@@ -1,0 +1,57 @@
+# tooling and design notes - never commit
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+MEMORY.md
+AGENTS.md
+DESIGN.md
+PLAN.md
+Research.md
+improvements/
+analysis/
+scratch/
+
+# private notes
+DEVLOG.md
+
+# secrets
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# audit-plan-code scratch dirs (slash command artifacts)
+.audit-plan-code/
+.audit-plan-code-rollback/
+
+# model weights and captured media
+models/
+recordings/
+*.onnx
+*.gguf
+*.bin
+*.wav
+*.opus
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+
+# node (visual client)
+node_modules/
+
+# editor / os
+.DS_Store
+.vscode/
+.idea/
+*.swp
