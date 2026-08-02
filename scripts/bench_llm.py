@@ -12,11 +12,12 @@ import sys
 import time
 from pathlib import Path
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError
 from pydantic import BaseModel
 
 REPO = Path(__file__).resolve().parent.parent
 WARMUP = 1
+RETRY_BACKOFF_S = 20
 SAMPLES = 30
 
 SYSTEM_PROMPT_BODY = """
@@ -104,10 +105,12 @@ class Sample(BaseModel):
     reasoning_chars: int
 
 
-async def one_turn(client: AsyncOpenAI, cfg: Config, effort: str | None) -> Sample:
-    kwargs = {}
-    if effort is not None:
-        kwargs["reasoning_effort"] = effort
+async def one_turn(client: AsyncOpenAI, cfg: Config, mode: str, max_tokens: int) -> Sample:
+    kwargs: dict = {}
+    if mode == "disabled":
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    else:
+        kwargs["reasoning_effort"] = mode
     start = time.perf_counter()
     first_chunk: float | None = None
     first_spoken: float | None = None
@@ -122,7 +125,7 @@ async def one_turn(client: AsyncOpenAI, cfg: Config, effort: str | None) -> Samp
         ],
         stream=True,
         stream_options={"include_usage": True},
-        max_tokens=150,
+        max_tokens=max_tokens,
         **kwargs,
     )
     async for chunk in stream:
@@ -163,14 +166,28 @@ def summarize(label: str, values: list[int]) -> None:
     )
 
 
-async def run_mode(client: AsyncOpenAI, cfg: Config, effort: str | None) -> None:
-    name = effort or "default"
+async def run_mode(
+    client: AsyncOpenAI, cfg: Config, mode: str, samples_n: int, max_tokens: int
+) -> None:
+    name = mode
     for _ in range(WARMUP):
-        await one_turn(client, cfg, effort)
+        while True:
+            try:
+                await one_turn(client, cfg, mode, max_tokens)
+                break
+            except RateLimitError:
+                await asyncio.sleep(RETRY_BACKOFF_S)
     samples: list[Sample] = []
-    for i in range(SAMPLES):
-        samples.append(await one_turn(client, cfg, effort))
-        print(f"  {name}: {i + 1}/{SAMPLES}", end="\r", file=sys.stderr)
+    retries = 0
+    for i in range(samples_n):
+        while True:
+            try:
+                samples.append(await one_turn(client, cfg, mode, max_tokens))
+                break
+            except RateLimitError:
+                retries += 1
+                await asyncio.sleep(RETRY_BACKOFF_S)
+        print(f"  {name}: {i + 1}/{samples_n}", end="\r", file=sys.stderr)
     print(" " * 40, end="\r", file=sys.stderr)
     print(f"\nreasoning_effort={name}  prompt_tokens={samples[0].prompt_tokens}")
     summarize("  time to first chunk", [s.first_chunk_ms for s in samples])
@@ -181,6 +198,8 @@ async def run_mode(client: AsyncOpenAI, cfg: Config, effort: str | None) -> None
     silent = sum(1 for s in samples if s.first_spoken_ms is None)
     if silent:
         print(f"  turns that never produced spoken content: {silent}/{len(samples)}")
+    if retries:
+        print(f"  rate-limit retries (excluded from timings): {retries}")
     reasoning = [s.reasoning_chars for s in samples]
     print(f"  reasoning chars median={int(statistics.median(reasoning))}")
 
@@ -188,7 +207,9 @@ async def run_mode(client: AsyncOpenAI, cfg: Config, effort: str | None) -> None
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="z-ai/glm-5.3-flash")
-    parser.add_argument("--modes", default="low,high,max")
+    parser.add_argument("--modes", default="disabled,low")
+    parser.add_argument("--samples", type=int, default=SAMPLES)
+    parser.add_argument("--max-tokens", type=int, default=150)
     args = parser.parse_args()
 
     cfg = load_config(args.model)
@@ -198,9 +219,11 @@ async def main() -> int:
         return 2
 
     client = AsyncOpenAI(api_key=cfg.api_key, base_url=cfg.base_url)
-    print(f"model={cfg.model}  samples={SAMPLES} (plus {WARMUP} discarded warm-up)")
-    for effort in args.modes.split(","):
-        await run_mode(client, cfg, effort.strip() or None)
+    print(
+        f"model={cfg.model}  samples={args.samples} (plus {WARMUP} discarded warm-up)  max_tokens={args.max_tokens}"
+    )
+    for mode in args.modes.split(","):
+        await run_mode(client, cfg, mode.strip(), args.samples, args.max_tokens)
     return 0
 
 
