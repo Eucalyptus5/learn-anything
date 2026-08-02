@@ -55,6 +55,12 @@ you assert. Cap what you pull; a wide search that floods your context makes you 
 less accurate, and the engineer hears the pause.
 """.strip()
 
+TERSE_REASONING = (
+    "Reasoning budget. You are being synthesized to audio and the engineer waits in silence while "
+    "you think. Keep internal reasoning to one short sentence at most, then start speaking. Never "
+    "deliberate at length before answering; think while you talk, not before."
+)
+
 USER_TURN = """
 Alright, before we go further into the transport layer I want to back up. You said earlier
 that the session actor owns the audio buffers and that the synthesis worker only ever gets
@@ -105,7 +111,9 @@ class Sample(BaseModel):
     reasoning_chars: int
 
 
-async def one_turn(client: AsyncOpenAI, cfg: Config, mode: str, max_tokens: int) -> Sample:
+async def one_turn(
+    client: AsyncOpenAI, cfg: Config, mode: str, max_tokens: int, system_prompt: str
+) -> Sample:
     kwargs: dict = {}
     if mode == "disabled":
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
@@ -120,7 +128,7 @@ async def one_turn(client: AsyncOpenAI, cfg: Config, mode: str, max_tokens: int)
     stream = await client.chat.completions.create(
         model=cfg.model,
         messages=[
-            {"role": "system", "content": pad_to_tokens(SYSTEM_PROMPT_BODY, 1500)},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": pad_to_tokens(USER_TURN, 225)},
         ],
         stream=True,
@@ -167,13 +175,16 @@ def summarize(label: str, values: list[int]) -> None:
 
 
 async def run_mode(
-    client: AsyncOpenAI, cfg: Config, mode: str, samples_n: int, max_tokens: int
+    client: AsyncOpenAI, cfg: Config, mode: str, samples_n: int, max_tokens: int, terse: bool
 ) -> None:
-    name = mode
+    name = f"{mode}{' +terse' if terse else ''}"
+    system_prompt = pad_to_tokens(SYSTEM_PROMPT_BODY, 1500)
+    if terse:
+        system_prompt = system_prompt + "\n\n" + TERSE_REASONING
     for _ in range(WARMUP):
         while True:
             try:
-                await one_turn(client, cfg, mode, max_tokens)
+                await one_turn(client, cfg, mode, max_tokens, system_prompt)
                 break
             except RateLimitError:
                 await asyncio.sleep(RETRY_BACKOFF_S)
@@ -182,7 +193,7 @@ async def run_mode(
     for i in range(samples_n):
         while True:
             try:
-                samples.append(await one_turn(client, cfg, mode, max_tokens))
+                samples.append(await one_turn(client, cfg, mode, max_tokens, system_prompt))
                 break
             except RateLimitError:
                 retries += 1
@@ -209,7 +220,8 @@ async def main() -> int:
     parser.add_argument("--model", default="z-ai/glm-5.3-flash")
     parser.add_argument("--modes", default="disabled,low")
     parser.add_argument("--samples", type=int, default=SAMPLES)
-    parser.add_argument("--max-tokens", type=int, default=150)
+    parser.add_argument("--max-tokens", type=int, default=400)
+    parser.add_argument("--terse", action="store_true")
     args = parser.parse_args()
 
     cfg = load_config(args.model)
@@ -223,7 +235,7 @@ async def main() -> int:
         f"model={cfg.model}  samples={args.samples} (plus {WARMUP} discarded warm-up)  max_tokens={args.max_tokens}"
     )
     for mode in args.modes.split(","):
-        await run_mode(client, cfg, mode.strip(), args.samples, args.max_tokens)
+        await run_mode(client, cfg, mode.strip(), args.samples, args.max_tokens, args.terse)
     return 0
 
 
