@@ -3,7 +3,12 @@ name = "learn-anything"
 version = "0.0.0"
 description = "Voice-first, visually-augmented tutor for learning a codebase."
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "aiortc>=1.15",
+    "av>=17.1,<18",
+    "aiohttp>=3.10",
+    "numpy>=2.0",
+]
 
 [tool.ruff]
 line-length = 100
@@ -22,7 +27,5 @@ bench = [
     "faster-whisper>=1.2",
     "kokoro-onnx>=0.6",
     "onnxruntime>=1.20",
-    "numpy>=2.0",
     "openai>=1.0",
-    "aiortc>=1.15",
 ]
