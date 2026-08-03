@@ -10,6 +10,7 @@ import os
 import statistics
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from openai import AsyncOpenAI, RateLimitError
@@ -108,6 +109,7 @@ class Sample(BaseModel):
     total_ms: int
     prompt_tokens: int
     completion_tokens: int
+    cached_tokens: int
     reasoning_chars: int
 
 
@@ -125,6 +127,7 @@ async def one_turn(
     reasoning_chars = 0
     prompt_tokens = 0
     completion_tokens = 0
+    cached_tokens = 0
     stream = await client.chat.completions.create(
         model=cfg.model,
         messages=[
@@ -143,6 +146,8 @@ async def one_turn(
         if chunk.usage is not None:
             prompt_tokens = chunk.usage.prompt_tokens
             completion_tokens = chunk.usage.completion_tokens
+            details = getattr(chunk.usage, "prompt_tokens_details", None)
+            cached_tokens = getattr(details, "cached_tokens", 0) or 0
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
@@ -158,6 +163,7 @@ async def one_turn(
         total_ms=int((end - start) * 1000),
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        cached_tokens=cached_tokens,
         reasoning_chars=reasoning_chars,
     )
 
@@ -175,10 +181,18 @@ def summarize(label: str, values: list[int]) -> None:
 
 
 async def run_mode(
-    client: AsyncOpenAI, cfg: Config, mode: str, samples_n: int, max_tokens: int, terse: bool
+    client: AsyncOpenAI,
+    cfg: Config,
+    mode: str,
+    samples_n: int,
+    max_tokens: int,
+    terse: bool,
+    cache_bust: bool,
 ) -> None:
     name = f"{mode}{' +terse' if terse else ''}"
     system_prompt = pad_to_tokens(SYSTEM_PROMPT_BODY, 1500)
+    if cache_bust:
+        system_prompt = uuid.uuid4().hex + " " + system_prompt
     if terse:
         system_prompt = system_prompt + "\n\n" + TERSE_REASONING
     for _ in range(WARMUP):
@@ -211,6 +225,10 @@ async def run_mode(
         print(f"  turns that never produced spoken content: {silent}/{len(samples)}")
     if retries:
         print(f"  rate-limit retries (excluded from timings): {retries}")
+    cached = [s.cached_tokens for s in samples]
+    print(
+        f"  cached prompt tokens median={int(statistics.median(cached))}/{samples[0].prompt_tokens}"
+    )
     reasoning = [s.reasoning_chars for s in samples]
     print(f"  reasoning chars median={int(statistics.median(reasoning))}")
 
@@ -222,6 +240,7 @@ async def main() -> int:
     parser.add_argument("--samples", type=int, default=SAMPLES)
     parser.add_argument("--max-tokens", type=int, default=400)
     parser.add_argument("--terse", action="store_true")
+    parser.add_argument("--cache-bust", action="store_true")
     args = parser.parse_args()
 
     cfg = load_config(args.model)
@@ -235,7 +254,9 @@ async def main() -> int:
         f"model={cfg.model}  samples={args.samples} (plus {WARMUP} discarded warm-up)  max_tokens={args.max_tokens}"
     )
     for mode in args.modes.split(","):
-        await run_mode(client, cfg, mode.strip(), args.samples, args.max_tokens, args.terse)
+        await run_mode(
+            client, cfg, mode.strip(), args.samples, args.max_tokens, args.terse, args.cache_bust
+        )
     return 0
 
 

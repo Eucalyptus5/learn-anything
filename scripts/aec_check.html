@@ -1,0 +1,143 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>AEC check</title>
+<style>
+  body { font: 14px ui-monospace, Menlo, monospace; margin: 2rem; max-width: 46rem; }
+  button { font: inherit; padding: .5rem 1rem; margin-right: .5rem; }
+  table { border-collapse: collapse; margin: 1rem 0; }
+  td, th { border: 1px solid #999; padding: .3rem .6rem; text-align: left; }
+  .bad { color: #b00; font-weight: bold; }
+  .good { color: #070; font-weight: bold; }
+  #log { white-space: pre-wrap; background: #f4f4f4; padding: .8rem; }
+  meter { width: 18rem; }
+</style>
+
+<h2>Acoustic echo cancellation check</h2>
+
+<p>Routes a tone through a loopback <code>RTCPeerConnection</code> and plays it from an
+<code>&lt;audio&gt;</code> element, which is the arrangement the tutor uses. Measures microphone
+level with the tone silent and with the tone playing. If echo cancellation is working, the two
+levels stay close. Use the built-in speakers, not headphones, and keep the room quiet.</p>
+
+<p><button id="start">Start</button><button id="run" disabled>Run measurement</button></p>
+
+<p>mic level <meter id="meter" min="0" max="0.2" value="0"></meter> <span id="lvl"></span></p>
+
+<table id="settings"></table>
+<div id="log">idle</div>
+
+<script>
+const log = (m) => { document.getElementById("log").textContent += "\n" + m; };
+const SAMPLES = 120;
+let analyser, buf, toneEl, audioCtx, osc, micTrack;
+
+function rms() {
+  analyser.getFloatTimeDomainData(buf);
+  let s = 0;
+  for (let i = 0; i < buf.length; i++) s += buf[i] * buf[i];
+  return Math.sqrt(s / buf.length);
+}
+
+async function measure(ms) {
+  const vals = [];
+  const t0 = performance.now();
+  while (performance.now() - t0 < ms) {
+    vals.push(rms());
+    document.getElementById("meter").value = vals[vals.length - 1];
+    document.getElementById("lvl").textContent = vals[vals.length - 1].toFixed(5);
+    await new Promise((r) => setTimeout(r, ms / SAMPLES));
+  }
+  vals.sort((a, b) => a - b);
+  return { median: vals[Math.floor(vals.length / 2)], p95: vals[Math.floor(vals.length * 0.95)], n: vals.length };
+}
+
+document.getElementById("start").onclick = async () => {
+  document.getElementById("log").textContent = "requesting microphone";
+  const mic = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false },
+  });
+  micTrack = mic.getAudioTracks()[0];
+
+  const s = micTrack.getSettings();
+  const rows = [["applied echoCancellation", s.echoCancellation],
+                ["applied noiseSuppression", s.noiseSuppression],
+                ["applied autoGainControl", s.autoGainControl],
+                ["sampleRate", s.sampleRate], ["channelCount", s.channelCount],
+                ["userAgent", navigator.userAgent.slice(0, 60)]];
+  const table = document.getElementById("settings");
+  table.replaceChildren();
+  const head = table.insertRow();
+  for (const label of ["setting", "value"]) {
+    const th = document.createElement("th");
+    th.textContent = label;
+    head.appendChild(th);
+  }
+  for (const [k, v] of rows) {
+    const tr = table.insertRow();
+    tr.insertCell().textContent = k;
+    const cell = tr.insertCell();
+    cell.textContent = String(v);
+    if (k === "applied echoCancellation") cell.className = v === true ? "good" : "bad";
+  }
+  if (s.echoCancellation !== true) {
+    log("WARNING: the browser did not apply echoCancellation. This is the Safari failure mode.");
+  }
+
+  audioCtx = new AudioContext();
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+  buf = new Float32Array(analyser.fftSize);
+  audioCtx.createMediaStreamSource(mic).connect(analyser);
+
+  osc = audioCtx.createOscillator();
+  osc.frequency.value = 440;
+  const gain = audioCtx.createGain();
+  gain.gain.value = 0.0;
+  const dest = audioCtx.createMediaStreamDestination();
+  osc.connect(gain).connect(dest);
+  osc.start();
+  window._gain = gain;
+
+  const pc1 = new RTCPeerConnection(), pc2 = new RTCPeerConnection();
+  pc1.onicecandidate = (e) => e.candidate && pc2.addIceCandidate(e.candidate);
+  pc2.onicecandidate = (e) => e.candidate && pc1.addIceCandidate(e.candidate);
+  dest.stream.getAudioTracks().forEach((t) => pc1.addTrack(t, dest.stream));
+  const remote = new MediaStream();
+  toneEl = new Audio();
+  toneEl.autoplay = true;
+  pc2.ontrack = (e) => { remote.addTrack(e.track); toneEl.srcObject = remote; };
+  const offer = await pc1.createOffer();
+  await pc1.setLocalDescription(offer);
+  await pc2.setRemoteDescription(offer);
+  const answer = await pc2.createAnswer();
+  await pc2.setLocalDescription(answer);
+  await pc1.setRemoteDescription(answer);
+
+  log("loopback peer connection up; tone will arrive as a remote WebRTC track");
+  log("codec negotiated: " + (pc1.localDescription.sdp.match(/a=rtpmap:\d+ ([^\/]+)/) || [])[1]);
+  document.getElementById("run").disabled = false;
+};
+
+document.getElementById("run").onclick = async () => {
+  document.getElementById("run").disabled = true;
+  log("\nmeasuring 3s of room tone, tone muted...");
+  window._gain.gain.value = 0.0;
+  const quiet = await measure(3000);
+  log(`  quiet   median=${quiet.median.toFixed(5)} p95=${quiet.p95.toFixed(5)} n=${quiet.n}`);
+
+  log("playing 440 Hz through the speakers for 3s...");
+  window._gain.gain.value = 0.6;
+  await new Promise((r) => setTimeout(r, 800));
+  const loud = await measure(3000);
+  window._gain.gain.value = 0.0;
+  log(`  tone on median=${loud.median.toFixed(5)} p95=${loud.p95.toFixed(5)} n=${loud.n}`);
+
+  const ratio = loud.median / Math.max(quiet.median, 1e-6);
+  log(`\nratio tone-on / quiet = ${ratio.toFixed(2)}x`);
+  if (ratio < 3) log("RESULT: echo cancellation is working. The tutor will not hear itself.");
+  else if (ratio < 10) log("RESULT: partial cancellation. Barge-in will misfire sometimes.");
+  else log("RESULT: NO usable cancellation. An open mic will trigger on the tutor's own voice.");
+  log("(turn the speaker volume up and rerun if the quiet and tone-on levels are both near zero)");
+  document.getElementById("run").disabled = false;
+};
+</script>

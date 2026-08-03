@@ -24,4 +24,5 @@ bench = [
     "onnxruntime>=1.20",
     "numpy>=2.0",
     "openai>=1.0",
+    "aiortc>=1.15",
 ]
