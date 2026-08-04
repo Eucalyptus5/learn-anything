@@ -7,12 +7,20 @@ import pytest
 from tutor.constants import (
     FRAME_SAMPLES,
     SAMPLE_RATE,
+    TTS_SAMPLE_RATE,
     WEBRTC_FRAME_SAMPLES,
     WEBRTC_SAMPLE_RATE,
 )
-from tutor.resample import INBOUND_STARTUP_DELAY_SAMPLES, InboundResampler
+from tutor.resample import (
+    INBOUND_STARTUP_DELAY_SAMPLES,
+    OUTBOUND_STARTUP_DELAY_SAMPLES,
+    InboundResampler,
+    OutboundResampler,
+)
 
 OUTPUT_SAMPLES_PER_WEBRTC_FRAME = WEBRTC_FRAME_SAMPLES * SAMPLE_RATE // WEBRTC_SAMPLE_RATE
+TTS_SAMPLES_PER_WEBRTC_FRAME = WEBRTC_FRAME_SAMPLES * TTS_SAMPLE_RATE // WEBRTC_SAMPLE_RATE
+WEBRTC_SAMPLES_PER_TTS_SAMPLE = WEBRTC_SAMPLE_RATE // TTS_SAMPLE_RATE
 
 
 def webrtc_frame(samples: np.ndarray, pts: int) -> av.AudioFrame:
@@ -91,3 +99,80 @@ def test_a_tone_survives_the_conversion() -> None:
     peak_hz = np.fft.rfftfreq(len(signal), 1 / SAMPLE_RATE)[int(np.argmax(magnitudes))]
 
     assert abs(peak_hz - tone_hz) <= SAMPLE_RATE / len(signal)
+
+
+def tts_tone(n_chunks: int, tone_hz: float) -> np.ndarray:
+    t = np.arange(n_chunks * TTS_SAMPLES_PER_WEBRTC_FRAME) / TTS_SAMPLE_RATE
+    return (np.sin(2 * np.pi * tone_hz * t) * 30000).astype(np.int16)
+
+
+def push_chunks(resampler: OutboundResampler, pcm: np.ndarray) -> None:
+    for i in range(0, len(pcm), TTS_SAMPLES_PER_WEBRTC_FRAME):
+        resampler.push(pcm[i : i + TTS_SAMPLES_PER_WEBRTC_FRAME])
+
+
+def test_pull_returns_exactly_what_it_was_asked_for() -> None:
+    resampler = OutboundResampler()
+    push_chunks(resampler, tts_tone(10, 440.0))
+    pulled = resampler.pull(WEBRTC_FRAME_SAMPLES)
+
+    assert pulled.dtype == np.int16
+    assert pulled.ndim == 1
+    assert len(pulled) == WEBRTC_FRAME_SAMPLES
+
+
+def test_pull_on_an_empty_buffer_is_silence_not_a_short_read() -> None:
+    resampler = OutboundResampler()
+
+    assert resampler.available() == 0
+    pulled = resampler.pull(WEBRTC_FRAME_SAMPLES)
+    assert len(pulled) == WEBRTC_FRAME_SAMPLES
+    assert not pulled.any()
+
+
+@pytest.mark.parametrize("n_chunks", [20, 200])
+def test_outbound_shortfall_is_bounded(n_chunks: int) -> None:
+    resampler = OutboundResampler()
+    pcm = tts_tone(n_chunks, 440.0)
+    push_chunks(resampler, pcm)
+
+    shortfall = WEBRTC_SAMPLES_PER_TTS_SAMPLE * len(pcm) - resampler.available()
+    assert 0 <= shortfall < WEBRTC_FRAME_SAMPLES + OUTBOUND_STARTUP_DELAY_SAMPLES
+
+
+def test_a_long_outbound_run_lags_no_further_behind_than_a_short_one() -> None:
+    def shortfall(n_chunks: int) -> int:
+        resampler = OutboundResampler()
+        pcm = tts_tone(n_chunks, 440.0)
+        push_chunks(resampler, pcm)
+        return WEBRTC_SAMPLES_PER_TTS_SAMPLE * len(pcm) - resampler.available()
+
+    assert shortfall(200) <= shortfall(20)
+
+
+def test_flush_leaves_the_next_pull_silent() -> None:
+    resampler = OutboundResampler()
+    tone = tts_tone(10, 440.0)
+
+    push_chunks(resampler, tone)
+    assert resampler.available() > 0
+
+    resampler.flush()
+    assert resampler.available() == 0
+    assert not resampler.pull(WEBRTC_FRAME_SAMPLES).any()
+
+    push_chunks(resampler, tone)
+    assert resampler.available() > 0
+
+
+def test_a_tone_survives_the_outbound_conversion() -> None:
+    tone_hz = 440.0
+    resampler = OutboundResampler()
+    push_chunks(resampler, tts_tone(TTS_SAMPLE_RATE // TTS_SAMPLES_PER_WEBRTC_FRAME, tone_hz))
+    signal = resampler.pull(resampler.available()).astype(np.float64)
+
+    magnitudes = np.abs(np.fft.rfft(signal))
+    magnitudes[0] = 0.0
+    peak_hz = np.fft.rfftfreq(len(signal), 1 / WEBRTC_SAMPLE_RATE)[int(np.argmax(magnitudes))]
+
+    assert abs(peak_hz - tone_hz) <= WEBRTC_SAMPLE_RATE / len(signal)
