@@ -28,6 +28,8 @@ class Connection:
 
         @pc.on("track")
         def _on_track(track: MediaStreamTrack) -> None:
+            if track.kind != "audio":
+                return
             self._reader = asyncio.create_task(self._read(track))
 
         @pc.on("datachannel")

@@ -78,6 +78,18 @@ class StallingTrack(MediaStreamTrack):
             raise
 
 
+class VideoTrack(MediaStreamTrack):
+    kind = "video"
+
+    def __init__(self, log: list[str]) -> None:
+        super().__init__()
+        self._log = log
+
+    async def recv(self) -> av.VideoFrame:
+        self._log.append("video")
+        raise AssertionError("a video track must never be read")
+
+
 class ToneTrack(AudioStreamTrack):
     async def recv(self) -> av.AudioFrame:
         frame = await super().recv()
@@ -126,6 +138,20 @@ async def test_frames_yields_vad_frames_until_the_track_ends() -> None:
         assert len(array) == FRAME_SAMPLES
     assert np.abs(frames[-1]).max() > LOUD
     await connection.close()
+
+
+async def test_a_video_track_is_ignored_and_leaves_the_audio_reader_alone() -> None:
+    pc = local_peer()
+    connection = Connection(pc)
+    log: list[str] = []
+    pc.emit("track", FiniteTrack(tone_frames(20)))
+    pc.emit("track", VideoTrack(log))
+
+    frames = [array async for array in connection.frames()]
+
+    await connection.close()
+    assert log == []
+    assert len(frames) > 0
 
 
 async def test_a_malformed_message_is_dropped_and_the_next_one_still_arrives() -> None:
