@@ -19,6 +19,8 @@ MALFORMED = [
     json.dumps({"sdp": "v=0"}),
     json.dumps({"sdp": "v=0", "type": "answer"}),
     json.dumps({"sdp": 17, "type": "offer"}),
+    json.dumps({"sdp": "v=0\r\nnonsense\r\n", "type": "offer"}),
+    json.dumps({"sdp": "v=0\r\nm=audio\r\n", "type": "offer"}),
 ]
 
 

@@ -47,9 +47,14 @@ def create_app(client_root: Path = CLIENT_ROOT) -> web.Application:
             logger.warning("offer_rejected reason=malformed")
             return web.json_response({"error": "expected a json offer"}, status=400)
 
-        connection, answer = await negotiate(
-            RTCSessionDescription(sdp=payload["sdp"], type="offer")
-        )
+        try:
+            connection, answer = await negotiate(
+                RTCSessionDescription(sdp=payload["sdp"], type="offer")
+            )
+        except (AssertionError, ValueError):
+            # aiortc's sdp parser asserts on a truncated m-line instead of raising ValueError
+            logger.warning("offer_rejected reason=bad_sdp")
+            return web.json_response({"error": "expected a json offer"}, status=400)
         request.app[CONNECTIONS].add(connection)
         logger.info("offer_answered live=%d", len(request.app[CONNECTIONS]))
         return web.json_response({"sdp": answer.sdp, "type": answer.type})
