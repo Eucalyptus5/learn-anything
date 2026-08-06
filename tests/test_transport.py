@@ -289,3 +289,28 @@ async def test_loopback_carries_json_and_audio_both_ways() -> None:
     await asyncio.gather(speaker, listener, *drainers, return_exceptions=True)
     await connection.close()
     await offerer.close()
+
+
+async def test_a_peer_that_goes_away_tears_the_connection_down() -> None:
+    offerer = local_peer()
+    offerer.createDataChannel("tutor")
+    offerer.addTrack(ToneTrack())
+
+    connected = asyncio.Event()
+
+    @offerer.on("connectionstatechange")
+    def _on_state() -> None:
+        if offerer.connectionState == "connected":
+            connected.set()
+
+    await offerer.setLocalDescription(await offerer.createOffer())
+    connection, answer = await negotiate(offerer.localDescription)
+    gone = asyncio.Event()
+    connection.on_close(gone.set)
+
+    await offerer.setRemoteDescription(answer)
+    await asyncio.wait_for(connected.wait(), LOOPBACK_TIMEOUT_S)
+    await offerer.close()
+    await asyncio.wait_for(gone.wait(), LOOPBACK_TIMEOUT_S)
+
+    assert connection.closed

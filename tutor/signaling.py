@@ -56,6 +56,11 @@ def create_app(client_root: Path = CLIENT_ROOT) -> web.Application:
             logger.warning("offer_rejected reason=bad_sdp")
             return web.json_response({"error": "expected a json offer"}, status=400)
         request.app[CONNECTIONS].add(connection)
+
+        def forget() -> None:
+            request.app[CONNECTIONS].discard(connection)
+
+        connection.on_close(forget)
         logger.info("offer_answered live=%d", len(request.app[CONNECTIONS]))
         return web.json_response({"sdp": answer.sdp, "type": answer.type})
 

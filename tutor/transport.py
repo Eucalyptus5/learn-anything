@@ -13,6 +13,8 @@ from tutor.resample import InboundResampler
 
 logger = logging.getLogger(__name__)
 
+TERMINAL_STATES = frozenset({"closed", "failed"})
+
 
 class Connection:
     def __init__(self, pc: RTCPeerConnection) -> None:
@@ -23,6 +25,9 @@ class Connection:
         self._channel: RTCDataChannel | None = None
         self._channel_ready = asyncio.Event()
         self._handlers: list[Callable[[dict[str, object]], None]] = []
+        self._close_handlers: list[Callable[[], None]] = []
+        self._closing: asyncio.Task[None] | None = None
+        self._closed = False
 
         pc.addTrack(self._playout)
 
@@ -40,6 +45,11 @@ class Connection:
             @channel.on("message")
             def _on_message(message: str) -> None:
                 self._dispatch(message)
+
+        @pc.on("connectionstatechange")
+        def _on_connectionstatechange() -> None:
+            if pc.connectionState in TERMINAL_STATES:
+                self._begin_close()
 
     async def _read(self, track: MediaStreamTrack) -> None:
         resampler = InboundResampler()
@@ -96,9 +106,27 @@ class Connection:
     def on_json(self, handler: Callable[[dict[str, object]], None]) -> None:
         self._handlers.append(handler)
 
-    async def close(self) -> None:
+    def on_close(self, handler: Callable[[], None]) -> None:
+        self._close_handlers.append(handler)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def _begin_close(self) -> asyncio.Task[None]:
+        if self._closing is None:
+            self._closing = asyncio.create_task(self._close())
+        return self._closing
+
+    async def _close(self) -> None:
         await self._stop_reader()
         await self._pc.close()
+        self._closed = True
+        for handler in self._close_handlers:
+            handler()
+
+    async def close(self) -> None:
+        await self._begin_close()
 
 
 async def negotiate(offer: RTCSessionDescription) -> tuple[Connection, RTCSessionDescription]:

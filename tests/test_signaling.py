@@ -1,14 +1,16 @@
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
-from aiortc import RTCConfiguration, RTCPeerConnection
+from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import AudioStreamTrack
 
 from tutor.signaling import CLIENT_ROOT, CONNECTIONS, HOST, create_app
 
+LOOPBACK_TIMEOUT_S = 20.0
 INDEX = "<!doctype html><title>tutor</title>"
 SCRIPT = "export const ready = true;\n"
 JSON_HEADERS = {"Content-Type": "application/json"}
@@ -104,6 +106,28 @@ async def test_shutdown_closes_the_survivors_of_an_already_closed_connection(
 
     assert len(connections) == 2
     for connection in connections:
-        assert connection._pc.connectionState == "closed"
+        assert connection.closed
     await first.close()
     await second.close()
+
+
+async def test_a_peer_that_goes_away_leaves_the_live_set(client: TestClient) -> None:
+    pc = offering_peer()
+    answer = await offer(client, pc)
+    (connection,) = client.app[CONNECTIONS]
+    gone = asyncio.Event()
+    connection.on_close(gone.set)
+    connected = asyncio.Event()
+
+    @pc.on("connectionstatechange")
+    def _on_state() -> None:
+        if pc.connectionState == "connected":
+            connected.set()
+
+    await pc.setRemoteDescription(RTCSessionDescription(sdp=answer["sdp"], type="answer"))
+    await asyncio.wait_for(connected.wait(), LOOPBACK_TIMEOUT_S)
+    await pc.close()
+    await asyncio.wait_for(gone.wait(), LOOPBACK_TIMEOUT_S)
+
+    assert connection.closed
+    assert client.app[CONNECTIONS] == set()
