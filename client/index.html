@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Codebase tutor</title>
+<style>
+  body { font: 14px ui-monospace, Menlo, monospace; margin: 2rem; max-width: 46rem; }
+  button { font: inherit; padding: .5rem 1rem; margin-right: .5rem; }
+  #status { white-space: pre-wrap; background: #f4f4f4; padding: .8rem; }
+  #canvas { margin: 1rem 0; }
+</style>
+
+<h2>Codebase tutor</h2>
+
+<p>Opens the microphone, negotiates one <code>RTCPeerConnection</code> with the local Python peer
+through <code>POST /offer</code>, plays whatever the tutor sends from the
+<code>&lt;audio&gt;</code> element on this page, and carries JSON both ways on a data channel
+named <code>tutor</code>. Audio and transcripts stay on this machine. The tutor peer currently
+sends digital silence, so read the packet counters and the data channel state below instead of
+listening for a voice; speak, and the microphone level should move.</p>
+
+<p><button id="connect">Connect</button></p>
+
+<div id="status">idle</div>
+
+<audio id="tutor" autoplay></audio>
+<div id="canvas"></div>
+
+<script type="module" src="/client.js"></script>
