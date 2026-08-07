@@ -8,6 +8,9 @@ dependencies = [
     "av>=17.1,<18",
     "aiohttp>=3.10",
     "numpy>=2.0",
+    "faster-whisper>=1.2",
+    "onnxruntime>=1.20",
+    "pydantic>=2.0",
 ]
 
 [tool.ruff]
@@ -24,8 +27,6 @@ dev = [
     "ruff>=0.8",
 ]
 bench = [
-    "faster-whisper>=1.2",
     "kokoro-onnx>=0.6",
-    "onnxruntime>=1.20",
     "openai>=1.0",
 ]
