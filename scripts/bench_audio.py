@@ -15,6 +15,7 @@ import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -22,6 +23,9 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from tutor.constants import FRAME_MS, FRAME_SAMPLES, SAMPLE_RATE, TTS_SAMPLE_RATE
+
+if TYPE_CHECKING:
+    from faster_whisper import WhisperModel
 
 MODELS = REPO / "models"
 FIXTURE = MODELS / "bench" / "utterance.wav"
@@ -31,6 +35,7 @@ VAD_CONTEXT = 64
 FRAGMENT_MS = [256, 384, 512, 640, 768, 1024, 2000, 4000, 8000]
 FRAGMENT_OFFSETS = 5
 FRAGMENT_RUNS = 5
+# end-of-turn budget: 690 ms median, 1230 ms p95, from speech stopping to the final transcript
 PARTIAL_FLOOR_MEDIAN_MS = 690
 PARTIAL_FLOOR_MAX_MS = 1230
 
@@ -176,7 +181,7 @@ def bench_silero(audio: np.ndarray) -> None:
     end(b)
 
 
-def whisper_transcribe(model, audio: np.ndarray) -> str:
+def whisper_transcribe(model: "WhisperModel", audio: np.ndarray) -> str:
     if audio.dtype != np.float32:
         raise ValueError(f"expected float32 audio, got {audio.dtype}")
     if np.max(np.abs(audio)) > 1.0:
@@ -244,6 +249,7 @@ def bench_whisper_fragments(audio: np.ndarray) -> None:
     print(f"  fixture {len(audio) / SAMPLE_RATE:.4f}s ({len(audio)} samples at {SAMPLE_RATE} Hz)")
     print(f"  {FRAGMENT_OFFSETS} offsets x {FRAGMENT_RUNS} timed runs per length")
     whisper_transcribe(model, audio)
+    assert max(FRAGMENT_MS) * SAMPLE_RATE // 1000 <= len(audio)
 
     total = len(FRAGMENT_MS) * FRAGMENT_OFFSETS * FRAGMENT_RUNS
     done = 0
@@ -263,6 +269,7 @@ def bench_whisper_fragments(audio: np.ndarray) -> None:
                 print(f"  {done}/{total}", end="\r", file=sys.stderr)
         print(" " * 20, end="\r", file=sys.stderr)
         curve[length_ms] = timings
+        print(f"  [{length_ms} ms] offsets spread over {slack} samples of slack")
         report(f"{length_ms} ms ({width} samples)", timings)
 
     print(f"  thresholds median<{PARTIAL_FLOOR_MEDIAN_MS}ms max<{PARTIAL_FLOOR_MAX_MS}ms")
