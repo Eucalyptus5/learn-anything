@@ -19,11 +19,13 @@ from pathlib import Path
 import numpy as np
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+from tutor.constants import FRAME_MS, FRAME_SAMPLES, SAMPLE_RATE, TTS_SAMPLE_RATE
+
 MODELS = REPO / "models"
 FIXTURE = MODELS / "bench" / "utterance.wav"
 
-SAMPLE_RATE = 16000
-VAD_FRAME = 512
 VAD_CONTEXT = 64
 
 FIXTURE_TEXT = (
@@ -148,7 +150,10 @@ def bench_silero(audio: np.ndarray) -> None:
     state = np.zeros((2, 1, 128), dtype=np.float32)
     context = np.zeros((1, VAD_CONTEXT), dtype=np.float32)
     sr = np.array(SAMPLE_RATE, dtype=np.int64)
-    frames = [audio[i : i + VAD_FRAME] for i in range(0, len(audio) - VAD_FRAME + 1, VAD_FRAME)]
+    frames = [
+        audio[i : i + FRAME_SAMPLES]
+        for i in range(0, len(audio) - FRAME_SAMPLES + 1, FRAME_SAMPLES)
+    ]
 
     timings: list[float] = []
     for index, frame in enumerate(frames):
@@ -160,8 +165,7 @@ def bench_silero(audio: np.ndarray) -> None:
         if index >= 1:
             timings.append(elapsed)
 
-    frame_ms = VAD_FRAME / SAMPLE_RATE * 1000
-    print(f"  frame size {VAD_FRAME} samples ({frame_ms:.0f} ms of audio at {SAMPLE_RATE} Hz)")
+    print(f"  frame size {FRAME_SAMPLES} samples ({FRAME_MS} ms of audio at {SAMPLE_RATE} Hz)")
     report("per-frame inference", timings)
     end(b)
 
@@ -221,7 +225,7 @@ async def bench_kokoro(samples: int, weights: str) -> None:
             first_at = None
             total_samples = 0
             chunks = 0
-            rate = 24000
+            rate = TTS_SAMPLE_RATE
             async for chunk, rate in kokoro.create_stream(text, voice="af_heart", lang="en-us"):
                 if first_at is None:
                     first_at = time.perf_counter() - t
