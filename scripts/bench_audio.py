@@ -28,6 +28,12 @@ FIXTURE = MODELS / "bench" / "utterance.wav"
 
 VAD_CONTEXT = 64
 
+FRAGMENT_MS = [256, 384, 512, 640, 768, 1024, 2000, 4000, 8000]
+FRAGMENT_OFFSETS = 5
+FRAGMENT_RUNS = 5
+PARTIAL_FLOOR_MEDIAN_MS = 690
+PARTIAL_FLOOR_MAX_MS = 1230
+
 FIXTURE_TEXT = (
     "The connection pool acquires a semaphore before it hands out a socket, and the worker "
     "releases it in a finally block so a panic during a flush cannot leak a permit."
@@ -170,6 +176,26 @@ def bench_silero(audio: np.ndarray) -> None:
     end(b)
 
 
+def whisper_transcribe(model, audio: np.ndarray) -> str:
+    if audio.dtype != np.float32:
+        raise ValueError(f"expected float32 audio, got {audio.dtype}")
+    if np.max(np.abs(audio)) > 1.0:
+        raise ValueError("expected audio in [-1, 1]")
+    segments, _ = model.transcribe(audio, language="en", beam_size=5)
+    return " ".join(s.text for s in segments).strip()
+
+
+def select_partial_floor_ms(curve: dict[int, list[float]]) -> int | None:
+    for length_ms in sorted(curve):
+        timings = curve[length_ms]
+        if (
+            statistics.median(timings) * 1000 < PARTIAL_FLOOR_MEDIAN_MS
+            and max(timings) * 1000 < PARTIAL_FLOOR_MAX_MS
+        ):
+            return length_ms
+    return None
+
+
 def bench_whisper(audio: np.ndarray, samples: int) -> None:
     from faster_whisper import WhisperModel
 
@@ -189,8 +215,7 @@ def bench_whisper(audio: np.ndarray, samples: int) -> None:
     text = ""
     for index in range(samples + 1):
         t = time.perf_counter()
-        segments, _ = model.transcribe(audio, language="en", beam_size=5)
-        text = " ".join(s.text for s in segments)
+        text = whisper_transcribe(model, audio)
         elapsed = time.perf_counter() - t
         if index >= 1:
             timings.append(elapsed)
@@ -200,7 +225,52 @@ def bench_whisper(audio: np.ndarray, samples: int) -> None:
     report("full utterance transcription", timings)
     rtf = statistics.median(timings) / duration
     print(f"  real-time factor {rtf:.3f} ({1 / rtf:.1f}x faster than real time)")
-    print(f"  transcript: {text.strip()[:110]}")
+    print(f"  transcript: {text[:110]}")
+    end(b)
+
+
+def bench_whisper_fragments(audio: np.ndarray) -> None:
+    from faster_whisper import WhisperModel
+
+    b = begin("faster-whisper base.en fragment cost curve")
+    load = time.perf_counter()
+    model = WhisperModel(
+        "base.en",
+        device="cpu",
+        compute_type="int8",
+        download_root=str(MODELS / "whisper"),
+    )
+    print(f"  model load {int((time.perf_counter() - load) * 1000)}ms")
+    print(f"  fixture {len(audio) / SAMPLE_RATE:.4f}s ({len(audio)} samples at {SAMPLE_RATE} Hz)")
+    print(f"  {FRAGMENT_OFFSETS} offsets x {FRAGMENT_RUNS} timed runs per length")
+    whisper_transcribe(model, audio)
+
+    total = len(FRAGMENT_MS) * FRAGMENT_OFFSETS * FRAGMENT_RUNS
+    done = 0
+    curve: dict[int, list[float]] = {}
+    for length_ms in FRAGMENT_MS:
+        width = length_ms * SAMPLE_RATE // 1000
+        slack = len(audio) - width
+        timings: list[float] = []
+        for step in range(FRAGMENT_OFFSETS):
+            start = round(step * slack / (FRAGMENT_OFFSETS - 1))
+            fragment = audio[start : start + width]
+            for _ in range(FRAGMENT_RUNS):
+                t = time.perf_counter()
+                whisper_transcribe(model, fragment)
+                timings.append(time.perf_counter() - t)
+                done += 1
+                print(f"  {done}/{total}", end="\r", file=sys.stderr)
+        print(" " * 20, end="\r", file=sys.stderr)
+        curve[length_ms] = timings
+        report(f"{length_ms} ms ({width} samples)", timings)
+
+    print(f"  thresholds median<{PARTIAL_FLOOR_MEDIAN_MS}ms max<{PARTIAL_FLOOR_MAX_MS}ms")
+    floor = select_partial_floor_ms(curve)
+    if floor is None:
+        print("  no fragment length is under both thresholds")
+    else:
+        print(f"  PARTIAL_FLOOR_MS {floor}")
     end(b)
 
 
@@ -266,6 +336,8 @@ async def main() -> int:
         bench_silero(audio)
     if "whisper" in blocks:
         bench_whisper(audio, args.samples)
+    if "whisper-fragments" in blocks:
+        bench_whisper_fragments(audio)
     if "kokoro" in blocks:
         await bench_kokoro(args.samples, args.kokoro_weights)
 
