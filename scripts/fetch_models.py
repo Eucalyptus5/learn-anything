@@ -1,7 +1,7 @@
 """Fetches the Silero VAD ONNX weights into models/silero/silero_vad.onnx and checks them
-against a pinned sha256. Whisper weights are not fetched here: tutor/stt.py passes
-download_root=models/whisper and faster-whisper pulls Systran/faster-whisper-base.en on first
-construction.
+against a pinned sha256. Whisper weights are not fetched here: tutor.stt.load_whisper passes its
+model_dir as download_root and faster-whisper pulls Systran/faster-whisper-base.en into it on
+first construction; the callers point it at models/whisper.
 """
 
 import hashlib
