@@ -1,0 +1,70 @@
+import importlib.util
+import wave
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pytest
+
+from tutor.constants import SAMPLE_RATE
+
+SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "bench_audio.py"
+_spec = importlib.util.spec_from_file_location("bench_audio", SCRIPT)
+bench_audio = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(bench_audio)
+
+
+class FakeWhisperModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def transcribe(self, audio: np.ndarray, **options: Any) -> tuple[Any, None]:
+        self.calls += 1
+        return iter(()), None
+
+
+def test_unconverted_audio_never_reaches_the_model() -> None:
+    model = FakeWhisperModel()
+
+    with pytest.raises(ValueError):
+        bench_audio.whisper_transcribe(model, np.zeros(SAMPLE_RATE, dtype=np.int16))
+
+    assert model.calls == 0
+
+
+def test_to_float32_rejects_audio_that_is_already_converted() -> None:
+    with pytest.raises(ValueError):
+        bench_audio.to_float32(np.zeros(16, dtype=np.float32))
+
+
+def test_to_float32_maps_int16_extremes_into_the_unit_range() -> None:
+    scaled = bench_audio.to_float32(np.array([-32768, 0, 32767], dtype=np.int16))
+
+    assert scaled.dtype == np.float32
+    assert scaled[0] == -1.0
+    assert scaled[1] == 0.0
+    assert scaled[2] == 32767 / 32768
+
+
+def test_report_us_reports_microseconds(capsys: pytest.CaptureFixture[str]) -> None:
+    bench_audio.report_us("per-frame inference", [0.000123, 0.000456, 0.000789])
+    out = capsys.readouterr().out
+
+    assert "median=  456us" in out
+    assert "ms" not in out
+
+
+def test_ensure_fixture_returns_int16(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    samples = np.array([-32768, -1, 0, 1, 32767], dtype=np.int16)
+    path = tmp_path / "utterance.wav"
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(samples.tobytes())
+    monkeypatch.setattr(bench_audio, "FIXTURE", path)
+
+    audio = bench_audio.ensure_fixture()
+
+    assert audio.dtype == np.int16
+    np.testing.assert_array_equal(audio, samples)

@@ -1,8 +1,9 @@
 """Latency and memory for the local audio path: Silero VAD, Faster-Whisper, Kokoro.
 
-Every block discards one warm-up and reports n, median, and p95 in whole milliseconds,
-with process RSS and system swap sampled before and after. No microphone is opened; the
-speech fixture is synthesized once with the macOS `say` command.
+Every block discards one warm-up and reports n, median, and p95 in whole milliseconds, or
+whole microseconds for the per-frame VAD, with process RSS and system swap sampled before and
+after. No microphone is opened; the speech fixture is synthesized once with the macOS `say`
+command.
 """
 
 import argparse
@@ -29,8 +30,6 @@ if TYPE_CHECKING:
 
 MODELS = REPO / "models"
 FIXTURE = MODELS / "bench" / "utterance.wav"
-
-VAD_CONTEXT = 64
 
 FRAGMENT_MS = [256, 384, 512, 640, 768, 1024, 2000, 4000, 8000]
 FRAGMENT_OFFSETS = 5
@@ -113,6 +112,15 @@ def report(label: str, values: list[float]) -> None:
     )
 
 
+def report_us(label: str, values: list[float]) -> None:
+    us = sorted(round(v * 1_000_000) for v in values)
+    p95 = us[max(0, int(len(us) * 0.95) - 1)]
+    print(
+        f"  {label:32s} n={len(us):4d} median={int(statistics.median(us)):5d}us "
+        f"p95={p95:5d}us min={us[0]:5d}us max={us[-1]:5d}us"
+    )
+
+
 def ensure_fixture() -> np.ndarray:
     if not FIXTURE.exists():
         FIXTURE.parent.mkdir(parents=True, exist_ok=True)
@@ -140,27 +148,23 @@ def ensure_fixture() -> np.ndarray:
     with wave.open(str(FIXTURE)) as w:
         assert w.getframerate() == SAMPLE_RATE and w.getnchannels() == 1
         raw = w.readframes(w.getnframes())
-    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    return np.frombuffer(raw, dtype=np.int16)
+
+
+def to_float32(audio: np.ndarray) -> np.ndarray:
+    if audio.dtype != np.int16:
+        raise ValueError(f"expected int16 audio, got {audio.dtype}")
+    return audio.astype(np.float32) / 32768.0
 
 
 def bench_silero(audio: np.ndarray) -> None:
-    import onnxruntime as ort
+    from tutor.vad import SileroVad
 
     b = begin("silero vad (onnxruntime, no torch)")
-    opts = ort.SessionOptions()
-    opts.inter_op_num_threads = 1
-    opts.intra_op_num_threads = 1
     load = time.perf_counter()
-    session = ort.InferenceSession(
-        str(MODELS / "silero" / "silero_vad.onnx"),
-        sess_options=opts,
-        providers=["CPUExecutionProvider"],
-    )
+    vad = SileroVad(MODELS / "silero" / "silero_vad.onnx")
     print(f"  model load {int((time.perf_counter() - load) * 1000)}ms")
 
-    state = np.zeros((2, 1, 128), dtype=np.float32)
-    context = np.zeros((1, VAD_CONTEXT), dtype=np.float32)
-    sr = np.array(SAMPLE_RATE, dtype=np.int64)
     frames = [
         audio[i : i + FRAME_SAMPLES]
         for i in range(0, len(audio) - FRAME_SAMPLES + 1, FRAME_SAMPLES)
@@ -168,16 +172,14 @@ def bench_silero(audio: np.ndarray) -> None:
 
     timings: list[float] = []
     for index, frame in enumerate(frames):
-        x = np.concatenate([context, frame[None, :]], axis=1).astype(np.float32)
         t = time.perf_counter()
-        _, state = session.run(None, {"input": x, "state": state, "sr": sr})
+        vad(frame)
         elapsed = time.perf_counter() - t
-        context = x[:, -VAD_CONTEXT:]
         if index >= 1:
             timings.append(elapsed)
 
     print(f"  frame size {FRAME_SAMPLES} samples ({FRAME_MS} ms of audio at {SAMPLE_RATE} Hz)")
-    report("per-frame inference", timings)
+    report_us("per-frame inference", timings)
     end(b)
 
 
@@ -204,6 +206,7 @@ def select_partial_floor_ms(curve: dict[int, list[float]]) -> int | None:
 def bench_whisper(audio: np.ndarray, samples: int) -> None:
     from faster_whisper import WhisperModel
 
+    audio = to_float32(audio)
     b = begin("faster-whisper base.en (ctranslate2, int8, cpu)")
     load = time.perf_counter()
     model = WhisperModel(
@@ -237,6 +240,7 @@ def bench_whisper(audio: np.ndarray, samples: int) -> None:
 def bench_whisper_fragments(audio: np.ndarray) -> None:
     from faster_whisper import WhisperModel
 
+    audio = to_float32(audio)
     b = begin("faster-whisper base.en fragment cost curve")
     load = time.perf_counter()
     model = WhisperModel(
