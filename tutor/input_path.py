@@ -40,6 +40,7 @@ class InputPath:
         self._transcriber = transcriber
         self._endpointer = Endpointer(start_frames=START_FRAMES)
         self._executor = ThreadPoolExecutor(max_workers=1)
+        # the confirming frames are still in the deque at SPEECH_START and eat into its room
         self._pre_roll: deque[np.ndarray] = deque(maxlen=START_FRAMES + PRE_ROLL_FRAMES)
         self._utterance: list[np.ndarray] = []
 
@@ -68,5 +69,5 @@ class InputPath:
                 yield EndOfTurn(text=text)
 
     async def aclose(self) -> None:
-        await self._frames.aclose()
         self._executor.shutdown(wait=False)
+        await self._frames.aclose()
