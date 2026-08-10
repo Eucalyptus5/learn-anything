@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 
 import numpy as np
 from aiortc import RTCConfiguration, RTCDataChannel, RTCPeerConnection, RTCSessionDescription
@@ -14,13 +14,15 @@ from tutor.resample import InboundResampler
 logger = logging.getLogger(__name__)
 
 TERMINAL_STATES = frozenset({"closed", "failed"})
+INBOUND_CAPACITY = 64
 
 
 class Connection:
     def __init__(self, pc: RTCPeerConnection) -> None:
         self._pc = pc
         self._playout = PlayoutTrack()
-        self._inbound: asyncio.Queue[np.ndarray | None] = asyncio.Queue()
+        self._inbound: asyncio.Queue[np.ndarray | None] = asyncio.Queue(maxsize=INBOUND_CAPACITY)
+        self._dropped_frames = 0
         self._reader: asyncio.Task[None] | None = None
         self._channel: RTCDataChannel | None = None
         self._channel_ready = asyncio.Event()
@@ -51,17 +53,23 @@ class Connection:
             if pc.connectionState in TERMINAL_STATES:
                 self._begin_close()
 
+    def _offer(self, item: np.ndarray | None) -> None:
+        while self._inbound.full():
+            self._inbound.get_nowait()
+            self._dropped_frames += 1
+        self._inbound.put_nowait(item)
+
     async def _read(self, track: MediaStreamTrack) -> None:
         resampler = InboundResampler()
         try:
             while True:
                 frame = await track.recv()
                 for pcm in resampler.push(frame):
-                    self._inbound.put_nowait(pcm)
+                    self._offer(pcm)
         except MediaStreamError:
             logger.info("inbound_track_ended")
         finally:
-            self._inbound.put_nowait(None)
+            self._offer(None)
 
     def _dispatch(self, message: str) -> None:
         try:
@@ -82,16 +90,15 @@ class Connection:
         with contextlib.suppress(asyncio.CancelledError):
             await self._reader
 
-    async def frames(self) -> AsyncIterator[np.ndarray]:
+    async def frames(self) -> AsyncGenerator[np.ndarray, None]:
         try:
             while True:
                 pcm = await self._inbound.get()
                 if pcm is None:
                     return
                 yield pcm
-        except asyncio.CancelledError:
+        finally:
             await self._stop_reader()
-            raise
 
     async def play(self, pcm: np.ndarray) -> None:
         await self._playout.enqueue(pcm)
@@ -112,6 +119,10 @@ class Connection:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def dropped_frames(self) -> int:
+        return self._dropped_frames
 
     def _begin_close(self) -> asyncio.Task[None]:
         if self._closing is None:

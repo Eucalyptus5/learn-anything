@@ -1,3 +1,4 @@
+import asyncio
 import threading
 from collections.abc import AsyncIterator, Iterator
 
@@ -39,10 +40,14 @@ class FakeVad:
     def __init__(self, probabilities: list[float]) -> None:
         self._probabilities = list(probabilities)
         self.threads: list[int] = []
+        self.resets = 0
 
     def __call__(self, frame: np.ndarray) -> float:
         self.threads.append(threading.get_ident())
         return self._probabilities.pop(0)
+
+    def reset(self) -> None:
+        self.resets += 1
 
 
 class FakeTranscriber:
@@ -64,6 +69,26 @@ class GatedTranscriber(FakeTranscriber):
 
     def transcribe(self, audio: np.ndarray) -> str:
         text = super().transcribe(audio)
+        self._release.wait()
+        return text
+
+
+class HeldTranscriber(FakeTranscriber):
+    def __init__(
+        self,
+        name: str,
+        release: threading.Event,
+        started: asyncio.Event,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        super().__init__(name)
+        self._release = release
+        self._started = started
+        self._loop = loop
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        text = super().transcribe(audio)
+        self._loop.call_soon_threadsafe(self._started.set)
         self._release.wait()
         return text
 
@@ -277,5 +302,69 @@ async def test_aclose_closes_the_frame_generator_after_the_consumer_stops() -> N
 
     await path.aclose()
 
+    assert connection.closed
+    await path.aclose()
+
+
+async def test_cancelling_the_consumer_reraises_cancelled_error() -> None:
+    path, vad, partial, final = build([0.9] * 90)
+    speaking = asyncio.Event()
+
+    async def consume() -> list[InputEvent]:
+        events = []
+        async for event in path.events():
+            events.append(event)
+            if isinstance(event, SpeechStarted):
+                speaking.set()
+        return events
+
+    consumer = asyncio.create_task(consume())
+    await speaking.wait()
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    assert vad.resets == 1
+    assert path.partial_transcript == ""
+    assert partial.handed == []
+    assert final.handed == []
+
+    rest = [event async for event in path.events()]
+
+    assert without_partials(rest) == [SpeechStarted()]
+
+
+async def test_aclose_is_idempotent(release: threading.Event) -> None:
+    started = asyncio.Event()
+    partial = HeldTranscriber("partial", release, started, asyncio.get_running_loop())
+    connection = FakeConnection(scripted_frames(90))
+    path = InputPath(connection, FakeVad([0.9] * 90), partial, FakeTranscriber("final"))
+
+    async def consume() -> list[InputEvent]:
+        return [event async for event in path.events()]
+
+    consumer = asyncio.create_task(consume())
+    await started.wait()
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    await path.aclose()
+    await path.aclose()
+
+    assert connection.closed
+    assert not release.is_set()
+    assert len(partial.handed) == 1
+
+
+async def test_transport_iterator_exhaustion_ends_the_event_stream() -> None:
+    connection = FakeConnection(scripted_frames(SPEECH_FRAMES))
+    final = FakeTranscriber("final")
+    path = InputPath(connection, FakeVad([0.9] * SPEECH_FRAMES), FakeTranscriber("partial"), final)
+
+    events = [event async for event in path.events()]
+
+    assert without_partials(events) == [SpeechStarted()]
+    assert final.handed == []
     assert connection.closed
     await path.aclose()

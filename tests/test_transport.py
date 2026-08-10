@@ -12,11 +12,12 @@ from aiortc.mediastreams import AudioStreamTrack, MediaStreamError, MediaStreamT
 
 from tutor.constants import (
     FRAME_SAMPLES,
+    SAMPLE_RATE,
     TTS_SAMPLE_RATE,
     WEBRTC_FRAME_SAMPLES,
     WEBRTC_SAMPLE_RATE,
 )
-from tutor.transport import Connection, negotiate
+from tutor.transport import INBOUND_CAPACITY, Connection, negotiate
 
 TTS_CHUNK_SAMPLES = TTS_SAMPLE_RATE * WEBRTC_FRAME_SAMPLES // WEBRTC_SAMPLE_RATE
 TONE_HZ = 440
@@ -37,6 +38,19 @@ def webrtc_frame(samples: np.ndarray, pts: int) -> av.AudioFrame:
     frame.pts = pts
     frame.time_base = fractions.Fraction(1, WEBRTC_SAMPLE_RATE)
     return frame
+
+
+def numbered_frame(value: int, pts: int) -> av.AudioFrame:
+    samples = np.full(FRAME_SAMPLES, value, dtype=np.int16)
+    frame = av.AudioFrame.from_ndarray(samples.reshape(1, -1), format="s16", layout="mono")
+    frame.sample_rate = SAMPLE_RATE
+    frame.pts = pts
+    frame.time_base = fractions.Fraction(1, SAMPLE_RATE)
+    return frame
+
+
+def numbered_frames(count: int) -> list[av.AudioFrame]:
+    return [numbered_frame(i + 1, i * FRAME_SAMPLES) for i in range(count)]
 
 
 def tone_frames(count: int) -> list[av.AudioFrame]:
@@ -314,3 +328,47 @@ async def test_a_peer_that_goes_away_tears_the_connection_down() -> None:
     await asyncio.wait_for(gone.wait(), LOOPBACK_TIMEOUT_S)
 
     assert connection.closed
+
+
+async def test_aclose_stops_the_transport_reader() -> None:
+    pc = local_peer()
+    connection = Connection(pc)
+    log: list[str] = []
+    pc.emit("track", StallingTrack(tone_frames(4), log))
+    frames = connection.frames()
+
+    await anext(frames)
+    await frames.aclose()
+
+    assert log == ["reader"]
+    assert connection._reader.done()
+    await connection.close()
+
+
+async def test_full_inbound_queue_drops_the_oldest_frame() -> None:
+    pc = local_peer()
+    connection = Connection(pc)
+    total = INBOUND_CAPACITY + 36
+    pc.emit("track", FiniteTrack(numbered_frames(total)))
+    await connection._reader
+
+    values = [int(array[0]) async for array in connection.frames()]
+
+    assert len(values) == INBOUND_CAPACITY - 1
+    assert values == list(range(total - INBOUND_CAPACITY + 2, total + 1))
+    assert connection.dropped_frames == total - INBOUND_CAPACITY + 1
+    await connection.close()
+
+
+async def test_full_inbound_queue_still_delivers_the_sentinel() -> None:
+    pc = local_peer()
+    connection = Connection(pc)
+    pc.emit("track", FiniteTrack(numbered_frames(INBOUND_CAPACITY)))
+    await connection._reader
+
+    values = [int(array[0]) async for array in connection.frames()]
+
+    assert len(values) == INBOUND_CAPACITY - 1
+    assert values == list(range(2, INBOUND_CAPACITY + 1))
+    assert connection.dropped_frames == 1
+    await connection.close()

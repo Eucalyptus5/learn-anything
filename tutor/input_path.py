@@ -69,57 +69,71 @@ class InputPath:
 
     async def events(self) -> AsyncIterator[InputEvent]:
         loop = asyncio.get_running_loop()
-        async for frame in self._frames:
-            if self._utterance:
-                self._utterance.append(frame)
-            else:
-                self._pre_roll.append(frame)
+        try:
+            async for frame in self._frames:
+                if self._utterance:
+                    self._utterance.append(frame)
+                else:
+                    self._pre_roll.append(frame)
 
-            probability = await asyncio.to_thread(self._vad, frame)
+                probability = await asyncio.to_thread(self._vad, frame)
 
-            if self._partial is not None and self._partial.done():
-                self._partial_text = self._partial.result()
-                self._partial = None
-                yield PartialTranscript(text=self._partial_text)
-
-            event = self._endpointer.push(probability)
-
-            if event is EndpointEvent.SPEECH_START:
-                self._utterance.extend(self._pre_roll)
-                self._pre_roll.clear()
-                yield SpeechStarted()
-            elif event is EndpointEvent.SILENCE_START:
-                if self._partial is not None:
-                    self._partial.cancel()
+                if self._partial is not None and self._partial.done():
+                    self._partial_text = self._partial.result()
                     self._partial = None
-                audio = np.concatenate(self._utterance)
-                self._final = loop.run_in_executor(
-                    self._final_executor, self._final_transcriber.transcribe, audio
-                )
-            elif event is EndpointEvent.END_OF_TURN:
-                text = await self._final
-                self._final = None
-                samples = len(self._utterance) * FRAME_SAMPLES
-                self._utterance.clear()
-                self._partial_samples = 0
-                self._partial_text = ""
-                logger.info("end_of_turn samples=%d", samples)
-                yield EndOfTurn(text=text)
-            elif self._final is not None and probability > START_THRESHOLD:
+                    yield PartialTranscript(text=self._partial_text)
+
+                event = self._endpointer.push(probability)
+
+                if event is EndpointEvent.SPEECH_START:
+                    self._utterance.extend(self._pre_roll)
+                    self._pre_roll.clear()
+                    yield SpeechStarted()
+                elif event is EndpointEvent.SILENCE_START:
+                    if self._partial is not None:
+                        self._partial.cancel()
+                        self._partial = None
+                    audio = np.concatenate(self._utterance)
+                    self._final = loop.run_in_executor(
+                        self._final_executor, self._final_transcriber.transcribe, audio
+                    )
+                elif event is EndpointEvent.END_OF_TURN:
+                    text = await self._final
+                    self._final = None
+                    samples = len(self._utterance) * FRAME_SAMPLES
+                    self._utterance.clear()
+                    self._partial_samples = 0
+                    self._partial_text = ""
+                    logger.info("end_of_turn samples=%d", samples)
+                    yield EndOfTurn(text=text)
+                elif self._final is not None and probability > START_THRESHOLD:
+                    self._final.cancel()
+                    self._final = None
+
+                if self._utterance and self._final is None and self._partial is None:
+                    samples = len(self._utterance) * FRAME_SAMPLES
+                    if (
+                        samples >= PARTIAL_FLOOR_SAMPLES
+                        and samples - self._partial_samples >= PARTIAL_STRIDE_SAMPLES
+                    ):
+                        audio = np.concatenate(self._utterance)
+                        self._partial = loop.run_in_executor(
+                            self._partial_executor, self._partial_transcriber.transcribe, audio
+                        )
+                        self._partial_samples = samples
+        finally:
+            self._utterance.clear()
+            self._pre_roll.clear()
+            if self._partial is not None:
+                self._partial.cancel()
+                self._partial = None
+            if self._final is not None:
                 self._final.cancel()
                 self._final = None
-
-            if self._utterance and self._final is None and self._partial is None:
-                samples = len(self._utterance) * FRAME_SAMPLES
-                if (
-                    samples >= PARTIAL_FLOOR_SAMPLES
-                    and samples - self._partial_samples >= PARTIAL_STRIDE_SAMPLES
-                ):
-                    audio = np.concatenate(self._utterance)
-                    self._partial = loop.run_in_executor(
-                        self._partial_executor, self._partial_transcriber.transcribe, audio
-                    )
-                    self._partial_samples = samples
+            self._partial_samples = 0
+            self._partial_text = ""
+            self._endpointer.reset()
+            self._vad.reset()
 
     async def aclose(self) -> None:
         self._partial_executor.shutdown(wait=False)
