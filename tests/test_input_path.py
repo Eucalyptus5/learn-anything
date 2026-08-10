@@ -1,17 +1,25 @@
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 
 import numpy as np
+import pytest
 
-from tutor.constants import FRAME_SAMPLES, SAMPLE_RATE
-from tutor.endpointer import SILENCE_WINDOW_MS
-from tutor.input_path import PRE_ROLL_FRAMES, START_FRAMES, EndOfTurn, InputPath, SpeechStarted
+from tutor.constants import FRAME_SAMPLES
+from tutor.input_path import (
+    PRE_ROLL_FRAMES,
+    START_FRAMES,
+    EndOfTurn,
+    InputEvent,
+    InputPath,
+    PartialTranscript,
+    SpeechStarted,
+)
 
-WINDOW_SAMPLES = SILENCE_WINDOW_MS * SAMPLE_RATE // 1000
-SILENT_FRAMES_TO_CLOSE = -(-WINDOW_SAMPLES // FRAME_SAMPLES)
 SPEECH_FRAMES = 40
 SILENCE_FRAMES = 20
-TRANSCRIPT = "walk me through the endpointer"
+CANONICAL = [0.9] * SPEECH_FRAMES + [0.0] * SILENCE_FRAMES
+FIRST_PARTIAL_FRAMES = 32
+SECOND_PARTIAL_FRAMES = 64
 
 
 class FakeConnection:
@@ -38,96 +46,230 @@ class FakeVad:
 
 
 class FakeTranscriber:
-    def __init__(self) -> None:
+    def __init__(self, name: str) -> None:
+        self._name = name
         self.handed: list[np.ndarray] = []
         self.threads: list[int] = []
 
     def transcribe(self, audio: np.ndarray) -> str:
         self.handed.append(audio)
         self.threads.append(threading.get_ident())
-        return TRANSCRIPT
+        return f"{self._name} {audio.size}"
+
+
+class GatedTranscriber(FakeTranscriber):
+    def __init__(self, name: str, release: threading.Event) -> None:
+        super().__init__(name)
+        self._release = release
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        text = super().transcribe(audio)
+        self._release.wait()
+        return text
+
+
+class ReleasingTranscriber(FakeTranscriber):
+    def __init__(self, name: str, release: threading.Event) -> None:
+        super().__init__(name)
+        self._release = release
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        self._release.set()
+        return super().transcribe(audio)
+
+
+@pytest.fixture
+def release() -> Iterator[threading.Event]:
+    event = threading.Event()
+    yield event
+    event.set()
 
 
 def scripted_frames(count: int) -> list[np.ndarray]:
     return [np.full(FRAME_SAMPLES, i + 1, dtype=np.int16) for i in range(count)]
 
 
-def build(lead: int = 0) -> tuple[InputPath, FakeVad, FakeTranscriber]:
-    probabilities = [0.0] * lead + [0.9] * SPEECH_FRAMES + [0.0] * SILENCE_FRAMES
+def build(
+    probabilities: list[float],
+    partial: FakeTranscriber | None = None,
+    final: FakeTranscriber | None = None,
+) -> tuple[InputPath, FakeVad, FakeTranscriber, FakeTranscriber]:
     vad = FakeVad(probabilities)
-    transcriber = FakeTranscriber()
+    partial = partial or FakeTranscriber("partial")
+    final = final or FakeTranscriber("final")
     connection = FakeConnection(scripted_frames(len(probabilities)))
-    return InputPath(connection, vad, transcriber), vad, transcriber
+    return InputPath(connection, vad, partial, final), vad, partial, final
+
+
+def without_partials(events: list[InputEvent]) -> list[InputEvent]:
+    return [event for event in events if not isinstance(event, PartialTranscript)]
 
 
 async def test_speech_started_then_end_of_turn_in_order() -> None:
-    path, _, _ = build()
+    path, _, _, _ = build(CANONICAL)
 
     events = [event async for event in path.events()]
 
-    assert events == [SpeechStarted(), EndOfTurn(text=TRANSCRIPT)]
+    assert without_partials(events) == [
+        SpeechStarted(),
+        EndOfTurn(text=f"final {(SPEECH_FRAMES + 1) * FRAME_SAMPLES}"),
+    ]
 
 
 async def test_end_of_turn_carries_the_final_transcript() -> None:
-    path, _, transcriber = build()
+    path, _, _, final = build(CANONICAL)
 
     events = [event async for event in path.events()]
 
-    assert events[-1].text == TRANSCRIPT
-    assert len(transcriber.handed) == 1
-    audio = transcriber.handed[0]
+    assert events[-1] == EndOfTurn(text=f"final {(SPEECH_FRAMES + 1) * FRAME_SAMPLES}")
+    assert len(final.handed) == 1
+    audio = final.handed[0]
     assert audio.dtype == np.int16
-    assert audio.size == (SPEECH_FRAMES + SILENT_FRAMES_TO_CLOSE) * FRAME_SAMPLES
+    assert audio.size == (SPEECH_FRAMES + 1) * FRAME_SAMPLES
+
+
+async def test_final_job_starts_at_silence_start() -> None:
+    path, _, _, final = build(CANONICAL)
+
+    events = [event async for event in path.events()]
+
+    assert len(final.handed) == 1
+    audio = final.handed[0]
+    assert audio.size == (SPEECH_FRAMES + 1) * FRAME_SAMPLES
+    assert int(audio[-1]) == SPEECH_FRAMES + 1
+    assert events[-1] == EndOfTurn(text=f"final {audio.size}")
 
 
 async def test_silent_stream_emits_nothing() -> None:
-    silent = scripted_frames(60)
-    transcriber = FakeTranscriber()
-    path = InputPath(FakeConnection(silent), FakeVad([0.0] * len(silent)), transcriber)
+    path, _, partial, final = build([0.0] * 60)
 
     events = [event async for event in path.events()]
 
     assert events == []
-    assert transcriber.handed == []
+    assert partial.handed == []
+    assert final.handed == []
 
 
 async def test_the_buffer_keeps_the_frames_before_speech_start() -> None:
     lead = START_FRAMES + PRE_ROLL_FRAMES
-    path, _, transcriber = build(lead=lead)
+    path, _, _, final = build([0.0] * lead + CANONICAL)
 
     events = [event async for event in path.events()]
 
-    assert len(events) == 2
-    first = int(transcriber.handed[0][0]) - 1
+    assert len(without_partials(events)) == 2
+    first = int(final.handed[0][0]) - 1
     assert first == lead - PRE_ROLL_FRAMES
+
+
+async def test_partial_transcript_is_empty_before_speech() -> None:
+    path, _, _, _ = build(CANONICAL)
+    assert path.partial_transcript == ""
+
+    async for event in path.events():
+        assert event == SpeechStarted()
+        assert path.partial_transcript == ""
+        break
+
+    await path.aclose()
+
+
+async def test_partial_transcript_updates_while_speaking() -> None:
+    path, _, partial, final = build([0.9] * 90)
+
+    events = []
+    async for event in path.events():
+        events.append(event)
+        if isinstance(event, PartialTranscript):
+            assert path.partial_transcript == event.text
+
+    assert [audio.size for audio in partial.handed] == [
+        FIRST_PARTIAL_FRAMES * FRAME_SAMPLES,
+        SECOND_PARTIAL_FRAMES * FRAME_SAMPLES,
+    ]
+    assert events == [
+        SpeechStarted(),
+        PartialTranscript(text=f"partial {FIRST_PARTIAL_FRAMES * FRAME_SAMPLES}"),
+        PartialTranscript(text=f"partial {SECOND_PARTIAL_FRAMES * FRAME_SAMPLES}"),
+    ]
+    assert final.handed == []
+
+
+async def test_no_partial_below_the_buffer_floor() -> None:
+    speech = FIRST_PARTIAL_FRAMES - 2
+    path, _, partial, _ = build([0.9] * speech + [0.0] * SILENCE_FRAMES)
+
+    events = [event async for event in path.events()]
+
+    assert partial.handed == []
+    assert events == [SpeechStarted(), EndOfTurn(text=f"final {(speech + 1) * FRAME_SAMPLES}")]
+
+
+async def test_late_partial_is_discarded(release: threading.Event) -> None:
+    path, _, partial, _ = build(
+        CANONICAL,
+        partial=GatedTranscriber("partial", release),
+        final=ReleasingTranscriber("final", release),
+    )
+
+    events = [event async for event in path.events()]
+
+    assert [audio.size for audio in partial.handed] == [FIRST_PARTIAL_FRAMES * FRAME_SAMPLES]
+    assert events == [
+        SpeechStarted(),
+        EndOfTurn(text=f"final {(SPEECH_FRAMES + 1) * FRAME_SAMPLES}"),
+    ]
+
+
+async def test_no_second_partial_while_one_is_in_flight(release: threading.Event) -> None:
+    path, _, partial, _ = build([0.9] * 90, partial=GatedTranscriber("partial", release))
+
+    events = [event async for event in path.events()]
+
+    assert [audio.size for audio in partial.handed] == [FIRST_PARTIAL_FRAMES * FRAME_SAMPLES]
+    assert events == [SpeechStarted()]
+
+
+async def test_resume_discards_the_pending_final_and_rearms() -> None:
+    gap = 5
+    resumed = [0.9] * SPEECH_FRAMES + [0.0] * gap + [0.9] * SPEECH_FRAMES + [0.0] * SILENCE_FRAMES
+    path, _, _, final = build(resumed)
+
+    events = [event async for event in path.events()]
+
+    last = final.handed[-1]
+    assert last.size == (2 * SPEECH_FRAMES + gap + 1) * FRAME_SAMPLES
+    assert without_partials(events) == [SpeechStarted(), EndOfTurn(text=f"final {last.size}")]
 
 
 async def test_vad_does_not_run_on_the_event_loop() -> None:
     loop_thread = threading.get_ident()
-    path, vad, _ = build()
+    path, vad, _, _ = build(CANONICAL)
 
     events = [event async for event in path.events()]
 
-    assert len(events) == 2
-    assert len(vad.threads) == SPEECH_FRAMES + SILENCE_FRAMES
+    assert len(without_partials(events)) == 2
+    assert len(vad.threads) == len(CANONICAL)
     assert all(ident != loop_thread for ident in vad.threads)
 
 
 async def test_transcription_does_not_run_on_the_event_loop() -> None:
     loop_thread = threading.get_ident()
-    path, _, transcriber = build()
+    path, _, partial, final = build(CANONICAL)
 
     events = [event async for event in path.events()]
 
-    assert len(events) == 2
-    assert len(transcriber.threads) == 1
-    assert transcriber.threads[0] != loop_thread
+    assert len(without_partials(events)) == 2
+    assert len(final.threads) == 1
+    assert final.threads[0] != loop_thread
+    assert partial.threads[0] != loop_thread
+    assert partial.threads[0] != final.threads[0]
 
 
 async def test_aclose_closes_the_frame_generator_after_the_consumer_stops() -> None:
-    probabilities = [0.9] * SPEECH_FRAMES + [0.0] * SILENCE_FRAMES
-    connection = FakeConnection(scripted_frames(len(probabilities)))
-    path = InputPath(connection, FakeVad(probabilities), FakeTranscriber())
+    connection = FakeConnection(scripted_frames(len(CANONICAL)))
+    path = InputPath(
+        connection, FakeVad(CANONICAL), FakeTranscriber("partial"), FakeTranscriber("final")
+    )
 
     async for event in path.events():
         assert event == SpeechStarted()
