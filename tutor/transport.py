@@ -14,7 +14,7 @@ from tutor.resample import InboundResampler
 logger = logging.getLogger(__name__)
 
 TERMINAL_STATES = frozenset({"closed", "failed"})
-INBOUND_CAPACITY = 64
+INBOUND_CAPACITY = 64  # 2 s of frames; a consumer stalled longer than that loses the oldest
 
 
 class Connection:

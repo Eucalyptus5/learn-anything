@@ -69,6 +69,7 @@ class InputPath:
 
     async def events(self) -> AsyncIterator[InputEvent]:
         loop = asyncio.get_running_loop()
+        hop: asyncio.Future[float] | None = None
         try:
             async for frame in self._frames:
                 if self._utterance:
@@ -76,7 +77,8 @@ class InputPath:
                 else:
                     self._pre_roll.append(frame)
 
-                probability = await asyncio.to_thread(self._vad, frame)
+                hop = loop.run_in_executor(None, self._vad, frame)
+                probability = await asyncio.shield(hop)
 
                 if self._partial is not None and self._partial.done():
                     self._partial_text = self._partial.result()
@@ -133,6 +135,9 @@ class InputPath:
             self._partial_samples = 0
             self._partial_text = ""
             self._endpointer.reset()
+            # a cancelled hop runs on, and a reset written before it finishes gets overwritten
+            if hop is not None and not hop.done():
+                await hop
             self._vad.reset()
 
     async def aclose(self) -> None:

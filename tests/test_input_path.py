@@ -50,6 +50,33 @@ class FakeVad:
         self.resets += 1
 
 
+class HeldVad(FakeVad):
+    def __init__(
+        self,
+        probabilities: list[float],
+        release: threading.Event,
+        started: asyncio.Event,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        super().__init__(probabilities)
+        self._release = release
+        self._started = started
+        self._loop = loop
+        self.log: list[str] = []
+
+    def __call__(self, frame: np.ndarray) -> float:
+        self.log.append("call")
+        self._loop.call_soon_threadsafe(self._started.set)
+        self._release.wait()
+        probability = super().__call__(frame)
+        self.log.append("done")
+        return probability
+
+    def reset(self) -> None:
+        self.log.append("reset")
+        super().reset()
+
+
 class FakeTranscriber:
     def __init__(self, name: str) -> None:
         self._name = name
@@ -367,4 +394,25 @@ async def test_transport_iterator_exhaustion_ends_the_event_stream() -> None:
     assert without_partials(events) == [SpeechStarted()]
     assert final.handed == []
     assert connection.closed
+    await path.aclose()
+
+
+async def test_vad_reset_lands_after_the_in_flight_hop(release: threading.Event) -> None:
+    started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    vad = HeldVad([0.9] * 90, release, started, loop)
+    connection = FakeConnection(scripted_frames(90))
+    path = InputPath(connection, vad, FakeTranscriber("partial"), FakeTranscriber("final"))
+
+    async def consume() -> list[InputEvent]:
+        return [event async for event in path.events()]
+
+    consumer = asyncio.create_task(consume())
+    await started.wait()
+    consumer.cancel()
+    loop.call_soon(release.set)
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    assert vad.log == ["call", "done", "reset"]
     await path.aclose()
