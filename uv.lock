@@ -852,6 +852,7 @@ dependencies = [
     { name = "aiortc" },
     { name = "av" },
     { name = "faster-whisper" },
+    { name = "kokoro-onnx" },
     { name = "numpy" },
     { name = "onnxruntime" },
     { name = "pydantic" },
@@ -859,7 +860,6 @@ dependencies = [
 
 [package.dev-dependencies]
 bench = [
-    { name = "kokoro-onnx" },
     { name = "openai" },
 ]
 dev = [
@@ -874,16 +874,14 @@ requires-dist = [
     { name = "aiortc", specifier = ">=1.15" },
     { name = "av", specifier = ">=17.1,<18" },
     { name = "faster-whisper", specifier = ">=1.2" },
+    { name = "kokoro-onnx", specifier = ">=0.6" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "onnxruntime", specifier = ">=1.20" },
     { name = "pydantic", specifier = ">=2.0" },
 ]
 
 [package.metadata.requires-dev]
-bench = [
-    { name = "kokoro-onnx", specifier = ">=0.6" },
-    { name = "openai", specifier = ">=1.0" },
-]
+bench = [{ name = "openai", specifier = ">=1.0" }]
 dev = [
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
