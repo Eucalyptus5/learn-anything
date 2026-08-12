@@ -1,4 +1,5 @@
 import re
+from collections.abc import AsyncIterator
 
 _BOUNDARY_CHARS = ".?!;:,"
 _ABBREVIATIONS = ("e.g.", "i.e.", "etc.", "vs.", "Dr.")
@@ -37,3 +38,29 @@ def split_clauses(text: str, min_words: int, max_words: int) -> tuple[list[str],
         count = 0
 
     return clauses, text[start:]
+
+
+async def clause_chunks(
+    tokens: AsyncIterator[str],
+    *,
+    first_min_words: int = 3,
+    min_words: int = 8,
+    max_words: int = 12,
+) -> AsyncIterator[str]:
+    buffer = ""
+    released = False
+    async for token in tokens:
+        buffer += token
+        if not released:
+            first, _ = split_clauses(buffer, first_min_words, max_words)
+            if not first:
+                continue
+            released = True
+            yield first[0]
+            buffer = buffer.lstrip()[len(first[0]) :]
+        clauses, buffer = split_clauses(buffer, min_words, max_words)
+        for clause in clauses:
+            yield clause
+    remainder = buffer.strip()
+    if remainder:
+        yield remainder

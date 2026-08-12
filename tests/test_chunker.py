@@ -1,4 +1,9 @@
-from tutor.chunker import split_clauses
+import asyncio
+from collections.abc import AsyncIterator
+
+import pytest
+
+from tutor.chunker import clause_chunks, split_clauses
 
 
 def test_splits_on_period_followed_by_whitespace() -> None:
@@ -165,3 +170,124 @@ def test_return_shape_is_list_and_string_tuple() -> None:
     clauses, remainder = result
     assert isinstance(clauses, list)
     assert isinstance(remainder, str)
+
+
+async def _stream(pieces: list[str]) -> AsyncIterator[str]:
+    for piece in pieces:
+        yield piece
+
+
+async def test_mid_word_token_cuts_still_yield_whole_clauses() -> None:
+    pieces = [
+        "The sys",
+        "tem logs each reque",
+        "st,",
+        " then it wri",
+        "tes the response to di",
+        "sk. ",
+    ]
+    clauses = [
+        clause
+        async for clause in clause_chunks(
+            _stream(pieces), first_min_words=3, min_words=3, max_words=50
+        )
+    ]
+    assert clauses == ["The system logs each request,", "then it writes the response to disk."]
+
+
+async def test_first_chunk_uses_first_min_words_then_switches_to_min_words() -> None:
+    text = "Yes, that is right, and then also, we look at the second clause, which is longer. "
+    tokens = [f"{word} " for word in text.split()]
+
+    clauses = [
+        clause
+        async for clause in clause_chunks(
+            _stream(tokens), first_min_words=3, min_words=8, max_words=50
+        )
+    ]
+
+    assert clauses == [
+        "Yes, that is right,",
+        "and then also, we look at the second clause,",
+        "which is longer.",
+    ]
+
+
+async def test_trailing_remainder_is_flushed_stripped_at_source_exhaustion() -> None:
+    tokens = ["This ", "finishes ", "quickly. ", "Wrap up"]
+
+    clauses = [
+        clause
+        async for clause in clause_chunks(
+            _stream(tokens), first_min_words=3, min_words=8, max_words=50
+        )
+    ]
+
+    assert clauses == ["This finishes quickly.", "Wrap up"]
+
+
+async def test_empty_source_yields_nothing() -> None:
+    clauses = [clause async for clause in clause_chunks(_stream([]))]
+    assert clauses == []
+
+
+async def test_cancelling_the_consumer_propagates_and_does_not_flush_the_buffer() -> None:
+    entered = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def source() -> AsyncIterator[str]:
+        entered.set()
+        yield "partial fragment without a boundary "
+        await blocked.wait()
+        yield "unreachable "
+
+    received: list[str] = []
+
+    async def consume() -> None:
+        async for clause in clause_chunks(source()):
+            received.append(clause)
+
+    task = asyncio.create_task(consume())
+    await entered.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert received == []
+    assert task.cancelled()
+
+
+async def test_one_token_with_several_boundaries_only_shortens_the_first_chunk() -> None:
+    text = "Yes, that is right, and then also, we look at the second clause, which is longer. "
+
+    clauses = [
+        clause
+        async for clause in clause_chunks(
+            _stream([text]), first_min_words=3, min_words=8, max_words=50
+        )
+    ]
+
+    assert clauses == [
+        "Yes, that is right,",
+        "and then also, we look at the second clause,",
+        "which is longer.",
+    ]
+
+
+async def test_boundary_free_run_is_forced_into_max_words_chunks() -> None:
+    tokens = [f"w{i} " for i in range(30)]
+
+    clauses = [
+        clause
+        async for clause in clause_chunks(
+            _stream(tokens), first_min_words=3, min_words=8, max_words=12
+        )
+    ]
+
+    assert clauses == [
+        " ".join(f"w{i}" for i in range(12)),
+        " ".join(f"w{i}" for i in range(12, 24)),
+        " ".join(f"w{i}" for i in range(24, 30)),
+    ]
+    assert all(len(clause.split()) <= 12 for clause in clauses)
