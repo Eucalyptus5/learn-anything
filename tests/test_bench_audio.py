@@ -6,7 +6,8 @@ from typing import Any
 import numpy as np
 import pytest
 
-from tutor.constants import SAMPLE_RATE
+from tutor.constants import FRAME_SAMPLES, SAMPLE_RATE
+from tutor.endpointer import SILENCE_WINDOW_MS
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "bench_audio.py"
 _spec = importlib.util.spec_from_file_location("bench_audio", SCRIPT)
@@ -68,3 +69,33 @@ def test_ensure_fixture_returns_int16(tmp_path: Path, monkeypatch: pytest.Monkey
 
     assert audio.dtype == np.int16
     np.testing.assert_array_equal(audio, samples)
+
+
+def silence_frames_to_end_of_turn() -> int:
+    window = SILENCE_WINDOW_MS * SAMPLE_RATE // 1000
+    return window // FRAME_SAMPLES + 1
+
+
+def test_replay_times_a_turn_from_the_last_silence_start() -> None:
+    tail = silence_frames_to_end_of_turn()
+    probabilities = [0.9] * 3 + [0.0] * 2 + [0.9] * 3 + [0.0] * tail
+    frames = [(p, float(i)) for i, p in enumerate(probabilities)]
+
+    turns = bench_audio.replay_turns(frames, [100.0])
+
+    assert len(turns) == 1
+    assert turns[0].silence_at == 8.0
+    assert turns[0].silence_starts == 2
+    assert turns[0].end_at == 100.0
+    assert turns[0].wait == 92.0
+
+
+def test_replay_pairs_turns_with_end_stamps_in_order() -> None:
+    utterance = [0.9] * 3 + [0.0] * silence_frames_to_end_of_turn()
+    frames = [(p, float(i)) for i, p in enumerate(utterance * 2)]
+
+    turns = bench_audio.replay_turns(frames, [50.0, 90.0])
+
+    assert [t.silence_at for t in turns] == [3.0, 22.0]
+    assert [t.end_at for t in turns] == [50.0, 90.0]
+    assert [t.silence_starts for t in turns] == [1, 1]

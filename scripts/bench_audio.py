@@ -1,8 +1,9 @@
-"""Latency and memory for the local audio path: Silero VAD, Faster-Whisper, Kokoro.
+"""Latency and memory for the local audio path: Silero VAD, Faster-Whisper, Kokoro, and the
+assembled input path driven in real time.
 
 Every block discards one warm-up and reports n, median, and p95 in whole milliseconds, or
-whole microseconds for the per-frame VAD, with process RSS and system swap sampled before and
-after. No microphone is opened; the speech fixture is synthesized once with the macOS `say`
+whole microseconds for the per-frame figures, with process RSS and system swap sampled before
+and after. No microphone is opened; the speech fixture is synthesized once with the macOS `say`
 command.
 """
 
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import time
 import wave
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -28,8 +30,13 @@ from tutor.constants import FRAME_MS, FRAME_SAMPLES, SAMPLE_RATE, TTS_SAMPLE_RAT
 if TYPE_CHECKING:
     from faster_whisper import WhisperModel
 
+    from tutor.stt import Transcriber
+    from tutor.vad import SileroVad
+
 MODELS = REPO / "models"
 FIXTURE = MODELS / "bench" / "utterance.wav"
+
+INPUT_PATH_TAIL_FRAMES = 20  # 640 ms of silence, enough to close a turn on a 500 ms window
 
 FRAGMENT_MS = [256, 384, 512, 640, 768, 1024, 2000, 4000, 8000]
 FRAGMENT_OFFSETS = 5
@@ -329,6 +336,185 @@ async def bench_kokoro(samples: int, weights: str) -> None:
     end(b)
 
 
+class PacedSource:
+    def __init__(self, frames: list[np.ndarray]) -> None:
+        from tutor.transport import INBOUND_CAPACITY
+
+        self._frames = frames
+        self._queue: asyncio.Queue[np.ndarray | None] = asyncio.Queue(maxsize=INBOUND_CAPACITY)
+        self.hops: list[float] = []
+        self.dropped_frames = 0
+
+    # the real reader runs on the peer's clock, so a stalled consumer loses the oldest frames
+    def _offer(self, item: np.ndarray | None) -> None:
+        while self._queue.full():
+            self._queue.get_nowait()
+            self.dropped_frames += 1
+        self._queue.put_nowait(item)
+
+    async def produce(self) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time()
+        for frame in self._frames:
+            self._offer(frame)
+            deadline += FRAME_MS / 1000
+            await asyncio.sleep(max(0.0, deadline - loop.time()))
+        self._offer(None)
+
+    async def frames(self) -> AsyncGenerator[np.ndarray, None]:
+        while True:
+            frame = await self._queue.get()
+            if frame is None:
+                return
+            handed = time.perf_counter()
+            yield frame
+            self.hops.append(time.perf_counter() - handed)
+
+
+class TimedVad:
+    def __init__(self, vad: "SileroVad") -> None:
+        self._vad = vad
+        self.probabilities: list[tuple[float, float]] = []
+
+    def __call__(self, frame: np.ndarray) -> float:
+        probability = self._vad(frame)
+        self.probabilities.append((probability, time.perf_counter()))
+        return probability
+
+    def reset(self) -> None:
+        self._vad.reset()
+
+
+class TimedTranscriber:
+    def __init__(self, transcriber: "Transcriber") -> None:
+        self._transcriber = transcriber
+        self.spans: list[tuple[float, float]] = []
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        started = time.perf_counter()
+        text = self._transcriber.transcribe(audio)
+        self.spans.append((started, time.perf_counter()))
+        return text
+
+
+@dataclass
+class TurnTiming:
+    silence_at: float
+    end_at: float
+    silence_starts: int
+
+    @property
+    def wait(self) -> float:
+        return self.end_at - self.silence_at
+
+
+def replay_turns(
+    probabilities: list[tuple[float, float]], end_stamps: list[float]
+) -> list[TurnTiming]:
+    from tutor.endpointer import Endpointer, EndpointEvent
+    from tutor.input_path import START_FRAMES, START_THRESHOLD
+
+    endpointer = Endpointer(start_frames=START_FRAMES, start_threshold=START_THRESHOLD)
+    replayed: list[tuple[float, int]] = []
+    silence_at = 0.0
+    starts = 0
+    for probability, stamp in probabilities:
+        event = endpointer.push(probability)
+        if event is EndpointEvent.SILENCE_START:
+            silence_at = stamp
+            starts += 1
+        elif event is EndpointEvent.END_OF_TURN:
+            replayed.append((silence_at, starts))
+            starts = 0
+    return [TurnTiming(at, end, n) for (at, n), end in zip(replayed, end_stamps)]
+
+
+async def bench_input_path(audio: np.ndarray, samples: int) -> None:
+    from tutor.endpointer import SILENCE_WINDOW_MS
+    from tutor.input_path import EndOfTurn, InputPath, PartialTranscript
+    from tutor.stt import FINAL_CPU_THREADS, PARTIAL_CPU_THREADS, Transcriber, load_whisper
+    from tutor.vad import SileroVad
+
+    b = begin("input path (silero + two whisper workers, real time)")
+    load = time.perf_counter()
+    vad = SileroVad(MODELS / "silero" / "silero_vad.onnx")
+    print(f"  vad load {int((time.perf_counter() - load) * 1000)}ms")
+    load = time.perf_counter()
+    partial_model = load_whisper(MODELS / "whisper", cpu_threads=PARTIAL_CPU_THREADS)
+    print(
+        f"  partial whisper load {int((time.perf_counter() - load) * 1000)}ms "
+        f"({PARTIAL_CPU_THREADS} cpu thread)"
+    )
+    load = time.perf_counter()
+    final_model = load_whisper(MODELS / "whisper", cpu_threads=FINAL_CPU_THREADS)
+    print(
+        f"  final whisper load {int((time.perf_counter() - load) * 1000)}ms "
+        f"({FINAL_CPU_THREADS} cpu threads)"
+    )
+    print(f"  rss with the vad and both whisper models loaded {rss_mb():.0f} MB")
+
+    whole = len(audio) - len(audio) % FRAME_SAMPLES
+    tail = np.zeros(INPUT_PATH_TAIL_FRAMES * FRAME_SAMPLES, dtype=np.int16)
+    utterance = np.concatenate([audio[:whole], tail])
+    stream = np.tile(utterance, samples + 1)
+    frames = [stream[i : i + FRAME_SAMPLES] for i in range(0, len(stream), FRAME_SAMPLES)]
+    per_utterance = len(utterance) // FRAME_SAMPLES
+    print(
+        f"  {samples + 1} utterances of {per_utterance} frames "
+        f"({len(utterance) / SAMPLE_RATE:.2f}s each, {len(frames) * FRAME_MS / 1000:.1f}s of stream)"
+    )
+
+    timed_vad = TimedVad(vad)
+    partial = TimedTranscriber(Transcriber(partial_model))
+    final = TimedTranscriber(Transcriber(final_model))
+    source = PacedSource(frames)
+    path = InputPath(source, timed_vad, partial, final)
+    producer = asyncio.create_task(source.produce())
+
+    end_stamps: list[float] = []
+    end_frames: list[int] = []
+    partials: list[int] = []
+    seen = 0
+    async for event in path.events():
+        if isinstance(event, PartialTranscript):
+            seen += 1
+        elif isinstance(event, EndOfTurn):
+            end_stamps.append(time.perf_counter())
+            end_frames.append(len(source.hops))
+            partials.append(seen)
+            seen = 0
+            print(f"  {len(end_stamps)}/{samples + 1}", end="\r", file=sys.stderr)
+    print(" " * 20, end="\r", file=sys.stderr)
+    await producer
+    await path.aclose()
+
+    turns = replay_turns(timed_vad.probabilities, end_stamps)[1:]
+    at_end_of_turn = set(end_frames)
+    hops = [
+        hop
+        for index, hop in enumerate(source.hops)
+        if index >= per_utterance and index not in at_end_of_turn
+    ]
+    starts = [t.silence_starts for t in turns]
+    counts = partials[1:]
+    decodes = [end - start for start, end in final.spans if start > end_stamps[0]]
+    overruns = sum(1 for t in turns if t.wait * 1000 > SILENCE_WINDOW_MS)
+    in_flight = sum(1 for t in turns if any(s <= t.silence_at <= e for s, e in partial.spans))
+
+    report_us("hand-off to next request (loop)", hops)
+    report("silence start to final transcript", [t.wait for t in turns])
+    print(f"  {overruns} of {len(turns)} turns wait past the {SILENCE_WINDOW_MS} ms silence window")
+    report("final transcriber run", decodes)
+    print(f"  {len(decodes)} final decodes ran across {len(turns)} timed turns")
+    print(
+        f"  silence starts per utterance median {statistics.median(starts):.1f} max {max(starts)}"
+    )
+    print(f"  partials per utterance median {statistics.median(counts):.1f} max {max(counts)}")
+    print(f"  {in_flight} of {len(turns)} timed turns had a partial in flight at the silence start")
+    print(f"  dropped frames {source.dropped_frames}")
+    end(b)
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--blocks", default="silero,whisper,kokoro")
@@ -349,6 +535,8 @@ async def main() -> int:
         bench_whisper(audio, args.samples)
     if "whisper-fragments" in blocks:
         bench_whisper_fragments(audio)
+    if "input-path" in blocks:
+        await bench_input_path(audio, args.samples)
     if "kokoro" in blocks:
         await bench_kokoro(args.samples, args.kokoro_weights)
 
