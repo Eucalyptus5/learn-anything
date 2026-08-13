@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 
 import numpy as np
@@ -34,3 +35,12 @@ class Speaker:
             await self._utterance
         finally:
             self._utterance = None
+
+    async def cancel(self) -> None:
+        utterance = self._utterance
+        if utterance is None or utterance.done():
+            return
+        self._transport.flush_playout()
+        utterance.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await utterance

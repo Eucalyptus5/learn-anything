@@ -54,6 +54,64 @@ class HeldSynthesizer(FakeSynthesizer):
         return audio
 
 
+class SignallingSynthesizer(HeldSynthesizer):
+    def __init__(
+        self,
+        release: threading.Event,
+        started: asyncio.Event,
+        finished: asyncio.Event,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        super().__init__(release, started, loop)
+        self._finished = finished
+
+    def synthesize(self, text: str) -> np.ndarray:
+        audio = super().synthesize(text)
+        self._loop.call_soon_threadsafe(self._finished.set)
+        return audio
+
+
+class OverlappingSynthesizer(FakeSynthesizer):
+    def __init__(
+        self,
+        release: threading.Event,
+        started: asyncio.Event,
+        finished: asyncio.Event,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        super().__init__()
+        self._release = release
+        self._started = started
+        self._finished = finished
+        self._loop = loop
+        self._entered = threading.Event()
+        self._first_done = threading.Event()
+        self.first_done_at_replacement: bool | None = None
+
+    def synthesize(self, text: str) -> np.ndarray:
+        if self._entered.is_set():
+            self.first_done_at_replacement = self._first_done.is_set()
+            self._release.set()
+            return super().synthesize(text)
+        self._entered.set()
+        audio = super().synthesize(text)
+        self._loop.call_soon_threadsafe(self._started.set)
+        self._release.wait()
+        self._first_done.set()
+        self._loop.call_soon_threadsafe(self._finished.set)
+        return audio
+
+
+class FlushLoggingTransport(FakeTransport):
+    def __init__(self, log: list[str]) -> None:
+        super().__init__()
+        self._log = log
+
+    def flush_playout(self) -> None:
+        self._log.append("flush")
+        super().flush_playout()
+
+
 @pytest.fixture
 def release() -> Iterator[threading.Event]:
     event = threading.Event()
@@ -168,6 +226,201 @@ async def test_a_second_speak_while_one_is_in_flight_is_refused(
         *(len(chunk) for chunk in CHUNKS),
         len("after"),
     ]
+
+
+async def test_cancel_drops_playout_once_before_speak_unwinds(
+    release: threading.Event,
+) -> None:
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    synth = HeldSynthesizer(release, started, loop)
+    log: list[str] = []
+    transport = FlushLoggingTransport(log)
+    speaker = Speaker(synth, transport)
+
+    async def unwinding() -> None:
+        try:
+            await speaker.speak(source(CHUNKS))
+        except asyncio.CancelledError:
+            log.append("unwound")
+            raise
+
+    utterance = asyncio.create_task(unwinding())
+    await started.wait()
+    await speaker.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await utterance
+
+    assert transport.flushes == 1
+    assert log == ["flush", "unwound"]
+
+
+async def test_the_caller_awaiting_speak_sees_cancelled_error(
+    release: threading.Event,
+) -> None:
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    synth = HeldSynthesizer(release, started, loop)
+    speaker = Speaker(synth, FakeTransport())
+
+    utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
+    await started.wait()
+    await speaker.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await utterance
+
+    assert utterance.cancelled()
+    assert speaker._utterance is None
+
+
+async def test_cancel_while_suspended_on_the_source_stops_the_utterance() -> None:
+    waiting = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def gated() -> AsyncIterator[str]:
+        yield CHUNKS[0]
+        waiting.set()
+        await gate.wait()
+        yield CHUNKS[1]
+
+    synth = FakeSynthesizer()
+    transport = FakeTransport()
+    speaker = Speaker(synth, transport)
+
+    utterance = asyncio.create_task(speaker.speak(gated()))
+    await waiting.wait()
+    await speaker.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await utterance
+
+    gate.set()
+
+    assert synth.calls == [CHUNKS[0]]
+    assert [len(pcm) for pcm in transport.played] == [len(CHUNKS[0])]
+    assert transport.flushes == 1
+
+
+async def test_cancel_returns_normally_to_a_task_that_was_not_cancelled(
+    release: threading.Event,
+) -> None:
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    synth = HeldSynthesizer(release, started, loop)
+    speaker = Speaker(synth, FakeTransport())
+    log: list[str] = []
+    cancelling: list[int] = []
+
+    async def canceller() -> None:
+        await speaker.cancel()
+        log.append("continued")
+        cancelling.append(asyncio.current_task().cancelling())
+
+    utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
+    await started.wait()
+    caller = asyncio.create_task(canceller())
+    await caller
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await utterance
+
+    assert not caller.cancelled()
+    assert caller.result() is None
+    assert log == ["continued"]
+    assert cancelling == [0]
+
+
+async def test_audio_already_in_the_worker_thread_is_never_enqueued(
+    release: threading.Event,
+) -> None:
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    synth = SignallingSynthesizer(release, started, finished, loop)
+    transport = FakeTransport()
+    speaker = Speaker(synth, transport)
+
+    utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
+    await started.wait()
+    await speaker.cancel()
+    release.set()
+    await finished.wait()
+
+    with pytest.raises(asyncio.CancelledError):
+        await utterance
+
+    assert synth.calls == [CHUNKS[0]]
+    assert transport.played == []
+
+
+async def test_speak_accepts_a_new_utterance_after_cancel(release: threading.Event) -> None:
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    synth = SignallingSynthesizer(release, started, finished, loop)
+    transport = FakeTransport()
+    speaker = Speaker(synth, transport)
+
+    utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
+    await started.wait()
+    await speaker.cancel()
+    release.set()
+    await finished.wait()
+
+    with pytest.raises(asyncio.CancelledError):
+        await utterance
+
+    await speaker.speak(source(["after"]))
+
+    assert synth.calls[-1] == "after"
+    assert [len(pcm) for pcm in transport.played] == [len("after")]
+    assert speaker._utterance is None
+
+
+async def test_cancel_on_an_idle_speaker_is_a_no_op() -> None:
+    transport = FakeTransport()
+    speaker = Speaker(FakeSynthesizer(), transport)
+
+    await speaker.cancel()
+
+    assert transport.flushes == 0
+
+    await speaker.speak(source(CHUNKS))
+    await speaker.cancel()
+
+    assert transport.flushes == 0
+    assert speaker._utterance is None
+
+
+async def test_the_replacement_utterance_runs_while_the_abandoned_call_is_in_flight(
+    release: threading.Event,
+) -> None:
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    synth = OverlappingSynthesizer(release, started, finished, loop)
+    transport = FakeTransport()
+    speaker = Speaker(synth, transport)
+
+    utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
+    await started.wait()
+    await speaker.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await utterance
+
+    await speaker.speak(source(["after"]))
+    await finished.wait()
+
+    assert synth.first_done_at_replacement is False
+    assert synth.calls == [CHUNKS[0], "after"]
+    assert [len(pcm) for pcm in transport.played] == [len("after")]
+    assert transport.flushes == 1
 
 
 async def test_warm_fills_the_cache_and_calls_the_synth_once_per_opener() -> None:
