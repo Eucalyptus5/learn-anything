@@ -1,6 +1,9 @@
 import asyncio
 from collections.abc import AsyncIterator
 
+import numpy as np
+
+from tutor.openers import synthesize_openers
 from tutor.transport import Connection
 from tutor.tts import KokoroSynthesizer
 
@@ -10,6 +13,13 @@ class Speaker:
         self._synth = synth
         self._transport = transport
         self._utterance: asyncio.Task[None] | None = None
+        self._openers: dict[str, np.ndarray] = {}
+
+    async def warm(self) -> None:
+        self._openers = await asyncio.to_thread(synthesize_openers, self._synth)
+
+    async def speak_opener(self, key: str) -> None:
+        await self._transport.play(self._openers[key])
 
     async def _drain(self, chunks: AsyncIterator[str]) -> None:
         async for chunk in chunks:

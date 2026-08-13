@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from tests.fakes import FakeSynthesizer, FakeTransport
+from tutor.openers import OPENER_PHRASES
 from tutor.speech import Speaker
 
 CHUNKS = ["one", "a longer clause", "two words"]
@@ -167,3 +168,57 @@ async def test_a_second_speak_while_one_is_in_flight_is_refused(
         *(len(chunk) for chunk in CHUNKS),
         len("after"),
     ]
+
+
+async def test_warm_fills_the_cache_and_calls_the_synth_once_per_opener() -> None:
+    synth = FakeSynthesizer()
+    speaker = Speaker(synth, FakeTransport())
+
+    await speaker.warm()
+
+    assert synth.calls == list(OPENER_PHRASES.values())
+    assert set(speaker._openers) == set(OPENER_PHRASES)
+
+
+async def test_warm_does_not_block_the_event_loop(release: threading.Event) -> None:
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    started = asyncio.Event()
+    synth = HeldSynthesizer(release, started, loop)
+    speaker = Speaker(synth, FakeTransport())
+
+    warming = asyncio.create_task(speaker.warm())
+    await started.wait()
+
+    assert synth.log == ["call"]
+    assert speaker._openers == {}
+
+    release.set()
+    await warming
+
+    assert len(synth.threads) == len(OPENER_PHRASES)
+    assert all(ident != loop_thread for ident in synth.threads)
+    assert set(speaker._openers) == set(OPENER_PHRASES)
+
+
+async def test_speak_opener_enqueues_the_cached_array_without_resynthesizing() -> None:
+    synth = FakeSynthesizer()
+    transport = FakeTransport()
+    speaker = Speaker(synth, transport)
+
+    await speaker.warm()
+    calls_after_warm = list(synth.calls)
+
+    await speaker.speak_opener("thinking")
+
+    assert synth.calls == calls_after_warm
+    assert len(transport.played) == 1
+    np.testing.assert_array_equal(transport.played[0], speaker._openers["thinking"])
+
+
+async def test_speak_opener_with_an_unknown_key_raises_key_error() -> None:
+    speaker = Speaker(FakeSynthesizer(), FakeTransport())
+    await speaker.warm()
+
+    with pytest.raises(KeyError):
+        await speaker.speak_opener("nope")
