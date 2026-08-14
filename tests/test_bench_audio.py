@@ -99,3 +99,55 @@ def test_replay_pairs_turns_with_end_stamps_in_order() -> None:
     assert [t.silence_at for t in turns] == [3.0, 22.0]
     assert [t.end_at for t in turns] == [50.0, 90.0]
     assert [t.silence_starts for t in turns] == [1, 1]
+
+
+def test_a_chunk_landing_inside_the_previous_playout_opens_no_gap() -> None:
+    assert bench_audio.playout_gaps([0.0, 0.1, 0.2], [0.5, 0.5, 0.5]) == []
+
+
+def test_a_late_chunk_opens_one_gap_and_the_next_arrival_closes_it() -> None:
+    gaps = bench_audio.playout_gaps([0.0, 0.7, 0.8], [0.5, 0.5, 0.5])
+
+    assert gaps == pytest.approx([0.2])
+
+
+def test_the_first_chunk_is_never_a_gap() -> None:
+    assert bench_audio.playout_gaps([5.0], [0.1]) == []
+    assert bench_audio.playout_gaps([5.0, 5.05], [0.1, 0.1]) == []
+
+
+def test_an_unreturned_abandoned_call_counts_as_in_flight() -> None:
+    replacement = bench_audio.SynthSpan(1.0, 2.0, 4, 96000)
+
+    assert bench_audio.in_flight_at(None, replacement)
+
+
+def test_an_abandoned_call_returning_after_the_replacement_counts_as_in_flight() -> None:
+    replacement = bench_audio.SynthSpan(1.0, 2.0, 4, 96000)
+    abandoned = bench_audio.SynthSpan(0.0, 2.5, 27, 648000)
+
+    assert bench_audio.in_flight_at(abandoned, replacement)
+
+
+def test_an_abandoned_call_returning_first_is_not_in_flight() -> None:
+    replacement = bench_audio.SynthSpan(1.0, 2.0, 4, 96000)
+    abandoned = bench_audio.SynthSpan(0.0, 1.5, 27, 648000)
+
+    assert not bench_audio.in_flight_at(abandoned, replacement)
+
+
+async def test_the_word_source_yields_one_word_at_a_time() -> None:
+    text = "The pool takes a semaphore"
+
+    items = [item async for item in bench_audio.words(text)]
+
+    assert items == ["The ", "pool ", "takes ", "a ", "semaphore "]
+    assert "".join(items).strip() == text
+
+
+async def test_the_whole_source_yields_the_text_once() -> None:
+    text = "The pool takes a semaphore"
+
+    items = [item async for item in bench_audio.whole(text)]
+
+    assert items == [text]

@@ -1,5 +1,6 @@
-"""Latency and memory for the local audio path: Silero VAD, Faster-Whisper, Kokoro, and the
-assembled input path driven in real time.
+"""Latency and memory for the local audio path: Silero VAD, Faster-Whisper, Kokoro, the
+assembled input path driven in real time, and the output path from the clause chunker through a
+barge-in.
 
 Every block discards one warm-up and reports n, median, and p95 in whole milliseconds, or
 whole microseconds for the per-frame figures, with process RSS and system swap sampled before
@@ -9,7 +10,9 @@ command.
 
 import argparse
 import asyncio
+import contextlib
 import os
+import resource
 import statistics
 import subprocess
 import sys
@@ -31,6 +34,7 @@ if TYPE_CHECKING:
     from faster_whisper import WhisperModel
 
     from tutor.stt import Transcriber
+    from tutor.tts import KokoroSynthesizer
     from tutor.vad import SileroVad
 
 MODELS = REPO / "models"
@@ -60,6 +64,27 @@ TTS_TEXTS = [
         ),
     ),
 ]
+TURN_TEXT = (
+    "Start in connection_pool.py, line 142, the acquire path. The pool takes a semaphore "
+    "before it hands out a socket, and the worker releases it in a finally block, so a panic "
+    "during a flush cannot leak a permit. The timeout on line 150 bounds the wait but never "
+    "the flush itself."
+)
+ABANDONED_TEXT = dict(TTS_TEXTS)["full turn"]
+REPLACEMENT_TEXT = "Checking the acquire path."
+CHUNK_MAX_WORDS = 12
+CANCEL_AFTER_S = 0.05
+
+BLOCKS = (
+    "silero",
+    "whisper",
+    "whisper-fragments",
+    "input-path",
+    "kokoro",
+    "chunked",
+    "cancel",
+    "combined",
+)
 
 
 def rss_mb(pid: int | None = None) -> float:
@@ -515,6 +540,283 @@ async def bench_input_path(audio: np.ndarray, samples: int) -> None:
     end(b)
 
 
+@dataclass
+class SynthSpan:
+    started: float
+    ended: float
+    words: int
+    samples: int
+
+    @property
+    def elapsed(self) -> float:
+        return self.ended - self.started
+
+    @property
+    def audio(self) -> float:
+        return self.samples / TTS_SAMPLE_RATE
+
+
+class StampingTransport:
+    def __init__(self) -> None:
+        self.stamps: list[float] = []
+        self.lengths: list[int] = []
+        self.flushes = 0
+
+    async def play(self, pcm: np.ndarray) -> None:
+        self.stamps.append(time.perf_counter())
+        self.lengths.append(len(pcm))
+
+    def flush_playout(self) -> None:
+        self.flushes += 1
+
+    def reset(self) -> None:
+        self.stamps.clear()
+        self.lengths.clear()
+
+
+# called from pool threads, so the bookkeeping stays list appends and one counter
+class TimedSynthesizer:
+    def __init__(self, synth: "KokoroSynthesizer") -> None:
+        self._synth = synth
+        self.spans: list[SynthSpan] = []
+        self.issued = 0
+
+    def synthesize(self, text: str) -> np.ndarray:
+        self.issued += 1
+        started = time.perf_counter()
+        audio = self._synth.synthesize(text)
+        self.spans.append(SynthSpan(started, time.perf_counter(), len(text.split()), len(audio)))
+        return audio
+
+    async def settle(self) -> None:
+        while len(self.spans) < self.issued:
+            await asyncio.sleep(0.005)
+
+
+async def words(text: str) -> AsyncGenerator[str, None]:
+    for word in text.split():
+        yield word + " "
+        await asyncio.sleep(0)
+
+
+async def whole(text: str) -> AsyncGenerator[str, None]:
+    yield text
+
+
+def playout_gaps(stamps: list[float], durations: list[float]) -> list[float]:
+    gaps: list[float] = []
+    playing_until = stamps[0]
+    for stamp, duration in zip(stamps, durations, strict=True):
+        if stamp > playing_until:
+            gaps.append(stamp - playing_until)
+            playing_until = stamp
+        playing_until += duration
+    return gaps
+
+
+def in_flight_at(abandoned: SynthSpan | None, replacement: SynthSpan) -> bool:
+    return abandoned is None or abandoned.ended > replacement.ended
+
+
+def load_kokoro() -> "KokoroSynthesizer":
+    from tutor.tts import KokoroSynthesizer
+
+    load = time.perf_counter()
+    synth = KokoroSynthesizer(
+        MODELS / "kokoro" / "kokoro-v1.0.fp16.onnx", MODELS / "kokoro" / "voices-v1.0.bin"
+    )
+    print(f"  kokoro load {int((time.perf_counter() - load) * 1000)}ms")
+    return synth
+
+
+async def bench_chunked(samples: int) -> None:
+    from tutor.chunker import clause_chunks
+    from tutor.speech import Speaker
+
+    b = begin("output path (kokoro fp16 through the clause chunker)")
+    synth = TimedSynthesizer(load_kokoro())
+    transport = StampingTransport()
+    speaker = Speaker(synth, transport)
+    await speaker.warm()
+
+    first: list[float] = []
+    full: list[float] = []
+    chunk_cost: list[float] = []
+    previous_playout: list[float] = []
+    behind = 0
+    gapped = 0
+    widest = 0.0
+    spoken = 0.0
+    for index in range(samples + 1):
+        transport.reset()
+        mark = len(synth.spans)
+        t = time.perf_counter()
+        await speaker.speak(clause_chunks(words(TURN_TEXT)))
+        elapsed = time.perf_counter() - t
+        spans = synth.spans[mark:]
+        durations = [s.audio for s in spans]
+        if index == 0:
+            print(f"  chunk word counts {[s.words for s in spans]}")
+        else:
+            first.append(transport.stamps[0] - t)
+            full.append(elapsed)
+            spoken = sum(durations)
+            for position, span in enumerate(spans[1:], start=1):
+                if span.words != CHUNK_MAX_WORDS:
+                    continue
+                chunk_cost.append(span.elapsed)
+                previous_playout.append(durations[position - 1])
+                if span.elapsed > durations[position - 1]:
+                    behind += 1
+            gaps = playout_gaps(transport.stamps, durations)
+            if gaps:
+                gapped += 1
+                widest = max(widest, max(gaps))
+        print(f"  chunked {index + 1}/{samples + 1}", end="\r", file=sys.stderr)
+    print(" " * 40, end="\r", file=sys.stderr)
+
+    whole_first: list[float] = []
+    for index in range(samples + 1):
+        transport.reset()
+        t = time.perf_counter()
+        await speaker.speak(whole(TURN_TEXT))
+        if index >= 1:
+            whole_first.append(transport.stamps[0] - t)
+        print(f"  whole turn {index + 1}/{samples + 1}", end="\r", file=sys.stderr)
+    print(" " * 40, end="\r", file=sys.stderr)
+
+    opener: list[float] = []
+    opener_audio = 0.0
+    for index in range(samples + 1):
+        transport.reset()
+        t = time.perf_counter()
+        await speaker.speak_opener("thinking")
+        if index >= 1:
+            opener.append(transport.stamps[0] - t)
+        opener_audio = transport.lengths[0] / TTS_SAMPLE_RATE
+
+    report("chunked time to first audio", first)
+    report("whole turn time to first audio", whole_first)
+    report("chunked full turn", full)
+    report_us("opener to playout", opener)
+    print(f"  opener audio {opener_audio * 1000:.0f}ms")
+    print(f"  the turn speaks {spoken:.2f}s of audio")
+    report(f"{CHUNK_MAX_WORDS}-word chunk synthesis", chunk_cost)
+    report("preceding chunk playout", previous_playout)
+    print(f"  {behind} of {len(chunk_cost)} full chunks cost more than the chunk before them buys")
+    print(f"  {gapped} of {samples} timed turns had a playout gap, widest {widest * 1000:.0f}ms")
+    end(b)
+
+
+async def bench_cancel(samples: int) -> None:
+    from tutor.speech import Speaker
+
+    b = begin("barge-in (cancel a full turn, replace it with a clause)")
+    synth = TimedSynthesizer(load_kokoro())
+    transport = StampingTransport()
+    speaker = Speaker(synth, transport)
+    replacement_words = len(REPLACEMENT_TEXT.split())
+
+    to_first: list[float] = []
+    returns: list[float] = []
+    offsets: list[float] = []
+    tax: list[float] = []
+    contended: list[float] = []
+    overlapped = 0
+    for index in range(samples + 1):
+        transport.reset()
+        mark = len(synth.spans)
+        speak_at = time.perf_counter()
+        task = asyncio.create_task(speaker.speak(whole(ABANDONED_TEXT)))
+        await asyncio.sleep(CANCEL_AFTER_S)
+        cancel_at = time.perf_counter()
+        await speaker.cancel()
+        returned = time.perf_counter() - cancel_at
+        await speaker.speak(whole(REPLACEMENT_TEXT))
+        spans = list(synth.spans[mark:])
+        replacement = next(s for s in spans if s.words == replacement_words)
+        still_running = in_flight_at(
+            next((s for s in spans if s.words != replacement_words), None), replacement
+        )
+        await synth.settle()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        abandoned = next(s for s in synth.spans[mark:] if s.words != replacement_words)
+        if index >= 1:
+            to_first.append(replacement.ended - cancel_at)
+            returns.append(returned)
+            offsets.append(cancel_at - speak_at)
+            tax.append(abandoned.elapsed)
+            contended.append(replacement.elapsed)
+            overlapped += still_running
+        print(f"  cancel {index + 1}/{samples + 1}", end="\r", file=sys.stderr)
+    print(" " * 40, end="\r", file=sys.stderr)
+
+    alone: list[float] = []
+    for index in range(samples + 1):
+        transport.reset()
+        mark = len(synth.spans)
+        await speaker.speak(whole(REPLACEMENT_TEXT))
+        if index >= 1:
+            alone.append(synth.spans[mark].elapsed)
+        print(f"  baseline {index + 1}/{samples + 1}", end="\r", file=sys.stderr)
+    print(" " * 40, end="\r", file=sys.stderr)
+
+    report("cancel to next first audio", to_first)
+    report_us("cancel() return", returns)
+    report("speak start to cancel", offsets)
+    report("abandoned call total", tax)
+    report("replacement under contention", contended)
+    report("replacement, nothing in flight", alone)
+    print(f"  {overlapped} of {samples} timed samples still had the abandoned call in flight")
+    end(b)
+
+
+def bench_combined(audio: np.ndarray) -> None:
+    from tutor.openers import synthesize_openers
+    from tutor.stt import FINAL_CPU_THREADS, PARTIAL_CPU_THREADS, Transcriber, load_whisper
+    from tutor.vad import SileroVad
+
+    b = begin("every model resident in one process")
+    vad = SileroVad(MODELS / "silero" / "silero_vad.onnx")
+    print(f"  rss with the vad {rss_mb():.0f} MB")
+    partial_model = load_whisper(MODELS / "whisper", cpu_threads=PARTIAL_CPU_THREADS)
+    print(f"  rss with the partial whisper {rss_mb():.0f} MB")
+    final_model = load_whisper(MODELS / "whisper", cpu_threads=FINAL_CPU_THREADS)
+    print(f"  rss with the final whisper {rss_mb():.0f} MB")
+    synth = load_kokoro()
+    print(f"  rss with kokoro {rss_mb():.0f} MB")
+    openers = synthesize_openers(synth)
+    print(f"  rss with {len(openers)} openers cached {rss_mb():.0f} MB")
+
+    frames = [
+        audio[i : i + FRAME_SAMPLES]
+        for i in range(0, len(audio) - FRAME_SAMPLES + 1, FRAME_SAMPLES)
+    ]
+    t = time.perf_counter()
+    for frame in frames:
+        vad(frame)
+    print(f"  n=1 vad over {len(frames)} frames {int((time.perf_counter() - t) * 1000)}ms")
+    t = time.perf_counter()
+    Transcriber(partial_model).transcribe(audio)
+    print(f"  n=1 partial transcribe {int((time.perf_counter() - t) * 1000)}ms")
+    t = time.perf_counter()
+    Transcriber(final_model).transcribe(audio)
+    print(f"  n=1 final transcribe {int((time.perf_counter() - t) * 1000)}ms")
+    t = time.perf_counter()
+    synth.synthesize(ABANDONED_TEXT)
+    print(
+        f"  n=1 synthesize {len(ABANDONED_TEXT.split())} words "
+        f"{int((time.perf_counter() - t) * 1000)}ms"
+    )
+
+    print(f"  rss after exercising every model {rss_mb():.0f} MB")
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 / 1024
+    print(f"  kernel peak rss {peak:.0f} MB")
+    print(f"  swap used {swap_used_mb():.0f} MB")
+    end(b)
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--blocks", default="silero,whisper,kokoro")
@@ -522,13 +824,17 @@ async def main() -> int:
     parser.add_argument("--kokoro-weights", default="fp16", choices=["fp16", "int8"])
     args = parser.parse_args()
 
+    blocks = [x.strip() for x in args.blocks.split(",")]
+    unknown = [name for name in blocks if name not in BLOCKS]
+    if unknown:
+        parser.error(f"unknown block {', '.join(unknown)}; known blocks are {', '.join(BLOCKS)}")
+
     print(f"machine swap used {swap_used_mb():.0f} MB at start")
     print("heaviest processes at start:")
     for row in heavy_processes():
         print(f"  {row}")
 
     audio = ensure_fixture()
-    blocks = [x.strip() for x in args.blocks.split(",")]
     if "silero" in blocks:
         bench_silero(audio)
     if "whisper" in blocks:
@@ -539,6 +845,12 @@ async def main() -> int:
         await bench_input_path(audio, args.samples)
     if "kokoro" in blocks:
         await bench_kokoro(args.samples, args.kokoro_weights)
+    if "chunked" in blocks:
+        await bench_chunked(args.samples)
+    if "cancel" in blocks:
+        await bench_cancel(args.samples)
+    if "combined" in blocks:
+        bench_combined(audio)
 
     print(f"\ncombined process rss {rss_mb():.0f} MB")
     print(f"machine swap used {swap_used_mb():.0f} MB at end")
