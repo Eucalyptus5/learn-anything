@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import re
 import threading
 from collections.abc import AsyncIterator, Iterator
 
@@ -10,6 +12,8 @@ from tutor.openers import OPENER_PHRASES
 from tutor.speech import Speaker
 
 CHUNKS = ["one", "a longer clause", "two words"]
+TIMING_CHUNKS = ["quorum", "the acquire path", "zebra crossing"]
+SPAN_PATTERN = re.compile(r"^tts\.(synthesize|first_audio|opener)( [a-z_]+=\d+)+$")
 
 
 class LoggingSynthesizer(FakeSynthesizer):
@@ -475,3 +479,98 @@ async def test_speak_opener_with_an_unknown_key_raises_key_error() -> None:
 
     with pytest.raises(KeyError):
         await speaker.speak_opener("nope")
+
+
+def tutor_speech_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if record.name == "tutor.speech"]
+
+
+async def test_one_utterance_logs_a_first_audio_span_and_one_synthesize_span_per_chunk(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    speaker = Speaker(FakeSynthesizer(), FakeTransport())
+
+    with caplog.at_level(logging.DEBUG, logger="tutor.speech"):
+        await speaker.speak(source(TIMING_CHUNKS))
+
+    records = tutor_speech_records(caplog)
+    messages = [record.getMessage() for record in records]
+
+    first_audio = [m for m in messages if m.startswith("tts.first_audio ")]
+    synthesize = [m for m in messages if m.startswith("tts.synthesize ")]
+
+    assert len(first_audio) == 1
+    assert f"words={len(TIMING_CHUNKS[0].split())}" in first_audio[0]
+
+    assert len(synthesize) == len(TIMING_CHUNKS)
+    for message, chunk in zip(synthesize, TIMING_CHUNKS, strict=True):
+        assert f"words={len(chunk.split())}" in message
+
+    for record in records:
+        assert record.levelno == logging.DEBUG
+        assert SPAN_PATTERN.match(record.getMessage())
+
+
+async def test_no_span_carries_the_spoken_text(caplog: pytest.LogCaptureFixture) -> None:
+    speaker = Speaker(FakeSynthesizer(), FakeTransport())
+
+    with caplog.at_level(logging.DEBUG, logger="tutor.speech"):
+        await speaker.speak(source(TIMING_CHUNKS))
+
+    messages = [record.getMessage() for record in tutor_speech_records(caplog)]
+
+    for chunk in TIMING_CHUNKS:
+        assert all(chunk not in message for message in messages)
+
+
+async def test_an_empty_source_logs_no_spans(caplog: pytest.LogCaptureFixture) -> None:
+    speaker = Speaker(FakeSynthesizer(), FakeTransport())
+
+    with caplog.at_level(logging.DEBUG, logger="tutor.speech"):
+        await speaker.speak(source([]))
+
+    assert tutor_speech_records(caplog) == []
+
+
+async def test_speak_opener_logs_one_opener_span_without_the_phrase_or_key(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    speaker = Speaker(FakeSynthesizer(), FakeTransport())
+
+    with caplog.at_level(logging.DEBUG, logger="tutor.speech"):
+        await speaker.warm()
+        warm_records = tutor_speech_records(caplog)
+        await speaker.speak_opener("thinking")
+        opener_records = tutor_speech_records(caplog)[len(warm_records) :]
+
+    assert warm_records == []
+    assert len(opener_records) == 1
+
+    message = opener_records[0].getMessage()
+    assert message.startswith("tts.opener ")
+    assert SPAN_PATTERN.match(message)
+    assert "thinking" not in message
+    assert OPENER_PHRASES["thinking"] not in message
+
+
+async def test_cancel_before_first_audio_logs_no_first_audio_span(
+    release: threading.Event, caplog: pytest.LogCaptureFixture
+) -> None:
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    synth = HeldSynthesizer(release, started, loop)
+    speaker = Speaker(synth, FakeTransport())
+
+    with caplog.at_level(logging.DEBUG, logger="tutor.speech"):
+        utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
+        await started.wait()
+        await speaker.cancel()
+        release.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await utterance
+
+    messages = [record.getMessage() for record in tutor_speech_records(caplog)]
+
+    assert not any(m.startswith("tts.first_audio") for m in messages)
+    assert not any(m.startswith("tts.synthesize") for m in messages)
