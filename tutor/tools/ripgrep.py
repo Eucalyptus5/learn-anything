@@ -42,13 +42,15 @@ def _clip(record: dict) -> None:
         return
 
     data["lines"]["text"] = data["lines"]["text"][:MAX_COLUMNS]
+    limit = len(data["lines"]["text"].encode())
     kept = []
     for submatch in data["submatches"]:
-        if submatch["start"] >= MAX_COLUMNS:
+        if submatch["start"] >= limit:
             continue
-        submatch["end"] = min(submatch["end"], MAX_COLUMNS)
-        span = submatch["end"] - submatch["start"]
-        submatch["match"]["text"] = submatch["match"]["text"][:span]
+        submatch["end"] = min(submatch["end"], limit)
+        if "text" in submatch["match"]:
+            span = submatch["end"] - submatch["start"]
+            submatch["match"]["text"] = submatch["match"]["text"].encode()[:span].decode()
         kept.append(submatch)
     data["submatches"] = kept
 

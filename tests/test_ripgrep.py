@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ FIXTURE_ROOT = Path(__file__).parent / "data" / "fixture_repo"
 class Spawned:
     def __init__(self) -> None:
         self.argv: list[str] = []
-        self.kwargs: dict = {}
+        self.kwargs: dict[str, object] = {}
         self.proc: asyncio.subprocess.Process | None = None
         self.calls = 0
         self.started = asyncio.Event()
@@ -52,7 +53,7 @@ def blocking_child(monkeypatch: pytest.MonkeyPatch) -> Spawned:
 
 
 @pytest.fixture
-def unreadable_helper():
+def unreadable_helper() -> Iterator[Path]:
     path = FIXTURE_ROOT / "src" / "pool_helpers.py"
     mode = path.stat().st_mode
     path.chmod(0o000)
@@ -60,6 +61,19 @@ def unreadable_helper():
         yield path
     finally:
         path.chmod(mode)
+
+
+def _match_record(path: str, number: int, text: str, submatches: list[dict]) -> dict:
+    return {
+        "type": "match",
+        "data": {
+            "path": {"text": path},
+            "lines": {"text": text},
+            "line_number": number,
+            "absolute_offset": 0,
+            "submatches": submatches,
+        },
+    }
 
 
 def matches(records: list[dict]) -> list[dict]:
@@ -119,7 +133,7 @@ async def test_run_ripgrep_argv(spawned: Spawned) -> None:
     assert Path(spawned.kwargs["cwd"]) == FIXTURE_ROOT
 
 
-async def test_no_match_returns_empty(spawned: Spawned) -> None:
+async def test_no_match_returns_empty() -> None:
     assert await run_ripgrep("zzznomatch", ["**/*.py"], FIXTURE_ROOT, SearchBudget()) == (
         [],
         0,
@@ -128,7 +142,7 @@ async def test_no_match_returns_empty(spawned: Spawned) -> None:
     )
 
 
-async def test_bad_pattern_raises_with_stderr(spawned: Spawned) -> None:
+async def test_bad_pattern_raises_with_stderr() -> None:
     with pytest.raises(RipgrepFailed, match="regex parse error"):
         await run_ripgrep("[", ["**/*.py"], FIXTURE_ROOT, SearchBudget())
 
@@ -147,7 +161,7 @@ async def test_unreadable_file_beside_match_still_returns_match(
     assert any("pool_helpers.py" in record.getMessage() for record in caplog.records)
 
 
-async def test_wide_lines_clip_to_max_columns(spawned: Spawned) -> None:
+async def test_wide_lines_clip_to_max_columns() -> None:
     records, byte_count, truncated, oversized = await run_ripgrep(
         "WIDE_ROW", ["src/wide.py"], FIXTURE_ROOT, SearchBudget(max_bytes=64000)
     )
@@ -196,7 +210,7 @@ async def test_oversized_record_is_dropped_and_search_continues(spawned: Spawned
     assert spawned.proc.returncode == 0
 
 
-async def test_oversized_applies_to_a_terminated_record(spawned: Spawned) -> None:
+async def test_oversized_applies_to_a_terminated_record() -> None:
     records, _, truncated, oversized = await run_ripgrep(
         "WIDE_ROW", ["src/wide.py"], FIXTURE_ROOT, SearchBudget(max_record_bytes=500)
     )
@@ -206,7 +220,7 @@ async def test_oversized_applies_to_a_terminated_record(spawned: Spawned) -> Non
     assert truncated is False
 
 
-async def test_big_line_clips_under_default_budget(spawned: Spawned) -> None:
+async def test_big_line_clips_under_default_budget() -> None:
     records, _, truncated, oversized = await run_ripgrep(
         "B", ["vendor/*.py"], FIXTURE_ROOT, SearchBudget()
     )
@@ -219,6 +233,49 @@ async def test_big_line_clips_under_default_budget(spawned: Spawned) -> None:
     assert len(found[0]["data"]["lines"]["text"]) == 400
     assert oversized is False
     assert truncated is False
+
+
+async def test_submatch_offsets_survive_non_ascii_lines(monkeypatch: pytest.MonkeyPatch) -> None:
+    accent = "\u00e9"
+    payload = "".join(
+        json.dumps(record) + "\n"
+        for record in (
+            _match_record(
+                "./src/accents.py",
+                1,
+                accent * 300 + "NEEDLE\n",
+                [{"match": {"text": "NEEDLE"}, "start": 600, "end": 606}],
+            ),
+            _match_record(
+                "./src/accents.py",
+                2,
+                accent * 398 + "NEEDLE" + accent * 50 + "\n",
+                [
+                    {"match": {"text": "NEEDLE"}, "start": 796, "end": 802},
+                    {"match": {"text": accent}, "start": 900, "end": 902},
+                ],
+            ),
+        )
+    )
+    _record_spawns(
+        monkeypatch, [sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", payload]
+    )
+
+    records, _, truncated, oversized = await run_ripgrep(
+        "NEEDLE", ["src/*.py"], FIXTURE_ROOT, SearchBudget()
+    )
+
+    first, second = records
+    assert len(first["data"]["lines"]["text"]) == 307
+    assert first["data"]["submatches"] == [{"match": {"text": "NEEDLE"}, "start": 600, "end": 606}]
+    assert len(second["data"]["lines"]["text"]) == 400
+    assert second["data"]["submatches"] == [{"match": {"text": "NE"}, "start": 796, "end": 798}]
+    for record in records:
+        line = record["data"]["lines"]["text"].encode()
+        for submatch in record["data"]["submatches"]:
+            assert line[submatch["start"] : submatch["end"]].decode() == submatch["match"]["text"]
+    assert truncated is False
+    assert oversized is False
 
 
 async def test_cancel_kills_child_and_reraises(blocking_child: Spawned) -> None:
