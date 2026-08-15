@@ -1,0 +1,3 @@
+#!/bin/sh
+version="${FAKE_RG_VERSION:-15.2.0}"
+printf 'ripgrep %s\n\nfeatures:+pcre2\n' "$version"
