@@ -11,15 +11,17 @@ dependencies = [
     "faster-whisper>=1.2",
     "onnxruntime>=1.20",
     "kokoro-onnx>=0.6",
-    "pydantic>=2.0",
+    "pydantic>=2.9",
 ]
 
 [tool.ruff]
 line-length = 100
+extend-exclude = ["tests/data/fixture_repo"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+norecursedirs = ["tests/data"]
 
 [dependency-groups]
 dev = [

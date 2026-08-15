@@ -877,7 +877,7 @@ requires-dist = [
     { name = "kokoro-onnx", specifier = ">=0.6" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "onnxruntime", specifier = ">=1.20" },
-    { name = "pydantic", specifier = ">=2.0" },
+    { name = "pydantic", specifier = ">=2.9" },
 ]
 
 [package.metadata.requires-dev]
