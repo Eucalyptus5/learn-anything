@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from tests.fakes import match_record, record_spawns
-from tutor.tools.models import SearchBudget, SearchResult
+from tutor.tools.models import ContextLine, SearchBudget, SearchResult
 from tutor.tools.search import search
 
 FIXTURE_ROOT = Path(__file__).parent / "data" / "fixture_repo"
@@ -134,3 +134,127 @@ async def test_match_text_has_no_trailing_newline() -> None:
     assert result.matches
     for match in result.matches:
         assert not match.text.endswith("\n")
+
+
+GOLDEN_CONTEXT = {
+    ("src/httpclient.py", 12): ([10, 11], [13, 14]),
+    ("src/pool.py", 1): ([], [2, 3]),
+    ("src/pool.py", 11): ([9, 10], [12, 13]),
+    ("src/pool.py", 14): ([], []),
+    ("src/pool.py", 15): ([], [17]),
+    ("src/pool.py", 16): ([], [18]),
+    ("src/pool.py", 26): ([24, 25], [27, 28]),
+    ("src/pool.py", 29): ([], [30]),
+    ("src/pool.py", 31): ([], []),
+    ("src/pool_helpers.py", 5): ([3, 4], [6, 7]),
+    ("src/pool_helpers.py", 12): ([10, 11], []),
+    ("src/pool_helpers.py", 13): ([], []),
+}
+
+
+async def test_first_line_match_has_no_before_context() -> None:
+    result = await search("acquire", ["src/**/*.py"], FIXTURE_ROOT, SearchBudget())
+
+    first = next(m for m in result.matches if (m.path, m.line) == ("src/pool.py", 1))
+    assert first.before == []
+    assert [line.line for line in first.after] == [2, 3]
+
+
+async def test_last_line_match_has_no_after_context() -> None:
+    result = await search("acquire", ["src/**/*.py"], FIXTURE_ROOT, SearchBudget())
+
+    last_of_pool = next(m for m in result.matches if (m.path, m.line) == ("src/pool.py", 31))
+    last_of_helpers = next(
+        m for m in result.matches if (m.path, m.line) == ("src/pool_helpers.py", 13)
+    )
+    assert last_of_pool.after == []
+    assert last_of_helpers.after == []
+
+
+async def test_overlapping_windows_do_not_duplicate_context() -> None:
+    result = await search("acquire", ["src/**/*.py"], FIXTURE_ROOT, SearchBudget())
+
+    earlier = next(m for m in result.matches if (m.path, m.line) == ("src/pool.py", 11))
+    later = next(m for m in result.matches if (m.path, m.line) == ("src/pool.py", 14))
+    assert [line.line for line in earlier.after] == [12, 13]
+    assert later.before == []
+
+    assert {
+        (match.path, match.line): (
+            [line.line for line in match.before],
+            [line.line for line in match.after],
+        )
+        for match in result.matches
+    } == GOLDEN_CONTEXT
+
+    seen: list[tuple[str, int]] = []
+    for match in result.matches:
+        for line in match.before + match.after:
+            assert not line.text.endswith("\n")
+            seen.append((match.path, line.line))
+    assert len(seen) == len(set(seen))
+    assert set(seen).isdisjoint(set(pairs(result)))
+
+
+async def test_zero_context_lines_reaches_the_child_and_yields_empty_lists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawned = record_spawns(monkeypatch, None)
+
+    result = await search("acquire", ["src/**/*.py"], FIXTURE_ROOT, SearchBudget(context_lines=0))
+
+    assert spawned.argv[spawned.argv.index("--context") + 1] == "0"
+    assert pairs(result) == GOLDEN
+    for match in result.matches:
+        assert match.before == []
+        assert match.after == []
+
+
+async def test_context_line_numbers_come_from_the_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = {
+        "type": "context",
+        "data": {
+            "path": {"text": "./src/a.py"},
+            "lines": {"text": "eight\n"},
+            "line_number": 8,
+            "absolute_offset": 0,
+            "submatches": [],
+        },
+    }
+    after = {
+        "type": "context",
+        "data": {
+            "path": {"text": "./src/a.py"},
+            "lines": {"text": "twelve\n"},
+            "line_number": 12,
+            "absolute_offset": 0,
+            "submatches": [],
+        },
+    }
+    other_file = {
+        "type": "context",
+        "data": {
+            "path": {"text": "./src/b.py"},
+            "lines": {"text": "b eleven\n"},
+            "line_number": 11,
+            "absolute_offset": 0,
+            "submatches": [],
+        },
+    }
+    hit = match_record(
+        "./src/a.py", 10, "ten acquire\n", [{"match": {"text": "acquire"}, "start": 4, "end": 11}]
+    )
+    payload = "".join(json.dumps(record) + "\n" for record in (before, hit, after, other_file))
+    record_spawns(
+        monkeypatch, [sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", payload]
+    )
+
+    result = await search("acquire", ["src/*.py"], FIXTURE_ROOT, SearchBudget())
+
+    assert len(result.matches) == 1
+    match = result.matches[0]
+    assert (match.path, match.line) == ("src/a.py", 10)
+    assert match.before == [ContextLine(line=8, text="eight")]
+    assert match.after == [ContextLine(line=12, text="twelve")]

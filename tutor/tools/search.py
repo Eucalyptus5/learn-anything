@@ -2,7 +2,7 @@ import base64
 from collections.abc import Sequence
 from pathlib import Path
 
-from tutor.tools.models import SearchBudget, SearchMatch, SearchResult
+from tutor.tools.models import ContextLine, SearchBudget, SearchMatch, SearchResult
 from tutor.tools.ripgrep import run_ripgrep
 
 
@@ -20,23 +20,40 @@ async def search(
 ) -> SearchResult:
     records, byte_count, truncated, oversized = await run_ripgrep(query, globs, root, budget)
 
-    matches: list[SearchMatch] = []
+    hits: list[tuple[str, int, str]] = []
+    context: dict[tuple[str, int], str] = {}
     for record in records:
-        if record["type"] != "match":
-            continue
         data = record["data"]
         path = _decode(data["path"])
         text = _decode(data["lines"])
         if path is None or text is None:
             continue
-        matches.append(
-            SearchMatch(
-                path=path.removeprefix("./"),
-                line=data["line_number"],
-                text=text.removesuffix("\n"),
-            )
-        )
-    matches.sort(key=lambda match: (match.path, match.line))
+        path = path.removeprefix("./")
+        text = text.removesuffix("\n")
+        if record["type"] == "match":
+            hits.append((path, data["line_number"], text))
+        else:
+            context[(path, data["line_number"])] = text
+    hits.sort(key=lambda hit: (hit[0], hit[1]))
+
+    taken: set[tuple[str, int]] = set()
+    matches: list[SearchMatch] = []
+    for path, line, text in hits:
+        before: list[ContextLine] = []
+        for number in range(line - budget.context_lines, line):
+            key = (path, number)
+            if key in context and key not in taken:
+                taken.add(key)
+                before.append(ContextLine(line=number, text=context[key]))
+
+        after: list[ContextLine] = []
+        for number in range(line + 1, line + budget.context_lines + 1):
+            key = (path, number)
+            if key in context and key not in taken:
+                taken.add(key)
+                after.append(ContextLine(line=number, text=context[key]))
+
+        matches.append(SearchMatch(path=path, line=line, text=text, before=before, after=after))
 
     return SearchResult(
         tool="search",
