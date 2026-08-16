@@ -2,8 +2,15 @@ import logging
 
 import pytest
 
-from tutor.tools.models import ContextLine, Position, SearchMatch, SearchResult
-from tutor.tools.provenance import TurnRegistry
+from tutor.chunker import split_clauses
+from tutor.tools.models import (
+    ContextLine,
+    GroundingVerdict,
+    Position,
+    SearchMatch,
+    SearchResult,
+)
+from tutor.tools.provenance import TurnRegistry, extract_positions
 
 
 def _result(*matches: SearchMatch) -> SearchResult:
@@ -181,3 +188,279 @@ def test_no_directory_path_keeps_full_keys_through_a_same_basename_collision() -
     assert registry.known("t1", Position(path="README.md", line=None))
     assert registry.known("t1", Position(path="docs/README.md", line=3))
     assert registry.known("t1", Position(path="docs/README.md", line=None))
+
+
+def test_verify_accepts_a_recorded_path_with_a_recorded_line() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+
+    verdict = registry.verify("t1", "the acquire helper sits in src/pool.py line 11")
+
+    assert verdict.ok
+    assert verdict.ungrounded == []
+
+
+def test_verify_rejects_a_path_no_tool_returned() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+
+    verdict = registry.verify("t1", "the acquire helper sits in src/queue.py")
+
+    assert not verdict.ok
+    assert verdict.ungrounded == [Position(path="src/queue.py")]
+
+
+def test_verify_rejects_a_recorded_path_with_an_invented_line() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+
+    verdict = registry.verify("t1", "the acquire helper sits in src/pool.py line 44")
+
+    assert not verdict.ok
+    assert verdict.ungrounded == [Position(path="src/pool.py", line=44)]
+
+
+def test_abandoned_turn_leaves_nothing_verifiable_in_the_next_turn() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.abandon("t1")
+    registry.record("t1", _sample_result())
+    registry.open_turn("t2")
+
+    verdict = registry.verify("t2", "the acquire helper sits in src/pool.py line 11")
+
+    assert not verdict.ok
+    assert verdict.ungrounded == [Position(path="src/pool.py", line=11)]
+
+
+_LEAD_IN = "Here is the thing you should look at now,"
+
+
+def _chunked(
+    registry: TurnRegistry, turn_id: str, text: str
+) -> tuple[list[str], list[GroundingVerdict]]:
+    clauses, remainder = split_clauses(text, 8, 12)
+    pieces = clauses + ([remainder.strip()] if remainder.strip() else [])
+    return pieces, [registry.verify_chunk(turn_id, piece) for piece in pieces]
+
+
+def _ungrounded(verdicts: list[GroundingVerdict]) -> list[Position]:
+    return [position for verdict in verdicts for position in verdict.ungrounded]
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "the fix lands in src/pool.py",
+        "the fix lands in `src/pool.py`",
+        "the fix lands in pool.py",
+        "the fix lands in `pool.py`",
+        "the fix lands in pool.py:11",
+        "the fix lands in `pool.py:11`",
+        "the fix lands in pool.py line 11",
+        "the fix lands in `pool.py` line 11",
+        "the fix lands in pool.py line twelve",
+        "the fix lands in `pool.py` line twelve",
+        "the fix lands in src/pool.py lines 9 to 10",
+        "the fix lands in `src/pool.py` lines 9 to 10",
+        "the fix lands on line 11 of src/pool.py",
+        "the fix lands on line 11 of `src/pool.py`",
+        "the fix lands on the 11th line of src/pool.py",
+        "the fix lands on the 11th line of `src/pool.py`",
+        "the fix lands on lines 9 to 10 of src/pool.py",
+        "the fix lands on lines 9 to 10 of `src/pool.py`",
+        "the fix lands in src/pool.py line 9",
+        "the fix lands in `src/pool.py` line 9",
+    ],
+)
+def test_recorded_token_forms_verify_clean(tail: str) -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+
+    pieces, verdicts = _chunked(registry, "t1", f"{_LEAD_IN} {tail}")
+
+    assert len(pieces) == 2
+    assert _ungrounded(verdicts) == []
+    assert all(verdict.ok for verdict in verdicts)
+
+
+@pytest.mark.parametrize(
+    ("tail", "expected"),
+    [
+        ("the fix lands in src/queue.py", [Position(path="src/queue.py")]),
+        ("the fix lands in `src/queue.py`", [Position(path="src/queue.py")]),
+        ("the fix lands in queue.py", [Position(path="queue.py")]),
+        ("the fix lands in `queue.py`", [Position(path="queue.py")]),
+        ("the fix lands in pool.py:44", [Position(path="pool.py", line=44)]),
+        ("the fix lands in `pool.py:44`", [Position(path="pool.py", line=44)]),
+        ("the fix lands in pool.py line 44", [Position(path="pool.py", line=44)]),
+        ("the fix lands in `pool.py` line 44", [Position(path="pool.py", line=44)]),
+        ("the fix lands in pool.py line one forty two", [Position(path="pool.py", line=142)]),
+        ("the fix lands in `pool.py` line one forty two", [Position(path="pool.py", line=142)]),
+        (
+            "the fix lands in src/pool.py lines 40 to 41",
+            [Position(path="src/pool.py", line=40), Position(path="src/pool.py", line=41)],
+        ),
+        (
+            "the fix lands in `src/pool.py` lines 40 to 41",
+            [Position(path="src/pool.py", line=40), Position(path="src/pool.py", line=41)],
+        ),
+        ("the fix lands on line 44 of src/pool.py", [Position(path="src/pool.py", line=44)]),
+        ("the fix lands on line 44 of `src/pool.py`", [Position(path="src/pool.py", line=44)]),
+        ("the fix lands on the 44th line of src/pool.py", [Position(path="src/pool.py", line=44)]),
+        (
+            "the fix lands on the 44th line of `src/pool.py`",
+            [Position(path="src/pool.py", line=44)],
+        ),
+        (
+            "the fix lands on lines 40 to 41 of src/pool.py",
+            [Position(path="src/pool.py", line=40), Position(path="src/pool.py", line=41)],
+        ),
+        (
+            "the fix lands on lines 40 to 41 of `src/pool.py`",
+            [Position(path="src/pool.py", line=40), Position(path="src/pool.py", line=41)],
+        ),
+    ],
+)
+def test_invented_token_forms_are_reported(tail: str, expected: list[Position]) -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+
+    pieces, verdicts = _chunked(registry, "t1", f"{_LEAD_IN} {tail}")
+
+    assert len(pieces) == 2
+    assert _ungrounded(verdicts) == expected
+    assert not verdicts[1].ok
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "it sits in os.path.join today",
+        "the call to threading.Lock blocks",
+        "the read/write split matters here",
+        "the tutor/tools package holds it",
+        "the notes at https://example.com/pool.py explain",
+    ],
+)
+def test_dotted_names_and_urls_yield_no_position(tail: str) -> None:
+    text = f"{_LEAD_IN} {tail}"
+    clauses, remainder = split_clauses(text, 8, 12)
+    pieces = clauses + [remainder.strip()]
+
+    assert len(pieces) == 2
+    assert [position for piece in pieces for position in extract_positions(piece)] == []
+
+
+def test_a_count_that_is_not_a_line_number_yields_only_the_path() -> None:
+    text = f"{_LEAD_IN} pool.py has three callers"
+    clauses, remainder = split_clauses(text, 8, 12)
+    pieces = clauses + [remainder.strip()]
+
+    assert len(pieces) == 2
+    assert [position for piece in pieces for position in extract_positions(piece)] == [
+        Position(path="pool.py")
+    ]
+
+
+def test_verify_chunk_carries_the_path_into_the_next_clause() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+
+    text = (
+        "The connection pool implementation lives over there in src/pool.py,"
+        " and you want lines 9 to 10"
+    )
+    pieces, verdicts = _chunked(registry, "t1", text)
+
+    assert len(pieces) == 2
+    assert _ungrounded(verdicts) == []
+    assert all(verdict.ok for verdict in verdicts)
+
+
+def test_verify_chunk_reports_invented_endpoints_against_the_carried_path() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+
+    text = (
+        "The connection pool implementation lives over there in src/pool.py,"
+        " and you want lines 40 to 41"
+    )
+    pieces, verdicts = _chunked(registry, "t1", text)
+
+    assert len(pieces) == 2
+    assert verdicts[0].ok
+    assert not verdicts[1].ok
+    assert _ungrounded(verdicts) == [
+        Position(path="src/pool.py", line=40),
+        Position(path="src/pool.py", line=41),
+    ]
+
+
+def test_a_line_mention_before_any_path_has_no_path_to_bind_to() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+
+    pieces, verdicts = _chunked(
+        registry, "t1", "On lines 40 to 41 you will find the missing branch"
+    )
+
+    assert len(pieces) == 1
+    assert not verdicts[0].ok
+    assert _ungrounded(verdicts) == [Position(path="", line=40), Position(path="", line=41)]
+
+
+def test_open_turn_clears_the_carried_path() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+    _chunked(registry, "t1", "Open src/pool.py and read the acquire body")
+
+    registry.open_turn("t2")
+    registry.record("t2", _sample_result())
+    pieces, verdicts = _chunked(registry, "t2", "On lines 9 to 10 you will find the acquire body")
+
+    assert len(pieces) == 1
+    assert _ungrounded(verdicts) == [Position(path="", line=9), Position(path="", line=10)]
+
+
+def test_abandon_clears_the_carried_path() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+    _chunked(registry, "t1", "Open src/pool.py and read the acquire body")
+
+    registry.abandon("t1")
+    pieces, verdicts = _chunked(registry, "t1", "On lines 9 to 10 you will find the acquire body")
+
+    assert len(pieces) == 1
+    assert _ungrounded(verdicts) == [Position(path="", line=9), Position(path="", line=10)]
+
+
+@pytest.mark.parametrize(
+    ("tail", "expected"),
+    [
+        ("the standup is at 12:30 today", []),
+        ("the blob lives in vendor/big.dat now", [Position(path="vendor/big.dat")]),
+        (
+            "the fix lands in pool.py:11-15 there",
+            [Position(path="pool.py", line=11), Position(path="pool.py", line=15)],
+        ),
+        ("the forty-second line of pool.py matters", [Position(path="pool.py", line=42)]),
+    ],
+)
+def test_extraction_of_ranges_ordinals_and_clock_times(tail: str, expected: list[Position]) -> None:
+    text = f"{_LEAD_IN} {tail}"
+    clauses, remainder = split_clauses(text, 8, 12)
+    pieces = clauses + [remainder.strip()]
+
+    assert len(pieces) == 2
+    assert [position for piece in pieces for position in extract_positions(piece)] == expected
