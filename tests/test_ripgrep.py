@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.fakes import Spawned, match_record, record_spawns
 from tutor.tools.models import SearchBudget
 from tutor.tools.ripgrep import RipgrepFailed, RipgrepUnavailable, probe_ripgrep, run_ripgrep
 
@@ -14,40 +15,14 @@ FAKE_RG_DIR = str(Path(__file__).parent / "data" / "fake_rg")
 FIXTURE_ROOT = Path(__file__).parent / "data" / "fixture_repo"
 
 
-class Spawned:
-    def __init__(self) -> None:
-        self.argv: list[str] = []
-        self.kwargs: dict[str, object] = {}
-        self.proc: asyncio.subprocess.Process | None = None
-        self.calls = 0
-        self.started = asyncio.Event()
-
-
-def _record_spawns(monkeypatch: pytest.MonkeyPatch, replacement: list[str] | None) -> Spawned:
-    holder = Spawned()
-    real = asyncio.create_subprocess_exec
-
-    async def passthrough(*argv: str, **kwargs: object) -> asyncio.subprocess.Process:
-        holder.argv = list(argv)
-        holder.kwargs = dict(kwargs)
-        holder.calls += 1
-        proc = await real(*(replacement or argv), **kwargs)
-        holder.proc = proc
-        holder.started.set()
-        return proc
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", passthrough)
-    return holder
-
-
 @pytest.fixture
 def spawned(monkeypatch: pytest.MonkeyPatch) -> Spawned:
-    return _record_spawns(monkeypatch, None)
+    return record_spawns(monkeypatch, None)
 
 
 @pytest.fixture
 def blocking_child(monkeypatch: pytest.MonkeyPatch) -> Spawned:
-    return _record_spawns(
+    return record_spawns(
         monkeypatch, [sys.executable, "-c", "import threading; threading.Event().wait()"]
     )
 
@@ -61,19 +36,6 @@ def unreadable_helper() -> Iterator[Path]:
         yield path
     finally:
         path.chmod(mode)
-
-
-def _match_record(path: str, number: int, text: str, submatches: list[dict]) -> dict:
-    return {
-        "type": "match",
-        "data": {
-            "path": {"text": path},
-            "lines": {"text": text},
-            "line_number": number,
-            "absolute_offset": 0,
-            "submatches": submatches,
-        },
-    }
 
 
 def matches(records: list[dict]) -> list[dict]:
@@ -240,13 +202,13 @@ async def test_submatch_offsets_survive_non_ascii_lines(monkeypatch: pytest.Monk
     payload = "".join(
         json.dumps(record) + "\n"
         for record in (
-            _match_record(
+            match_record(
                 "./src/accents.py",
                 1,
                 accent * 300 + "NEEDLE\n",
                 [{"match": {"text": "NEEDLE"}, "start": 600, "end": 606}],
             ),
-            _match_record(
+            match_record(
                 "./src/accents.py",
                 2,
                 accent * 398 + "NEEDLE" + accent * 50 + "\n",
@@ -257,7 +219,7 @@ async def test_submatch_offsets_survive_non_ascii_lines(monkeypatch: pytest.Monk
             ),
         )
     )
-    _record_spawns(
+    record_spawns(
         monkeypatch, [sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", payload]
     )
 
