@@ -36,6 +36,10 @@ def probe_ripgrep(minimum: tuple[int, int, int] = (14, 0, 0)) -> str:
     return version
 
 
+def record_size(record: dict) -> int:
+    return len(json.dumps(record, separators=(",", ":")).encode())
+
+
 def _clip(record: dict) -> None:
     data = record["data"]
     if "text" not in data["lines"]:
@@ -121,7 +125,7 @@ async def run_ripgrep(
                         if record["type"] not in ("match", "context"):
                             continue
                         _clip(record)
-                        size = len(json.dumps(record, separators=(",", ":")).encode())
+                        size = record_size(record)
                         if byte_count + size > budget.max_bytes:
                             truncated = True
                             break

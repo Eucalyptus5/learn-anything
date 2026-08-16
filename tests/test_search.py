@@ -7,6 +7,7 @@ import pytest
 
 from tests.fakes import match_record, record_spawns
 from tutor.tools.models import ContextLine, SearchBudget, SearchResult
+from tutor.tools.ripgrep import run_ripgrep
 from tutor.tools.search import search
 
 FIXTURE_ROOT = Path(__file__).parent / "data" / "fixture_repo"
@@ -258,3 +259,120 @@ async def test_context_line_numbers_come_from_the_events(
     assert (match.path, match.line) == ("src/a.py", 10)
     assert match.before == [ContextLine(line=8, text="eight")]
     assert match.after == [ContextLine(line=12, text="twelve")]
+
+
+def metered(records: list[dict]) -> int:
+    return sum(len(json.dumps(record, separators=(",", ":")).encode()) for record in records)
+
+
+def record_key(record: dict) -> tuple[str, int]:
+    return (record["data"]["path"]["text"].removeprefix("./"), record["data"]["line_number"])
+
+
+async def test_max_matches_keeps_exactly_the_first_n_and_flags_truncation() -> None:
+    under = await search("acquire", ["src/**/*.py"], FIXTURE_ROOT, SearchBudget(max_matches=11))
+
+    assert pairs(under) == GOLDEN[:11]
+    assert under.truncated is True
+
+    exact = await search("acquire", ["src/**/*.py"], FIXTURE_ROOT, SearchBudget(max_matches=12))
+
+    assert pairs(exact) == GOLDEN
+    assert exact.truncated is False
+
+    default = await search("acquire", ["src/**/*.py"], FIXTURE_ROOT, SearchBudget())
+
+    assert pairs(default) == GOLDEN
+    assert default.truncated is False
+
+
+async def test_byte_count_meters_only_the_records_that_survive_the_count_cap() -> None:
+    budget = SearchBudget(max_matches=10)
+    result = await search("acquire", ["src/**/*.py"], FIXTURE_ROOT, budget)
+    records, raw_byte_count, _, _ = await run_ripgrep(
+        "acquire", ["src/**/*.py"], FIXTURE_ROOT, budget
+    )
+
+    kept = {position.key() for position in result.positions()}
+    assert result.byte_count == metered([r for r in records if record_key(r) in kept])
+    assert result.byte_count < raw_byte_count
+    assert kept.isdisjoint(
+        {
+            ("src/pool_helpers.py", 10),
+            ("src/pool_helpers.py", 11),
+            ("src/pool_helpers.py", 12),
+            ("src/pool_helpers.py", 13),
+        }
+    )
+
+    whole = await search("acquire", ["src/**/*.py"], FIXTURE_ROOT, SearchBudget())
+    _, whole_byte_count, _, _ = await run_ripgrep(
+        "acquire", ["src/**/*.py"], FIXTURE_ROOT, SearchBudget()
+    )
+
+    assert whole.byte_count == whole_byte_count
+
+
+async def test_dropped_matches_take_their_context_records_out_of_the_meter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def context_record(number: int, text: str) -> dict:
+        return {
+            "type": "context",
+            "data": {
+                "path": {"text": "./src/a.py"},
+                "lines": {"text": text},
+                "line_number": number,
+                "absolute_offset": 0,
+                "submatches": [],
+            },
+        }
+
+    submatches = [{"match": {"text": "acquire"}, "start": 0, "end": 7}]
+    emitted = [
+        context_record(1, "one\n"),
+        match_record("./src/a.py", 2, "acquire two\n", submatches),
+        context_record(3, "three\n"),
+        context_record(4, "four\n"),
+        match_record("./src/a.py", 5, "acquire five\n", submatches),
+        context_record(6, "six\n"),
+        context_record(7, "seven\n"),
+    ]
+    payload = "".join(json.dumps(record) + "\n" for record in emitted)
+    record_spawns(
+        monkeypatch, [sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", payload]
+    )
+
+    result = await search("acquire", ["src/*.py"], FIXTURE_ROOT, SearchBudget(max_matches=1))
+
+    assert len(result.matches) == 1
+    match = result.matches[0]
+    assert (match.path, match.line) == ("src/a.py", 2)
+    assert [line.line for line in match.before] == [1]
+    assert [line.line for line in match.after] == [3, 4]
+    assert result.truncated is True
+    assert result.byte_count == metered(emitted[:4])
+
+
+async def test_count_cap_fires_when_the_byte_meter_does_not() -> None:
+    budget = SearchBudget(max_bytes=64000, max_matches=40)
+    result = await search("WIDE_ROW", ["src/wide.py"], FIXTURE_ROOT, budget)
+    records, _, _, _ = await run_ripgrep("WIDE_ROW", ["src/wide.py"], FIXTURE_ROOT, budget)
+
+    assert pairs(result) == [("src/wide.py", line) for line in range(1, 41)]
+    assert result.truncated is True
+    assert result.oversized is False
+    assert result.byte_count == metered(records[:40])
+
+
+async def test_byte_meter_alone_keeps_every_record_ripgrep_retained() -> None:
+    budget = SearchBudget(max_bytes=12000)
+    result = await search("WIDE_ROW", ["src/wide.py"], FIXTURE_ROOT, budget)
+    records, raw_byte_count, _, _ = await run_ripgrep(
+        "WIDE_ROW", ["src/wide.py"], FIXTURE_ROOT, budget
+    )
+
+    assert pairs(result) == [record_key(record) for record in records]
+    assert result.truncated is True
+    assert result.byte_count == raw_byte_count
+    assert 18 <= len(result.matches) <= 22
