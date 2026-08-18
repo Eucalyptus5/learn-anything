@@ -74,8 +74,6 @@ async def run_ripgrep(
     argv = [
         "rg",
         "--json",
-        "--sort",
-        "path",
         "--context",
         str(budget.context_lines),
         "--no-require-git",

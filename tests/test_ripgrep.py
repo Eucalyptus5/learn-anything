@@ -13,6 +13,15 @@ from tutor.tools.ripgrep import RipgrepFailed, RipgrepUnavailable, probe_ripgrep
 
 FAKE_RG_DIR = str(Path(__file__).parent / "data" / "fake_rg")
 FIXTURE_ROOT = Path(__file__).parent / "data" / "fixture_repo"
+FIXTURE_PY = {
+    "./generated/out.py",
+    "./src/httpclient.py",
+    "./src/pool.py",
+    "./src/pool_helpers.py",
+    "./src/wide.py",
+    "./vendor/big.py",
+    "./vendor/small.py",
+}
 
 
 @pytest.fixture
@@ -83,7 +92,8 @@ async def test_run_ripgrep_argv(spawned: Spawned) -> None:
     assert argv[0] == "rg"
     assert "--json" in argv
     assert "--no-require-git" in argv
-    assert argv[argv.index("--sort") + 1] == "path"
+    assert "--sort" not in argv
+    assert "--threads" not in argv
     assert argv[argv.index("--context") + 1] == "3"
     globs = [argv[index + 1] for index, arg in enumerate(argv) if arg == "--glob"]
     assert globs == ["src/*.py", "docs/*.md"]
@@ -152,13 +162,35 @@ async def test_byte_budget_truncates_wide(spawned: Spawned) -> None:
 
 
 async def test_byte_budget_kills_a_child_still_writing(spawned: Spawned) -> None:
-    records, _, truncated, _ = await run_ripgrep(
+    records, byte_count, truncated, _ = await run_ripgrep(
         '= "', ["**/*.py"], FIXTURE_ROOT, SearchBudget(max_bytes=12000)
     )
 
     assert truncated is True
-    assert {record["data"]["path"]["text"] for record in records} == {"./src/wide.py"}
+    assert records
+    assert {record["data"]["path"]["text"] for record in records} <= FIXTURE_PY
+    assert byte_count <= 12000
     assert spawned.proc.returncode < 0
+
+
+async def test_records_arrive_in_contiguous_per_file_blocks() -> None:
+    records, _, truncated, oversized = await run_ripgrep(
+        '= "', ["**/*.py"], FIXTURE_ROOT, SearchBudget(max_bytes=400000)
+    )
+
+    blocks: list[tuple[str, list[int]]] = []
+    for record in records:
+        path = record["data"]["path"]["text"]
+        if not blocks or blocks[-1][0] != path:
+            blocks.append((path, []))
+        blocks[-1][1].append(record["data"]["line_number"])
+
+    assert truncated is False
+    assert oversized is False
+    assert len({path for path, _ in blocks}) > 1
+    assert len(blocks) == len({path for path, _ in blocks})
+    for _, lines in blocks:
+        assert lines == sorted(set(lines))
 
 
 async def test_oversized_record_is_dropped_and_search_continues(spawned: Spawned) -> None:
@@ -188,11 +220,12 @@ async def test_big_line_clips_under_default_budget() -> None:
     )
 
     found = matches(records)
-    assert [record["data"]["path"]["text"] for record in found] == [
+    assert sorted(record["data"]["path"]["text"] for record in found) == [
         "./vendor/big.py",
         "./vendor/small.py",
     ]
-    assert len(found[0]["data"]["lines"]["text"]) == 400
+    big = next(record for record in found if record["data"]["path"]["text"] == "./vendor/big.py")
+    assert len(big["data"]["lines"]["text"]) == 400
     assert oversized is False
     assert truncated is False
 

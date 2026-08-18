@@ -38,11 +38,37 @@ async def test_golden_pairs() -> None:
     assert pairs(result) == GOLDEN
 
 
-async def test_repeated_search_is_byte_stable() -> None:
+async def test_untruncated_search_is_byte_stable() -> None:
     first = await search("acquire", ["src/**/*.py"], FIXTURE_ROOT, SearchBudget())
     second = await search("acquire", ["src/**/*.py"], FIXTURE_ROOT, SearchBudget())
 
+    assert first.truncated is False
     assert first.model_dump_json() == second.model_dump_json()
+
+
+async def test_truncated_search_is_stable_in_order_not_membership() -> None:
+    reference = await search(
+        '= "', ["**/*.py"], FIXTURE_ROOT, SearchBudget(max_bytes=400000, max_matches=100)
+    )
+
+    assert reference.truncated is False
+    reference_paths = {match.path for match in reference.matches}
+
+    budget = SearchBudget(max_bytes=12000)
+    for _ in range(5):
+        result = await search('= "', ["**/*.py"], FIXTURE_ROOT, budget)
+
+        assert result.truncated is True
+        assert result.matches
+        assert pairs(result) == sorted(pairs(result))
+        for match in result.matches:
+            assert not Path(match.path).is_absolute()
+            assert "./" not in match.path
+            assert match.path in reference_paths
+        assert result.byte_count <= budget.max_bytes
+        assert len(result.matches) <= budget.max_matches
+        keys = [position.key() for position in result.positions()]
+        assert len(keys) == len(set(keys))
 
 
 async def test_paths_are_relative_and_sorted() -> None:
