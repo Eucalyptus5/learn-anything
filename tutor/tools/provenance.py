@@ -71,6 +71,7 @@ _NUMBER_WORDS: dict[str, tuple[int, str, bool]] = (
     | {word: (value, "ones", True) for value, word in enumerate(_ORDINAL_ONES, start=1)}
     | {word: (value, "teens", True) for value, word in enumerate(_ORDINAL_TEENS, start=10)}
     | {word: (20 + step * 10, "tens", True) for step, word in enumerate(_ORDINAL_TENS)}
+    | {"hundred": (100, "hundred", False), "thousand": (1000, "thousand", False)}
 )
 
 
@@ -78,6 +79,7 @@ _NUMBER_WORDS: dict[str, tuple[int, str, bool]] = (
 class _Unit:
     kind: str
     index: int
+    end: int
     path: str = ""
     value: int = 0
     ordinal: bool = False
@@ -108,51 +110,81 @@ def _digit_value(piece: str) -> tuple[int, bool] | None:
 
 
 def _compose(run: list[tuple[int, str, bool]]) -> tuple[int, bool]:
-    digits = ""
+    segments: list[int] = []
+    multiplied = False
     index = 0
     while index < len(run):
         value, tier, _ = run[index]
-        if tier == "tens" and index + 1 < len(run) and run[index + 1][1] == "ones":
-            value += run[index + 1][0]
-            index += 2
-        else:
-            index += 1
-        digits += str(value)
-    return int(digits), any(word[2] for word in run)
+        index += 1
+        if tier in ("hundred", "thousand"):
+            multiplied = True
+            if not segments:
+                segments = [value]
+            elif tier == "hundred":
+                segments[-1] *= value
+            else:
+                segments = [sum(segments) * value]
+            continue
+        if tier == "tens" and index < len(run):
+            next_value, next_tier, _ = run[index]
+            if next_tier == "ones":
+                value += next_value
+                index += 1
+        segments.append(value)
+
+    ordinal = any(is_ordinal for _, _, is_ordinal in run)
+    if multiplied:
+        return sum(segments), ordinal
+    return int("".join(str(segment) for segment in segments)), ordinal
 
 
 def _scan(text: str) -> tuple[list[_Unit], list[str]]:
     stripped = [_strip(token) for token in text.split()]
     units: list[_Unit] = []
     run: list[tuple[int, str, bool]] = []
-    run_index = 0
+    run_start = 0
+    run_end = 0
 
     def flush() -> None:
         nonlocal run
         if not run:
             return
         value, ordinal = _compose(run)
-        units.append(_Unit(kind="number", index=run_index, value=value, ordinal=ordinal))
+        units.append(
+            _Unit(kind="number", index=run_start, end=run_end, value=value, ordinal=ordinal)
+        )
         run = []
+
+    def number(index: int, value: int, ordinal: bool = False, owner: int | None = None) -> None:
+        units.append(
+            _Unit(kind="number", index=index, end=index, value=value, ordinal=ordinal, owner=owner)
+        )
 
     for index, token in enumerate(stripped):
         suffix = _LINE_SUFFIX.search(token)
         if suffix:
             flush()
             head = token[: suffix.start()]
+            start, end = suffix.groups()
             if _is_path(head):
                 owner = len(units)
-                units.append(_Unit(kind="path", index=index, path=head))
-                start, end = suffix.groups()
-                units.append(_Unit(kind="number", index=index, value=int(start), owner=owner))
+                units.append(_Unit(kind="path", index=index, end=index, path=head))
+                number(index, int(start), owner=owner)
                 if end:
-                    units.append(_Unit(kind="range", index=index))
-                    units.append(_Unit(kind="number", index=index, value=int(end), owner=owner))
+                    units.append(_Unit(kind="range", index=index, end=index))
+                    number(index, int(end), owner=owner)
+            elif _DIGITS.match(head):
+                number(index, int(head))
+                units.append(_Unit(kind="range", index=index, end=index))
+                number(index, int(start))
+                if end:
+                    units.append(_Unit(kind="range", index=index, end=index))
+                    number(index, int(end))
             continue
 
         if _is_path(token):
             flush()
-            units.append(_Unit(kind="path", index=index, path=token))
+            units.append(_Unit(kind="path", index=index, end=index, path=token))
             continue
 
         pieces = token.split("-")
@@ -161,27 +193,45 @@ def _scan(text: str) -> tuple[list[_Unit], list[str]]:
             flush()
             for offset, numeral in enumerate(numerals):
                 if offset:
-                    units.append(_Unit(kind="range", index=index))
+                    units.append(_Unit(kind="range", index=index, end=index))
                 value, ordinal = numeral
-                units.append(_Unit(kind="number", index=index, value=value, ordinal=ordinal))
+                number(index, value, ordinal=ordinal)
             continue
 
         words = [_NUMBER_WORDS.get(piece.lower()) for piece in pieces]
         if all(word is not None for word in words):
             if not run:
-                run_index = index
+                run_start = index
+            run_end = index
             run.extend(words)
             continue
 
         flush()
         if token.lower() in _RANGE_WORDS:
-            units.append(_Unit(kind="range", index=index))
+            units.append(_Unit(kind="range", index=index, end=index))
 
     flush()
     return units, stripped
 
 
+def _ordinal_mentions(units: list[_Unit], stripped: list[str]) -> list[bool]:
+    flags = [False] * len(units)
+    for position in reversed(range(len(units))):
+        unit = units[position]
+        if unit.kind != "number" or not unit.ordinal:
+            continue
+        following = stripped[unit.end + 1].lower() if unit.end + 1 < len(stripped) else ""
+        flags[position] = following in _LINE_WORDS or (
+            following in _RANGE_WORDS
+            and position + 2 < len(units)
+            and units[position + 1].kind == "range"
+            and flags[position + 2]
+        )
+    return flags
+
+
 def _mentions(units: list[_Unit], stripped: list[str]) -> list[bool]:
+    ordinals = _ordinal_mentions(units, stripped)
     flags = [False] * len(units)
     for position, unit in enumerate(units):
         if unit.kind != "number":
@@ -194,7 +244,7 @@ def _mentions(units: list[_Unit], stripped: list[str]) -> list[bool]:
             and flags[position - 2]
         )
         flags[position] = (
-            unit.owner is not None or unit.ordinal or after_line_word or continues_range
+            unit.owner is not None or ordinals[position] or after_line_word or continues_range
         )
     return flags
 

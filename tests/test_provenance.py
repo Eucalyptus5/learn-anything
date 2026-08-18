@@ -239,11 +239,15 @@ def test_abandoned_turn_leaves_nothing_verifiable_in_the_next_turn() -> None:
 _LEAD_IN = "Here is the thing you should look at now,"
 
 
+def _pieces(text: str) -> list[str]:
+    clauses, remainder = split_clauses(text, 8, 12)
+    return clauses + ([remainder.strip()] if remainder.strip() else [])
+
+
 def _chunked(
     registry: TurnRegistry, turn_id: str, text: str
 ) -> tuple[list[str], list[GroundingVerdict]]:
-    clauses, remainder = split_clauses(text, 8, 12)
-    pieces = clauses + ([remainder.strip()] if remainder.strip() else [])
+    pieces = _pieces(text)
     return pieces, [registry.verify_chunk(turn_id, piece) for piece in pieces]
 
 
@@ -274,6 +278,8 @@ def _ungrounded(verdicts: list[GroundingVerdict]) -> list[Position]:
         "the fix lands on lines 9 to 10 of `src/pool.py`",
         "the fix lands in src/pool.py line 9",
         "the fix lands in `src/pool.py` line 9",
+        "the fix lands on the 11th and 12th lines of src/pool.py",
+        "the fix lands on the 11th and 12th lines of `src/pool.py`",
     ],
 )
 def test_recorded_token_forms_verify_clean(tail: str) -> None:
@@ -349,18 +355,14 @@ def test_invented_token_forms_are_reported(tail: str, expected: list[Position]) 
     ],
 )
 def test_dotted_names_and_urls_yield_no_position(tail: str) -> None:
-    text = f"{_LEAD_IN} {tail}"
-    clauses, remainder = split_clauses(text, 8, 12)
-    pieces = clauses + [remainder.strip()]
+    pieces = _pieces(f"{_LEAD_IN} {tail}")
 
     assert len(pieces) == 2
     assert [position for piece in pieces for position in extract_positions(piece)] == []
 
 
 def test_a_count_that_is_not_a_line_number_yields_only_the_path() -> None:
-    text = f"{_LEAD_IN} pool.py has three callers"
-    clauses, remainder = split_clauses(text, 8, 12)
-    pieces = clauses + [remainder.strip()]
+    pieces = _pieces(f"{_LEAD_IN} pool.py has three callers")
 
     assert len(pieces) == 2
     assert [position for piece in pieces for position in extract_positions(piece)] == [
@@ -455,12 +457,39 @@ def test_abandon_clears_the_carried_path() -> None:
             [Position(path="pool.py", line=11), Position(path="pool.py", line=15)],
         ),
         ("the forty-second line of pool.py matters", [Position(path="pool.py", line=42)]),
+        (
+            "you should look at line 12:14 for the bug",
+            [Position(path="", line=12), Position(path="", line=14)],
+        ),
+        ("the fix lands in pool.py line two hundred fifty", [Position(path="pool.py", line=250)]),
+        (
+            "the fix lands in pool.py line one thousand two hundred thirty four",
+            [Position(path="pool.py", line=1234)],
+        ),
+        ("the second argument to acquire in src/pool.py", [Position(path="src/pool.py")]),
+        ("the first case handles it", []),
     ],
 )
-def test_extraction_of_ranges_ordinals_and_clock_times(tail: str, expected: list[Position]) -> None:
-    text = f"{_LEAD_IN} {tail}"
-    clauses, remainder = split_clauses(text, 8, 12)
-    pieces = clauses + [remainder.strip()]
+def test_extraction_of_ranges_scales_ordinals_and_clock_times(
+    tail: str, expected: list[Position]
+) -> None:
+    pieces = _pieces(f"{_LEAD_IN} {tail}")
 
     assert len(pieces) == 2
     assert [position for piece in pieces for position in extract_positions(piece)] == expected
+
+
+def test_a_scaled_number_word_does_not_truncate_into_a_recorded_line() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record(
+        "t1",
+        _result(SearchMatch(path="src/pool.py", line=1, text="import os", before=[], after=[])),
+    )
+
+    text = f"{_LEAD_IN} the lock lives in pool.py line one hundred"
+    pieces, verdicts = _chunked(registry, "t1", text)
+
+    assert len(pieces) == 2
+    assert not verdicts[1].ok
+    assert _ungrounded(verdicts) == [Position(path="pool.py", line=100)]
