@@ -468,6 +468,7 @@ def test_abandon_clears_the_carried_path() -> None:
         ),
         ("the second argument to acquire in src/pool.py", [Position(path="src/pool.py")]),
         ("the first case handles it", []),
+        ("forty-second", []),
     ],
 )
 def test_extraction_of_ranges_scales_ordinals_and_clock_times(
