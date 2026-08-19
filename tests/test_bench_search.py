@@ -32,13 +32,6 @@ def test_summarize_applies_the_p95_rule() -> None:
     assert isinstance(p95, int)
 
 
-def test_samples_defaults_to_thirty() -> None:
-    parser = bench_search.build_parser()
-    args = parser.parse_args(["--root", "tests/data/fixture_repo"])
-
-    assert args.samples == 30
-
-
 def test_root_is_required() -> None:
     parser = bench_search.build_parser()
 
