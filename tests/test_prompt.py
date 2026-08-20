@@ -104,9 +104,21 @@ async def test_timed_out_walk_kills_the_child_and_caches_nothing(
 ) -> None:
     monkeypatch.setattr("tutor.prompt.WALK_TIMEOUT_MS", 1)
 
-    assert await derive_globs("anything", tmp_path) == []
+    assert await derive_globs("anything", tmp_path) == ["**/*"]
     assert blocking_child.proc.returncode < 0
 
     await derive_globs("anything", tmp_path)
 
     assert blocking_child.calls == 2
+
+
+async def test_empty_tree_falls_back_to_the_catch_all(spawned: Spawned, tmp_path: Path) -> None:
+    globs = await derive_globs("anything", tmp_path)
+
+    assert globs == ["**/*"]
+    assert await derive_globs("anything", tmp_path) == ["**/*"]
+    assert spawned.calls == 1
+
+    result = await search("anything", globs, tmp_path, SearchBudget())
+
+    assert result.matches == []
