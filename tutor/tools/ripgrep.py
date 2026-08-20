@@ -59,7 +59,7 @@ def _clip(record: dict) -> None:
     data["submatches"] = kept
 
 
-async def _reap(proc: asyncio.subprocess.Process) -> None:
+async def reap(proc: asyncio.subprocess.Process) -> None:
     if proc.returncode is None:
         proc.kill()
     await proc.wait()
@@ -140,13 +140,13 @@ async def run_ripgrep(
             truncated = True
 
         if truncated:
-            await _reap(proc)
+            await reap(proc)
             return records, byte_count, True, oversized
 
         stderr = await proc.stderr.read()
         code = await proc.wait()
     except asyncio.CancelledError:
-        await _reap(proc)
+        await reap(proc)
         raise
 
     if code >= 2:
