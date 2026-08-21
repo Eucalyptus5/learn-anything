@@ -21,6 +21,7 @@ def _write(tmp_path: Path, name: str, body: str) -> Path:
 
 
 def _unauthorized(request: httpx2.Request) -> httpx2.Response:
+    assert request.headers["authorization"] == f"Bearer {FAKE_KEY}"
     return httpx2.Response(
         401, json={"error": {"message": "invalid key", "type": "invalid_request"}}
     )

@@ -1,8 +1,23 @@
 import json
+import logging
+import time
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+import httpx2
+from openai import AsyncOpenAI, AsyncStream
+from openai.types.chat import ChatCompletionChunk
 from pydantic import BaseModel
+
+from tutor.config import Settings
+from tutor.prompt import TurnPrompt
+
+logger = logging.getLogger(__name__)
+
+
+def _elapsed_ms(start: float) -> int:
+    return int((time.perf_counter() - start) * 1000)
 
 
 class TurnChunk(BaseModel):
@@ -82,3 +97,66 @@ def parse_chunk(chunk: object, tool_calls: ToolCallAccumulator) -> TurnChunk | N
         return TurnChunk(kind="spoken", text=content)
 
     return None
+
+
+class TurnStream:
+    def __init__(self, client: AsyncOpenAI, request: dict[str, object], start: float) -> None:
+        self._client = client
+        self._request = request
+        self._start = start
+        self._stream: AsyncStream[ChatCompletionChunk] | None = None
+        self.spoke = False
+        self.first_chunk_ms: int | None = None
+        self.first_spoken_ms: int | None = None
+
+    async def _drain(self) -> AsyncIterator[TurnChunk]:
+        self._stream = await self._client.chat.completions.create(**self._request)
+        tool_calls = ToolCallAccumulator()
+        async for raw in self._stream:
+            if self.first_chunk_ms is None:
+                self.first_chunk_ms = _elapsed_ms(self._start)
+                logger.debug("llm_first_chunk ms=%d", self.first_chunk_ms)
+            chunk = parse_chunk(raw, tool_calls)
+            if chunk is None:
+                continue
+            if chunk.kind == "spoken" and not self.spoke:
+                self.spoke = True
+                self.first_spoken_ms = _elapsed_ms(self._start)
+                logger.debug("llm_first_spoken ms=%d", self.first_spoken_ms)
+            yield chunk
+
+    def __aiter__(self) -> AsyncIterator[TurnChunk]:
+        return self._drain()
+
+
+class ReasoningClient:
+    def __init__(self, cfg: Settings, http_client: httpx2.AsyncClient | None = None) -> None:
+        self._cfg = cfg
+        injected = {"http_client": http_client} if http_client is not None else {}
+        self._client = AsyncOpenAI(
+            api_key=cfg.reasoning_api_key.get_secret_value(),
+            base_url=cfg.reasoning_api_base,
+            **injected,
+        )
+
+    def start_turn(
+        self,
+        prompt: TurnPrompt,
+        tools: Sequence[dict] | None = None,
+        effort: str | None = None,
+        max_tokens: int | None = None,
+    ) -> TurnStream:
+        request: dict[str, object] = {
+            "model": self._cfg.reasoning_model,
+            "messages": prompt.messages(),
+            "reasoning_effort": effort if effort is not None else self._cfg.reasoning_effort,
+            "max_tokens": max_tokens if max_tokens is not None else self._cfg.reasoning_max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if tools is not None:
+            request["tools"] = list(tools)
+        return TurnStream(self._client, request, time.perf_counter())
+
+    async def aclose(self) -> None:
+        await self._client.close()
