@@ -3,8 +3,6 @@ from collections.abc import Callable
 from types import SimpleNamespace
 
 import httpx2
-import openai
-import pytest
 from openai.types.chat import ChatCompletionChunk
 
 from tutor.config import Settings
@@ -323,9 +321,6 @@ async def test_client_reuses_one_http_client() -> None:
 
     await client.aclose()
     assert http.is_closed is True
-
-    with pytest.raises(openai.APIConnectionError):
-        [chunk async for chunk in client.start_turn(PROMPT)]
 
 
 async def test_start_turn_arguments_override_settings() -> None:

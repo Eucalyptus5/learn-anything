@@ -6,8 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import httpx2
-from openai import AsyncOpenAI, AsyncStream
-from openai.types.chat import ChatCompletionChunk
+from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from tutor.config import Settings
@@ -104,15 +103,14 @@ class TurnStream:
         self._client = client
         self._request = request
         self._start = start
-        self._stream: AsyncStream[ChatCompletionChunk] | None = None
         self.spoke = False
         self.first_chunk_ms: int | None = None
         self.first_spoken_ms: int | None = None
 
     async def _drain(self) -> AsyncIterator[TurnChunk]:
-        self._stream = await self._client.chat.completions.create(**self._request)
+        stream = await self._client.chat.completions.create(**self._request)
         tool_calls = ToolCallAccumulator()
-        async for raw in self._stream:
+        async for raw in stream:
             if self.first_chunk_ms is None:
                 self.first_chunk_ms = _elapsed_ms(self._start)
                 logger.debug("llm_first_chunk ms=%d", self.first_chunk_ms)
