@@ -55,26 +55,31 @@ class ToolCallAccumulator:
         if arguments:
             partial.arguments += arguments
 
+    def _emit(self, index: int) -> TurnChunk:
+        partial = self._partial[index]
+        self._emitted.add(index)
+        return TurnChunk(
+            kind="tool_call",
+            text=partial.arguments,
+            tool_call_id=partial.call_id,
+            tool_name=partial.name,
+        )
+
     def ready(self) -> list[TurnChunk]:
         chunks: list[TurnChunk] = []
         for index in sorted(self._partial):
             if index in self._emitted:
                 continue
-            partial = self._partial[index]
             try:
-                json.loads(partial.arguments)
+                json.loads(self._partial[index].arguments)
             except json.JSONDecodeError:
                 continue
-            self._emitted.add(index)
-            chunks.append(
-                TurnChunk(
-                    kind="tool_call",
-                    text=partial.arguments,
-                    tool_call_id=partial.call_id,
-                    tool_name=partial.name,
-                )
-            )
+            chunks.append(self._emit(index))
         return chunks
+
+    def flush(self) -> list[TurnChunk]:
+        pending = [index for index in sorted(self._partial) if index not in self._emitted]
+        return [self._emit(index) for index in pending]
 
 
 def parse_chunk(chunk: object, tool_calls: ToolCallAccumulator) -> TurnChunk | None:
@@ -106,7 +111,9 @@ class TurnStream:
         self._start = start
         self._stream: AsyncStream[ChatCompletionChunk] | None = None
         self._cancelled = False
+        self._usage: object | None = None
         self.spoke = False
+        self.finish_reason: str | None = None
         self.first_chunk_ms: int | None = None
         self.first_spoken_ms: int | None = None
 
@@ -125,7 +132,16 @@ class TurnStream:
                 if self.first_chunk_ms is None:
                     self.first_chunk_ms = _elapsed_ms(self._start)
                     logger.debug("llm_first_chunk ms=%d", self.first_chunk_ms)
+                choices = getattr(raw, "choices", None)
+                reason = getattr(choices[0], "finish_reason", None) if choices else None
+                if reason:
+                    self.finish_reason = reason
+                usage = getattr(raw, "usage", None)
+                if usage is not None:
+                    self._usage = usage
                 chunk = parse_chunk(raw, tool_calls)
+                for call in tool_calls.ready():
+                    yield call
                 if chunk is None:
                     continue
                 if chunk.kind == "spoken" and not self.spoke:
@@ -133,6 +149,17 @@ class TurnStream:
                     self.first_spoken_ms = _elapsed_ms(self._start)
                     logger.debug("llm_first_spoken ms=%d", self.first_spoken_ms)
                 yield chunk
+            if self._cancelled:
+                return
+            for call in tool_calls.flush():
+                yield call
+            if not self.spoke:
+                logger.info(
+                    "silent_turn finish_reason=%s prompt_tokens=%s completion_tokens=%s",
+                    self.finish_reason,
+                    getattr(self._usage, "prompt_tokens", None),
+                    getattr(self._usage, "completion_tokens", None),
+                )
         except (httpx2.ReadError, httpx2.RemoteProtocolError):
             if not self._cancelled:
                 raise

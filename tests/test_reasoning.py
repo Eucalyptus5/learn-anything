@@ -2,6 +2,7 @@ import asyncio
 import http.client
 import io
 import json
+import logging
 from collections.abc import AsyncIterator, Callable
 from types import SimpleNamespace
 
@@ -159,55 +160,70 @@ def _frame(payload: dict[str, object]) -> str:
     return "data: " + json.dumps(payload) + "\n\n"
 
 
-def _delta_frame(delta: dict[str, object]) -> str:
+def _delta_frame(delta: dict[str, object], finish_reason: str | None = None) -> str:
     return _frame(
         {
             "id": "c",
             "object": "chat.completion.chunk",
             "created": 0,
             "model": "m",
-            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
         }
     )
 
 
-def _sse_body(deltas: list[dict[str, object]]) -> str:
+def _tool_delta(
+    index: int, arguments: str, call_id: str | None = None, name: str | None = None
+) -> dict[str, object]:
+    function: dict[str, str] = {"arguments": arguments}
+    if name is not None:
+        function["name"] = name
+    call: dict[str, object] = {"index": index, "function": function}
+    if call_id is not None:
+        call["id"] = call_id
+        call["type"] = "function"
+    return {"tool_calls": [call]}
+
+
+USAGE_FRAME = _frame(
+    {
+        "id": "c",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "m",
+        "choices": [],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+    }
+)
+DONE = "data: [DONE]\n\n"
+
+
+def _sse_body(deltas: list[dict[str, object]], finish_reason: str | None = None) -> str:
     frames = [_delta_frame(delta) for delta in deltas]
-    frames.append(
-        _frame(
-            {
-                "id": "c",
-                "object": "chat.completion.chunk",
-                "created": 0,
-                "model": "m",
-                "choices": [],
-                "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
-            }
-        )
-    )
-    frames.append("data: [DONE]\n\n")
-    return "".join(frames)
+    if finish_reason is not None:
+        frames.append(_delta_frame({}, finish_reason))
+    return "".join(frames) + USAGE_FRAME + DONE
 
 
 def _handler(
-    deltas: list[dict[str, object]], bodies: list[dict[str, object]]
+    body: str, bodies: list[dict[str, object]]
 ) -> Callable[[httpx2.Request], httpx2.Response]:
     def handle(request: httpx2.Request) -> httpx2.Response:
         assert request.headers["authorization"] == f"Bearer {FAKE_KEY}"
         bodies.append(json.loads(request.content))
-        return httpx2.Response(
-            200,
-            headers={"content-type": "text/event-stream"},
-            content=_sse_body(deltas),
-        )
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=body)
 
     return handle
+
+
+def _raw_client(body: str, bodies: list[dict[str, object]]) -> httpx2.AsyncClient:
+    return httpx2.AsyncClient(transport=httpx2.MockTransport(_handler(body, bodies)))
 
 
 def _mock_client(
     deltas: list[dict[str, object]], bodies: list[dict[str, object]]
 ) -> httpx2.AsyncClient:
-    return httpx2.AsyncClient(transport=httpx2.MockTransport(_handler(deltas, bodies)))
+    return _raw_client(_sse_body(deltas), bodies)
 
 
 TWO_THEN_THREE: list[dict[str, object]] = [
@@ -539,3 +555,169 @@ async def test_cancel_stops_the_consumer() -> None:
         server.close()
         await server.wait_closed()
         await client.aclose()
+
+
+REASONING_ONLY: list[dict[str, object]] = [
+    {"reasoning_content": "the pool is bounded"},
+    {"reasoning_content": " by max_size"},
+]
+
+
+async def test_reasoning_only_turn_leaves_spoke_false(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="tutor.reasoning")
+    bodies: list[dict[str, object]] = []
+    client = ReasoningClient(
+        _settings(), http_client=_raw_client(_sse_body(REASONING_ONLY, "stop"), bodies)
+    )
+
+    stream = client.start_turn(PROMPT)
+    chunks = [chunk async for chunk in stream]
+    await client.aclose()
+
+    assert [chunk.kind for chunk in chunks] == ["reasoning", "reasoning"]
+    assert [chunk.text for chunk in chunks] == ["the pool is bounded", " by max_size"]
+    assert stream.spoke is False
+    assert stream.first_spoken_ms is None
+    assert stream.finish_reason == "stop"
+    assert "silent_turn" in caplog.text
+    assert "prompt_tokens=5" in caplog.text
+    assert "completion_tokens=3" in caplog.text
+    assert "the pool is bounded" not in caplog.text
+    assert "max_size" not in caplog.text
+
+    caplog.clear()
+    spoken = ReasoningClient(_settings(), http_client=_mock_client(TWO_THEN_THREE, bodies))
+    assert len([chunk async for chunk in spoken.start_turn(PROMPT)]) == 5
+    await spoken.aclose()
+    assert "silent_turn" not in caplog.text
+
+
+async def test_truncated_stream_mid_reasoning_completes(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="tutor.reasoning")
+    bodies: list[dict[str, object]] = []
+    cut = "".join(_delta_frame(delta) for delta in REASONING_ONLY)
+    client = ReasoningClient(_settings(), http_client=_raw_client(cut, bodies))
+
+    stream = client.start_turn(PROMPT)
+    chunks = [chunk async for chunk in stream]
+    await client.aclose()
+
+    assert [chunk.kind for chunk in chunks] == ["reasoning", "reasoning"]
+    assert [chunk.text for chunk in chunks] == ["the pool is bounded", " by max_size"]
+    assert stream.spoke is False
+    assert stream.first_spoken_ms is None
+    assert stream.finish_reason is None
+    assert "silent_turn" in caplog.text
+    assert "prompt_tokens=None" in caplog.text
+    assert "completion_tokens=None" in caplog.text
+
+
+async def test_length_finish_reason_recorded() -> None:
+    bodies: list[dict[str, object]] = []
+    client = ReasoningClient(
+        _settings(), http_client=_raw_client(_sse_body(REASONING_ONLY, "length"), bodies)
+    )
+    stream = client.start_turn(PROMPT)
+    assert [chunk.kind async for chunk in stream] == ["reasoning", "reasoning"]
+    await client.aclose()
+
+    assert stream.finish_reason == "length"
+    assert stream.spoke is False
+
+    cut_short = (
+        _delta_frame({"reasoning_content": "the pool is bounded"})
+        + _delta_frame({"content": "the connection pool"})
+        + _delta_frame({"content": " holds at"}, "length")
+        + USAGE_FRAME
+        + DONE
+    )
+    spoken = ReasoningClient(_settings(), http_client=_raw_client(cut_short, bodies))
+    stream = spoken.start_turn(PROMPT)
+    assert [chunk.kind async for chunk in stream] == ["reasoning", "spoken", "spoken"]
+    await spoken.aclose()
+
+    assert stream.finish_reason == "length"
+    assert stream.spoke is True
+
+
+async def test_zero_chunk_stream_completes(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="tutor.reasoning")
+    bodies: list[dict[str, object]] = []
+    for body in ("", DONE):
+        caplog.clear()
+        client = ReasoningClient(_settings(), http_client=_raw_client(body, bodies))
+        stream = client.start_turn(PROMPT)
+        assert [chunk async for chunk in stream] == []
+        await client.aclose()
+
+        assert stream.spoke is False
+        assert stream.first_spoken_ms is None
+        assert stream.finish_reason is None
+        assert "silent_turn" in caplog.text
+    assert len(bodies) == 2
+
+
+async def test_tool_call_only_turn_drains_with_spoke_false(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="tutor.reasoning")
+    release = asyncio.Event()
+    head = [
+        _delta_frame({"reasoning_content": "two call sites"}),
+        _delta_frame(_tool_delta(0, '{"pat', call_id="call_a", name="search_code")),
+        _delta_frame(_tool_delta(0, 'tern": "acq')),
+        _delta_frame(_tool_delta(0, 'uire"}')),
+    ]
+    tail = [
+        _delta_frame(_tool_delta(1, '{"pa', call_id="call_b", name="read_file")),
+        _delta_frame(_tool_delta(1, 'th": "tutor/tts.py"}')),
+        _delta_frame({}, "tool_calls"),
+        USAGE_FRAME,
+        DONE,
+    ]
+    body = _ParkedBody(head, release, tail)
+    bodies: list[dict[str, object]] = []
+    client = ReasoningClient(_settings(), http_client=_parked_client(body, bodies))
+    stream = client.start_turn(PROMPT)
+    seen: list[TurnChunk] = []
+
+    async def consume() -> None:
+        async for chunk in stream:
+            seen.append(chunk)
+
+    consumer = asyncio.create_task(consume())
+    await body.parked.wait()
+
+    assert [chunk.kind for chunk in seen] == ["reasoning", "tool_call"]
+    assert seen[1].tool_call_id == "call_a"
+    assert seen[1].tool_name == "search_code"
+    assert seen[1].text == '{"pattern": "acquire"}'
+
+    release.set()
+    await consumer
+    await client.aclose()
+
+    assert [chunk.kind for chunk in seen] == ["reasoning", "tool_call", "tool_call"]
+    assert seen[2].tool_call_id == "call_b"
+    assert seen[2].tool_name == "read_file"
+    assert seen[2].text == '{"path": "tutor/tts.py"}'
+    assert stream.spoke is False
+    assert stream.first_spoken_ms is None
+    assert stream.finish_reason == "tool_calls"
+    assert "silent_turn" in caplog.text
+
+    unparsed = _tool_delta(0, '{"pattern": "acq', call_id="call_c", name="search_code")
+    partial = ReasoningClient(
+        _settings(), http_client=_raw_client(_sse_body([unparsed], "tool_calls"), bodies)
+    )
+    stream = partial.start_turn(PROMPT)
+    chunks = [chunk async for chunk in stream]
+    await partial.aclose()
+
+    assert len(chunks) == 1
+    assert chunks[0].kind == "tool_call"
+    assert chunks[0].tool_call_id == "call_c"
+    assert chunks[0].tool_name == "search_code"
+    assert chunks[0].text == '{"pattern": "acq'
+    assert stream.finish_reason == "tool_calls"
+    assert stream.spoke is False
