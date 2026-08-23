@@ -1,13 +1,19 @@
+import asyncio
+import http.client
+import io
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from types import SimpleNamespace
 
 import httpx2
+import pytest
 from openai.types.chat import ChatCompletionChunk
 
 from tutor.config import Settings
 from tutor.prompt import TurnPrompt
-from tutor.reasoning import ReasoningClient, ToolCallAccumulator, parse_chunk
+from tutor.reasoning import ReasoningClient, ToolCallAccumulator, TurnChunk, TurnStream, parse_chunk
+
+HANG_GUARD_S = 20.0
 
 
 def _chunk(**delta_fields: object) -> SimpleNamespace:
@@ -145,28 +151,28 @@ PROMPT = TurnPrompt(
 
 
 def _settings(**overrides: object) -> Settings:
-    return Settings(
-        _env_file=None, reasoning_api_base=FAKE_BASE, reasoning_api_key=FAKE_KEY, **overrides
-    )
+    fields: dict[str, object] = {"reasoning_api_base": FAKE_BASE, "reasoning_api_key": FAKE_KEY}
+    return Settings(_env_file=None, **{**fields, **overrides})
 
 
 def _frame(payload: dict[str, object]) -> str:
     return "data: " + json.dumps(payload) + "\n\n"
 
 
+def _delta_frame(delta: dict[str, object]) -> str:
+    return _frame(
+        {
+            "id": "c",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "m",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+        }
+    )
+
+
 def _sse_body(deltas: list[dict[str, object]]) -> str:
-    frames = [
-        _frame(
-            {
-                "id": "c",
-                "object": "chat.completion.chunk",
-                "created": 0,
-                "model": "m",
-                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
-            }
-        )
-        for delta in deltas
-    ]
+    frames = [_delta_frame(delta) for delta in deltas]
     frames.append(
         _frame(
             {
@@ -351,3 +357,185 @@ async def test_start_turn_arguments_override_settings() -> None:
     assert bodies[1]["reasoning_effort"] == "high"
     assert bodies[1]["max_tokens"] == 77
     assert bodies[1]["tools"] == tools
+
+
+class _ParkedBody(httpx2.AsyncByteStream):
+    def __init__(self, head: list[str], release: asyncio.Event, tail: list[str]) -> None:
+        self._head = head
+        self._release = release
+        self._tail = tail
+        self.parked = asyncio.Event()
+        self.closes = 0
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for frame in self._head:
+            yield frame.encode()
+        self.parked.set()
+        await self._release.wait()
+        for frame in self._tail:
+            yield frame.encode()
+
+    async def aclose(self) -> None:
+        self.closes += 1
+
+
+def _parked_client(body: _ParkedBody, bodies: list[dict[str, object]]) -> httpx2.AsyncClient:
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        bodies.append(json.loads(request.content))
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, stream=body)
+
+    return httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
+
+
+async def _collect(stream: TurnStream, got_first: asyncio.Event) -> list[TurnChunk]:
+    seen: list[TurnChunk] = []
+    async for chunk in stream:
+        seen.append(chunk)
+        got_first.set()
+    return seen
+
+
+FIRST = _delta_frame({"content": "the pool"})
+SECOND = _delta_frame({"content": " is bounded"})
+
+
+async def test_cancel_closes_the_response() -> None:
+    release = asyncio.Event()
+    body = _ParkedBody([FIRST], release, [SECOND])
+    bodies: list[dict[str, object]] = []
+    client = ReasoningClient(_settings(), http_client=_parked_client(body, bodies))
+    stream = client.start_turn(PROMPT)
+    got_first = asyncio.Event()
+    consumer = asyncio.create_task(_collect(stream, got_first))
+
+    await got_first.wait()
+    await stream.cancel()
+    assert body.closes == 1
+
+    release.set()
+    chunks = await consumer
+    await client.aclose()
+
+    assert [chunk.text for chunk in chunks] == ["the pool"]
+    assert stream.spoke is True
+
+
+async def test_cancel_is_idempotent() -> None:
+    release = asyncio.Event()
+    body = _ParkedBody([FIRST], release, [])
+    bodies: list[dict[str, object]] = []
+    client = ReasoningClient(_settings(), http_client=_parked_client(body, bodies))
+    stream = client.start_turn(PROMPT)
+    got_first = asyncio.Event()
+    consumer = asyncio.create_task(_collect(stream, got_first))
+
+    await got_first.wait()
+    await stream.cancel()
+    await stream.cancel()
+    assert body.closes == 1
+
+    release.set()
+    assert [chunk.text for chunk in await consumer] == ["the pool"]
+    await stream.cancel()
+    assert body.closes == 1
+
+    untouched = client.start_turn(PROMPT)
+    await untouched.cancel()
+    await untouched.cancel()
+    assert len(bodies) == 1
+
+    plain = ReasoningClient(_settings(), http_client=_mock_client(TWO_THEN_THREE, bodies))
+    finished = plain.start_turn(PROMPT)
+    assert len([chunk async for chunk in finished]) == 5
+    await finished.cancel()
+
+    await client.aclose()
+    await plain.aclose()
+
+
+async def test_cancelled_error_propagates_to_caller() -> None:
+    release = asyncio.Event()
+    body = _ParkedBody([FIRST], release, [SECOND])
+    bodies: list[dict[str, object]] = []
+    client = ReasoningClient(_settings(), http_client=_parked_client(body, bodies))
+    stream = client.start_turn(PROMPT)
+    got_first = asyncio.Event()
+    consumer = asyncio.create_task(_collect(stream, got_first))
+
+    await got_first.wait()
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    await client.aclose()
+
+    assert consumer.cancelled()
+    assert body.closes == 1
+
+
+async def test_cancel_before_first_chunk_is_clean() -> None:
+    release = asyncio.Event()
+    body = _ParkedBody([], release, [FIRST])
+    bodies: list[dict[str, object]] = []
+    client = ReasoningClient(_settings(), http_client=_parked_client(body, bodies))
+    stream = client.start_turn(PROMPT)
+    consumer = asyncio.create_task(_collect(stream, asyncio.Event()))
+
+    await body.parked.wait()
+    await stream.cancel()
+    assert body.closes == 1
+
+    release.set()
+    assert await consumer == []
+    assert stream.spoke is False
+    assert len(bodies) == 1
+    await client.aclose()
+
+    unsent: list[dict[str, object]] = []
+    quiet = ReasoningClient(_settings(), http_client=_parked_client(body, unsent))
+    fresh = quiet.start_turn(PROMPT)
+    await fresh.cancel()
+    assert [chunk async for chunk in fresh] == []
+    assert unsent == []
+    assert fresh.spoke is False
+    await quiet.aclose()
+
+
+async def test_cancel_stops_the_consumer() -> None:
+    park = asyncio.Event()
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        head = await reader.readuntil(b"\r\n\r\n")
+        _, _, raw_headers = head.partition(b"\r\n")
+        headers = http.client.parse_headers(io.BytesIO(raw_headers))
+        await reader.readexactly(int(headers["content-length"]))
+        frame = FIRST.encode()
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"content-type: text/event-stream\r\n"
+            b"transfer-encoding: chunked\r\n"
+            b"\r\n" + f"{len(frame):x}\r\n".encode() + frame + b"\r\n"
+        )
+        await writer.drain()
+        await park.wait()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    client = ReasoningClient(_settings(reasoning_api_base=f"http://127.0.0.1:{port}/v1"))
+    try:
+        stream = client.start_turn(PROMPT)
+        got_first = asyncio.Event()
+        consumer = asyncio.create_task(_collect(stream, got_first))
+
+        await got_first.wait()
+        await stream.cancel()
+        async with asyncio.timeout(HANG_GUARD_S):
+            chunks = await consumer
+
+        assert [chunk.text for chunk in chunks] == ["the pool"]
+        assert stream.spoke is True
+    finally:
+        park.set()
+        server.close()
+        await server.wait_closed()
+        await client.aclose()

@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 import httpx2
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, AsyncStream
+from openai.types.chat import ChatCompletionChunk
 from pydantic import BaseModel
 
 from tutor.config import Settings
@@ -103,28 +104,48 @@ class TurnStream:
         self._client = client
         self._request = request
         self._start = start
+        self._stream: AsyncStream[ChatCompletionChunk] | None = None
+        self._cancelled = False
         self.spoke = False
         self.first_chunk_ms: int | None = None
         self.first_spoken_ms: int | None = None
 
     async def _drain(self) -> AsyncIterator[TurnChunk]:
+        if self._cancelled:
+            return
         stream = await self._client.chat.completions.create(**self._request)
+        self._stream = stream
         tool_calls = ToolCallAccumulator()
-        async for raw in stream:
-            if self.first_chunk_ms is None:
-                self.first_chunk_ms = _elapsed_ms(self._start)
-                logger.debug("llm_first_chunk ms=%d", self.first_chunk_ms)
-            chunk = parse_chunk(raw, tool_calls)
-            if chunk is None:
-                continue
-            if chunk.kind == "spoken" and not self.spoke:
-                self.spoke = True
-                self.first_spoken_ms = _elapsed_ms(self._start)
-                logger.debug("llm_first_spoken ms=%d", self.first_spoken_ms)
-            yield chunk
+        try:
+            if self._cancelled:
+                return
+            async for raw in stream:
+                if self._cancelled:
+                    return
+                if self.first_chunk_ms is None:
+                    self.first_chunk_ms = _elapsed_ms(self._start)
+                    logger.debug("llm_first_chunk ms=%d", self.first_chunk_ms)
+                chunk = parse_chunk(raw, tool_calls)
+                if chunk is None:
+                    continue
+                if chunk.kind == "spoken" and not self.spoke:
+                    self.spoke = True
+                    self.first_spoken_ms = _elapsed_ms(self._start)
+                    logger.debug("llm_first_spoken ms=%d", self.first_spoken_ms)
+                yield chunk
+        except (httpx2.ReadError, httpx2.RemoteProtocolError):
+            if not self._cancelled:
+                raise
+        finally:
+            await stream.close()
 
     def __aiter__(self) -> AsyncIterator[TurnChunk]:
         return self._drain()
+
+    async def cancel(self) -> None:
+        self._cancelled = True
+        if self._stream is not None:
+            await self._stream.close()
 
 
 class ReasoningClient:
