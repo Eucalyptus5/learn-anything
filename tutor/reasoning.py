@@ -7,6 +7,7 @@ from typing import Literal
 
 import httpx2
 from openai import AsyncOpenAI, AsyncStream
+from openai.types import CompletionUsage
 from openai.types.chat import ChatCompletionChunk
 from pydantic import BaseModel
 
@@ -83,7 +84,7 @@ class ToolCallAccumulator:
         return [self._emit(index) for index in pending]
 
 
-def _turn_usage(raw_usage: object, reasoning_chars: int) -> TurnUsage:
+def _turn_usage(raw_usage: CompletionUsage, reasoning_chars: int) -> TurnUsage:
     details = getattr(raw_usage, "prompt_tokens_details", None)
     cached_tokens = getattr(details, "cached_tokens", 0) or 0
     return TurnUsage(
@@ -136,7 +137,7 @@ class TurnStream:
         self._stream = stream
         tool_calls = ToolCallAccumulator()
         reasoning_chars = 0
-        raw_usage: object | None = None
+        raw_usage: CompletionUsage | None = None
         try:
             if self._cancelled:
                 return
@@ -175,8 +176,8 @@ class TurnStream:
                 logger.info(
                     "silent_turn finish_reason=%s prompt_tokens=%s completion_tokens=%s",
                     self.finish_reason,
-                    getattr(self.usage, "prompt_tokens", None),
-                    getattr(self.usage, "completion_tokens", None),
+                    self.usage.prompt_tokens if self.usage else None,
+                    self.usage.completion_tokens if self.usage else None,
                 )
         except (httpx2.ReadError, httpx2.RemoteProtocolError):
             if not self._cancelled:
