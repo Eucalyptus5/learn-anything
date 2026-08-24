@@ -11,6 +11,7 @@ from openai.types.chat import ChatCompletionChunk
 from pydantic import BaseModel
 
 from tutor.config import Settings
+from tutor.cost import TurnUsage
 from tutor.prompt import TurnPrompt
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,17 @@ class ToolCallAccumulator:
         return [self._emit(index) for index in pending]
 
 
+def _turn_usage(raw_usage: object, reasoning_chars: int) -> TurnUsage:
+    details = getattr(raw_usage, "prompt_tokens_details", None)
+    cached_tokens = getattr(details, "cached_tokens", 0) or 0
+    return TurnUsage(
+        prompt_tokens=raw_usage.prompt_tokens,
+        completion_tokens=raw_usage.completion_tokens,
+        cached_tokens=cached_tokens,
+        reasoning_chars=reasoning_chars,
+    )
+
+
 def parse_chunk(chunk: object, tool_calls: ToolCallAccumulator) -> TurnChunk | None:
     choices = getattr(chunk, "choices", None)
     if not choices:
@@ -111,11 +123,11 @@ class TurnStream:
         self._start = start
         self._stream: AsyncStream[ChatCompletionChunk] | None = None
         self._cancelled = False
-        self._usage: object | None = None
         self.spoke = False
         self.finish_reason: str | None = None
         self.first_chunk_ms: int | None = None
         self.first_spoken_ms: int | None = None
+        self.usage: TurnUsage | None = None
 
     async def _drain(self) -> AsyncIterator[TurnChunk]:
         if self._cancelled:
@@ -123,6 +135,8 @@ class TurnStream:
         stream = await self._client.chat.completions.create(**self._request)
         self._stream = stream
         tool_calls = ToolCallAccumulator()
+        reasoning_chars = 0
+        raw_usage: object | None = None
         try:
             if self._cancelled:
                 return
@@ -138,17 +152,21 @@ class TurnStream:
                     self.finish_reason = reason
                 usage = getattr(raw, "usage", None)
                 if usage is not None:
-                    self._usage = usage
+                    raw_usage = usage
                 chunk = parse_chunk(raw, tool_calls)
                 for call in tool_calls.ready():
                     yield call
                 if chunk is None:
                     continue
+                if chunk.kind == "reasoning":
+                    reasoning_chars += len(chunk.text)
                 if chunk.kind == "spoken" and not self.spoke:
                     self.spoke = True
                     self.first_spoken_ms = _elapsed_ms(self._start)
                     logger.debug("llm_first_spoken ms=%d", self.first_spoken_ms)
                 yield chunk
+            if raw_usage is not None:
+                self.usage = _turn_usage(raw_usage, reasoning_chars)
             if self._cancelled:
                 return
             for call in tool_calls.flush():
@@ -157,8 +175,8 @@ class TurnStream:
                 logger.info(
                     "silent_turn finish_reason=%s prompt_tokens=%s completion_tokens=%s",
                     self.finish_reason,
-                    getattr(self._usage, "prompt_tokens", None),
-                    getattr(self._usage, "completion_tokens", None),
+                    getattr(self.usage, "prompt_tokens", None),
+                    getattr(self.usage, "completion_tokens", None),
                 )
         except (httpx2.ReadError, httpx2.RemoteProtocolError):
             if not self._cancelled:
