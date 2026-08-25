@@ -6,17 +6,23 @@ transcript, a recording, or any file from the target repository.
 
 import argparse
 import asyncio
-import os
 import statistics
 import sys
 import time
 import uuid
 from pathlib import Path
 
-from openai import AsyncOpenAI, RateLimitError
-from pydantic import BaseModel
+from openai import RateLimitError
+from pydantic import BaseModel, ValidationError
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+from tutor.config import settings
+from tutor.cost import TurnUsage
+from tutor.prompt import TurnPrompt
+from tutor.reasoning import ReasoningClient
+
 WARMUP = 1
 RETRY_BACKOFF_S = 20
 SAMPLES = 30
@@ -73,28 +79,6 @@ the ordering, and I want to know which of those steps can fail independently.
 """.strip()
 
 
-class Config(BaseModel):
-    base_url: str
-    api_key: str
-    model: str
-
-
-def load_config(model: str) -> Config | None:
-    env = REPO / ".env"
-    values: dict[str, str] = {}
-    if env.exists():
-        for line in env.read_text().splitlines():
-            if line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            values[key.strip()] = value.strip()
-    base_url = os.environ.get("REASONING_API_BASE") or values.get("REASONING_API_BASE", "")
-    api_key = os.environ.get("REASONING_API_KEY") or values.get("REASONING_API_KEY", "")
-    if not base_url or not api_key:
-        return None
-    return Config(base_url=base_url, api_key=api_key, model=model)
-
-
 def pad_to_tokens(body: str, target_words: int) -> str:
     words = body.split()
     out = list(words)
@@ -104,7 +88,7 @@ def pad_to_tokens(body: str, target_words: int) -> str:
 
 
 class Sample(BaseModel):
-    first_chunk_ms: int
+    first_chunk_ms: int | None
     first_spoken_ms: int | None
     total_ms: int
     prompt_tokens: int
@@ -114,57 +98,23 @@ class Sample(BaseModel):
 
 
 async def one_turn(
-    client: AsyncOpenAI, cfg: Config, mode: str, max_tokens: int, system_prompt: str
+    client: ReasoningClient, mode: str, max_tokens: int, system_prompt: str
 ) -> Sample:
-    kwargs: dict = {}
-    if mode == "disabled":
-        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-    else:
-        kwargs["reasoning_effort"] = mode
+    prompt = TurnPrompt(system=system_prompt, user_text=pad_to_tokens(USER_TURN, 225))
     start = time.perf_counter()
-    first_chunk: float | None = None
-    first_spoken: float | None = None
-    reasoning_chars = 0
-    prompt_tokens = 0
-    completion_tokens = 0
-    cached_tokens = 0
-    stream = await client.chat.completions.create(
-        model=cfg.model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": pad_to_tokens(USER_TURN, 225)},
-        ],
-        stream=True,
-        stream_options={"include_usage": True},
-        max_tokens=max_tokens,
-        **kwargs,
-    )
-    async for chunk in stream:
-        now = time.perf_counter()
-        if first_chunk is None:
-            first_chunk = now
-        if chunk.usage is not None:
-            prompt_tokens = chunk.usage.prompt_tokens
-            completion_tokens = chunk.usage.completion_tokens
-            details = getattr(chunk.usage, "prompt_tokens_details", None)
-            cached_tokens = getattr(details, "cached_tokens", 0) or 0
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta
-        reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
-        if reasoning:
-            reasoning_chars += len(reasoning)
-        if delta.content and first_spoken is None:
-            first_spoken = now
-    end = time.perf_counter()
+    stream = client.start_turn(prompt, effort=mode, max_tokens=max_tokens)
+    async for _ in stream:
+        pass
+    total_ms = int((time.perf_counter() - start) * 1000)
+    usage = stream.usage or TurnUsage(prompt_tokens=0, completion_tokens=0)
     return Sample(
-        first_chunk_ms=int((first_chunk - start) * 1000) if first_chunk else -1,
-        first_spoken_ms=int((first_spoken - start) * 1000) if first_spoken else None,
-        total_ms=int((end - start) * 1000),
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        cached_tokens=cached_tokens,
-        reasoning_chars=reasoning_chars,
+        first_chunk_ms=stream.first_chunk_ms,
+        first_spoken_ms=stream.first_spoken_ms,
+        total_ms=total_ms,
+        prompt_tokens=usage.prompt_tokens,
+        completion_tokens=usage.completion_tokens,
+        cached_tokens=usage.cached_tokens,
+        reasoning_chars=usage.reasoning_chars,
     )
 
 
@@ -181,8 +131,7 @@ def summarize(label: str, values: list[int]) -> None:
 
 
 async def run_mode(
-    client: AsyncOpenAI,
-    cfg: Config,
+    client: ReasoningClient,
     mode: str,
     samples_n: int,
     max_tokens: int,
@@ -198,7 +147,7 @@ async def run_mode(
     for _ in range(WARMUP):
         while True:
             try:
-                await one_turn(client, cfg, mode, max_tokens, system_prompt)
+                await one_turn(client, mode, max_tokens, system_prompt)
                 break
             except RateLimitError:
                 await asyncio.sleep(RETRY_BACKOFF_S)
@@ -207,7 +156,7 @@ async def run_mode(
     for i in range(samples_n):
         while True:
             try:
-                samples.append(await one_turn(client, cfg, mode, max_tokens, system_prompt))
+                samples.append(await one_turn(client, mode, max_tokens, system_prompt))
                 break
             except RateLimitError:
                 retries += 1
@@ -215,7 +164,9 @@ async def run_mode(
         print(f"  {name}: {i + 1}/{samples_n}", end="\r", file=sys.stderr)
     print(" " * 40, end="\r", file=sys.stderr)
     print(f"\nreasoning_effort={name}  prompt_tokens={samples[0].prompt_tokens}")
-    summarize("  time to first chunk", [s.first_chunk_ms for s in samples])
+    summarize(
+        "  time to first chunk", [s.first_chunk_ms for s in samples if s.first_chunk_ms is not None]
+    )
     summarize(
         "  time to first spoken token", [s.first_spoken_ms for s in samples if s.first_spoken_ms]
     )
@@ -235,28 +186,32 @@ async def run_mode(
 
 async def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="z-ai/glm-5.3-flash")
-    parser.add_argument("--modes", default="disabled,low")
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--modes", default="low")
     parser.add_argument("--samples", type=int, default=SAMPLES)
     parser.add_argument("--max-tokens", type=int, default=400)
     parser.add_argument("--terse", action="store_true")
     parser.add_argument("--cache-bust", action="store_true")
     args = parser.parse_args()
 
-    cfg = load_config(args.model)
-    if cfg is None:
+    try:
+        cfg = settings()
+    except ValidationError:
         print("BLOCKED: REASONING_API_BASE or REASONING_API_KEY is empty in .env.")
         print("No reasoning-model latency can be reported. Populate .env and rerun.")
         return 2
+    if args.model:
+        cfg = cfg.model_copy(update={"reasoning_model": args.model})
 
-    client = AsyncOpenAI(api_key=cfg.api_key, base_url=cfg.base_url)
+    client = ReasoningClient(cfg)
     print(
-        f"model={cfg.model}  samples={args.samples} (plus {WARMUP} discarded warm-up)  max_tokens={args.max_tokens}"
+        f"model={cfg.reasoning_model}  samples={args.samples} (plus {WARMUP} discarded warm-up)  max_tokens={args.max_tokens}"
     )
     for mode in args.modes.split(","):
         await run_mode(
-            client, cfg, mode.strip(), args.samples, args.max_tokens, args.terse, args.cache_bust
+            client, mode.strip(), args.samples, args.max_tokens, args.terse, args.cache_bust
         )
+    await client.aclose()
     return 0
 
 
