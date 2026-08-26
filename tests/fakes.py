@@ -1,8 +1,13 @@
 import asyncio
+import fractions
 import threading
 
+import av
 import numpy as np
 import pytest
+from aiortc import RTCConfiguration, RTCPeerConnection
+
+from tutor.constants import FRAME_SAMPLES, SAMPLE_RATE
 
 
 class Spawned:
@@ -65,3 +70,20 @@ class FakeTransport:
 
     def flush_playout(self) -> None:
         self.flushes += 1
+
+
+def numbered_frame(value: int, pts: int) -> av.AudioFrame:
+    samples = np.full(FRAME_SAMPLES, value, dtype=np.int16)
+    frame = av.AudioFrame.from_ndarray(samples.reshape(1, -1), format="s16", layout="mono")
+    frame.sample_rate = SAMPLE_RATE
+    frame.pts = pts
+    frame.time_base = fractions.Fraction(1, SAMPLE_RATE)
+    return frame
+
+
+def numbered_frames(count: int) -> list[av.AudioFrame]:
+    return [numbered_frame(i + 1, i * FRAME_SAMPLES) for i in range(count)]
+
+
+def local_peer() -> RTCPeerConnection:
+    return RTCPeerConnection(RTCConfiguration(iceServers=[]))

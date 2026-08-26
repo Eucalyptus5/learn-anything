@@ -7,12 +7,11 @@ from collections.abc import Callable
 import av
 import numpy as np
 import pytest
-from aiortc import RTCConfiguration, RTCPeerConnection
 from aiortc.mediastreams import AudioStreamTrack, MediaStreamError, MediaStreamTrack
 
+from tests.fakes import local_peer, numbered_frames
 from tutor.constants import (
     FRAME_SAMPLES,
-    SAMPLE_RATE,
     TTS_SAMPLE_RATE,
     WEBRTC_FRAME_SAMPLES,
     WEBRTC_SAMPLE_RATE,
@@ -38,19 +37,6 @@ def webrtc_frame(samples: np.ndarray, pts: int) -> av.AudioFrame:
     frame.pts = pts
     frame.time_base = fractions.Fraction(1, WEBRTC_SAMPLE_RATE)
     return frame
-
-
-def numbered_frame(value: int, pts: int) -> av.AudioFrame:
-    samples = np.full(FRAME_SAMPLES, value, dtype=np.int16)
-    frame = av.AudioFrame.from_ndarray(samples.reshape(1, -1), format="s16", layout="mono")
-    frame.sample_rate = SAMPLE_RATE
-    frame.pts = pts
-    frame.time_base = fractions.Fraction(1, SAMPLE_RATE)
-    return frame
-
-
-def numbered_frames(count: int) -> list[av.AudioFrame]:
-    return [numbered_frame(i + 1, i * FRAME_SAMPLES) for i in range(count)]
 
 
 def tone_frames(count: int) -> list[av.AudioFrame]:
@@ -125,10 +111,6 @@ class FakeChannel:
 
     def send(self, message: str) -> None:
         self.sent.append(message)
-
-
-def local_peer() -> RTCPeerConnection:
-    return RTCPeerConnection(RTCConfiguration(iceServers=[]))
 
 
 async def loud_array(queue: asyncio.Queue[np.ndarray]) -> np.ndarray:
