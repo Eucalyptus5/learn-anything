@@ -124,9 +124,62 @@ def _fitting_prefix(result: SearchResult, budget: int, floor_one: bool) -> Searc
     return None
 
 
+ToolCallPayload = dict[str, str | dict[str, str]]
+MessagePayload = dict[str, str | list[ToolCallPayload]]
+
+SEARCH_CODE_TOOL: dict[str, object] = {
+    "type": "function",
+    "function": {
+        "name": "search_code",
+        "description": (
+            "Search the target repository for a regular expression and return the matching "
+            "lines with their paths, line numbers and surrounding context."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Regular expression matched against file contents.",
+                },
+                "globs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Path globs limiting the search, such as src/**/*.py.",
+                },
+            },
+            "required": ["query", "globs"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+class ToolCallFunction(BaseModel):
+    name: str
+    arguments: str
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: Literal["function"] = "function"
+    function: ToolCallFunction
+
+
 class Message(BaseModel):
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "tool"]
     content: str
+    tool_call_id: str | None = None
+    tool_calls: list[ToolCall] | None = None
+
+
+def _payload(message: Message) -> MessagePayload:
+    payload: MessagePayload = {"role": message.role, "content": message.content}
+    if message.tool_call_id is not None:
+        payload["tool_call_id"] = message.tool_call_id
+    if message.tool_calls is not None:
+        payload["tool_calls"] = [call.model_dump() for call in message.tool_calls]
+    return payload
 
 
 class TurnPrompt(BaseModel):
@@ -134,6 +187,7 @@ class TurnPrompt(BaseModel):
     history: list[Message] = Field(default_factory=list)
     tool_context: list[SearchResult] = Field(default_factory=list)
     user_text: str
+    tool_exchange: list[Message] = Field(default_factory=list)
 
     @field_validator("tool_context", mode="after")
     @classmethod
@@ -152,9 +206,10 @@ class TurnPrompt(BaseModel):
             break
         return capped
 
-    def messages(self) -> list[dict[str, str]]:
-        messages = [{"role": "system", "content": self.system}]
-        messages.extend({"role": m.role, "content": m.content} for m in self.history)
+    def messages(self) -> list[MessagePayload]:
+        messages: list[MessagePayload] = [{"role": "system", "content": self.system}]
+        messages.extend(_payload(m) for m in self.history)
         messages.extend({"role": "user", "content": r.model_dump_json()} for r in self.tool_context)
         messages.append({"role": "user", "content": self.user_text})
+        messages.extend(_payload(m) for m in self.tool_exchange)
         return messages

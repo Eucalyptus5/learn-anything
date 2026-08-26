@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -6,7 +7,15 @@ from pathlib import Path
 import pytest
 
 from tests.fakes import Spawned, record_spawns
-from tutor.prompt import TOOL_CONTEXT_BYTES, Message, TurnPrompt, derive_globs
+from tutor.prompt import (
+    SEARCH_CODE_TOOL,
+    TOOL_CONTEXT_BYTES,
+    Message,
+    ToolCall,
+    ToolCallFunction,
+    TurnPrompt,
+    derive_globs,
+)
 from tutor.tools.models import PATH_EXTENSIONS, SearchBudget, SearchMatch, SearchResult
 from tutor.tools.search import search
 
@@ -343,3 +352,135 @@ def test_second_result_dropped_when_its_fitting_prefix_would_be_empty() -> None:
         m for m in messages if m["role"] == "user" and m["content"] == zero.model_dump_json()
     ]
     assert len(tool_messages) == 1
+
+
+def _tool_call(call_id: str, arguments: str) -> ToolCall:
+    return ToolCall(id=call_id, function=ToolCallFunction(name="search_code", arguments=arguments))
+
+
+def test_tool_exchange_follows_the_user_turn() -> None:
+    ctx = _result("acquire", 1, 10)
+    call = _tool_call("call_a", '{"query": "acquire", "globs": ["src/**/*.py"]}')
+
+    prompt = TurnPrompt(
+        system="you are the tutor",
+        history=[Message(role="user", content="how does the pool work")],
+        tool_context=[ctx],
+        user_text="walk me through it",
+        tool_exchange=[
+            Message(role="assistant", content="", tool_calls=[call]),
+            Message(role="tool", content=ctx.model_dump_json(), tool_call_id="call_a"),
+        ],
+    )
+
+    messages = prompt.messages()
+
+    assert [m["role"] for m in messages] == [
+        "system",
+        "user",
+        "user",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert messages[3] == {"role": "user", "content": "walk me through it"}
+    assert messages[-2]["tool_calls"][0]["id"] == messages[-1]["tool_call_id"]
+
+
+def test_emitted_tool_call_is_api_shaped() -> None:
+    arguments = '{"query": "acquire", "globs": ["src/**/*.py"]}'
+
+    prompt = TurnPrompt(
+        system="you are the tutor",
+        user_text="walk me through it",
+        tool_exchange=[
+            Message(role="assistant", content="", tool_calls=[_tool_call("call_a", arguments)])
+        ],
+    )
+
+    entry = json.loads(json.dumps(prompt.messages()[-1]))["tool_calls"][0]
+
+    assert entry == {
+        "id": "call_a",
+        "type": "function",
+        "function": {"name": "search_code", "arguments": arguments},
+    }
+    assert json.loads(entry["function"]["arguments"]) == {
+        "query": "acquire",
+        "globs": ["src/**/*.py"],
+    }
+
+
+def test_optional_keys_appear_only_where_set() -> None:
+    prompt = TurnPrompt(
+        system="you are the tutor",
+        history=[Message(role="assistant", content="it hands out connections")],
+        user_text="walk me through it",
+        tool_exchange=[
+            Message(role="assistant", content="", tool_calls=[_tool_call("call_a", "{}")]),
+            Message(role="tool", content="{}", tool_call_id="call_a"),
+        ],
+    )
+
+    messages = prompt.messages()
+
+    for plain in messages[:3]:
+        assert set(plain) == {"role", "content"}
+    assert set(messages[-2]) == {"role", "content", "tool_calls"}
+    assert set(messages[-1]) == {"role", "content", "tool_call_id"}
+
+
+def test_two_calls_keep_their_pairing_and_order() -> None:
+    calls = [
+        _tool_call("call_a", '{"query": "acquire"}'),
+        _tool_call("call_b", '{"query": "release"}'),
+    ]
+
+    prompt = TurnPrompt(
+        system="you are the tutor",
+        user_text="walk me through it",
+        tool_exchange=[
+            Message(role="assistant", content="", tool_calls=calls),
+            Message(role="tool", content="acquire result", tool_call_id="call_a"),
+            Message(role="tool", content="release result", tool_call_id="call_b"),
+        ],
+    )
+
+    messages = prompt.messages()
+
+    assert [entry["id"] for entry in messages[-3]["tool_calls"]] == ["call_a", "call_b"]
+    assert [(m["tool_call_id"], m["content"]) for m in messages[-2:]] == [
+        ("call_a", "acquire result"),
+        ("call_b", "release result"),
+    ]
+
+
+def test_search_code_schema_is_json_data() -> None:
+    assert json.loads(json.dumps(SEARCH_CODE_TOOL)) == SEARCH_CODE_TOOL
+    assert SEARCH_CODE_TOOL["function"]["name"] == "search_code"
+
+
+def test_search_code_schema_describes_only_model_chosen_arguments() -> None:
+    properties = SEARCH_CODE_TOOL["function"]["parameters"]["properties"]
+
+    assert set(properties) == {"query", "globs"}
+    assert set(properties) <= set(inspect.signature(search).parameters)
+
+
+def test_prompt_without_a_tool_exchange_is_unchanged() -> None:
+    ctx = _result("acquire", 1, 10)
+
+    prompt = TurnPrompt(
+        system="you are the tutor",
+        history=[Message(role="user", content="how does the pool work")],
+        tool_context=[ctx],
+        user_text="walk me through it",
+    )
+
+    assert prompt.tool_exchange == []
+    assert prompt.messages() == [
+        {"role": "system", "content": "you are the tutor"},
+        {"role": "user", "content": "how does the pool work"},
+        {"role": "user", "content": ctx.model_dump_json()},
+        {"role": "user", "content": "walk me through it"},
+    ]
