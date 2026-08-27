@@ -12,6 +12,7 @@ import pytest
 from aiortc.mediastreams import MediaStreamError, MediaStreamTrack
 
 from tests.fakes import local_peer, numbered_frames
+from tutor.chunker import split_clauses
 from tutor.constants import FRAME_SAMPLES, SAMPLE_RATE
 from tutor.endpointer import SILENCE_WINDOW_MS
 from tutor.input_path import (
@@ -26,7 +27,14 @@ from tutor.lead_in import lead_in_sentence
 from tutor.prompt import SEARCH_CODE_TOOL, TurnPrompt
 from tutor.reasoning import TurnChunk
 from tutor.session import BAD_ARGUMENTS, SPOKEN_DEPTH, TurnLoop, TurnLoopConfig
-from tutor.tools.models import SearchBudget, SearchMatch, SearchResult
+from tutor.tools.models import (
+    GroundingVerdict,
+    Position,
+    SearchBudget,
+    SearchMatch,
+    SearchResult,
+)
+from tutor.tools.provenance import TurnRegistry
 from tutor.transport import INBOUND_CAPACITY, Connection
 
 HANG_GUARD_S = 20.0
@@ -35,10 +43,38 @@ SYSTEM = "you tutor an engineer through a codebase"
 SUBJECT = "the inbound frame queue"
 USER_TEXT = "walk me through tutor/transport.py"
 SECOND_TEXT = "and where does tutor/playout.py fit"
+GROUNDED_PATH = "tutor/transport.py"
+UNGROUNDED_PATH = "tutor/playout.py"
+UNPARSEABLE_PATH = "tutor/my transport.py"
 GLOBS = ["tutor/**/*.py"]
 SPOKEN_DELTAS = ["It lives in ", "the reader, ", "which drains ", "the track."]
 SPOKEN_CLAUSES = ["It lives in the reader,", "which drains the track."]
 FOLLOW_DELTAS = [" Both call sites ", "drain it."]
+PATH_DELTAS = [
+    f"It lives in {GROUNDED_PATH}, ",
+    f"and the other copy of the same reader sits in {UNGROUNDED_PATH}, ",
+    "Both call sites drain it.",
+]
+PATH_CLAUSES = [
+    f"It lives in {GROUNDED_PATH},",
+    f"and the other copy of the same reader sits in {UNGROUNDED_PATH},",
+    "Both call sites drain it.",
+]
+LINE_DELTAS = [f"It lives in {GROUNDED_PATH} line 24, ", "and the reader drains the track."]
+LINE_CLAUSES = [
+    f"It lives in {GROUNDED_PATH} line 24,",
+    "and the reader drains the track.",
+]
+SPLIT_LINE = 4021
+SPLIT_DELTAS = [
+    "It lives there. The queue reader that drains ",
+    f"the inbound audio track sits on line {SPLIT_LINE} of that same file and it never blocks.",
+]
+SPLIT_CLAUSES = [
+    "It lives there.",
+    "The queue reader that drains the inbound audio track sits on line",
+    f"{SPLIT_LINE} of that same file and it never blocks.",
+]
 CHAINED_CLAUSES = [
     "It lives in the reader,",
     "which drains the track. Both call sites drain it.",
@@ -80,14 +116,12 @@ PACED_PROBABILITIES = (
 )
 
 
-def found() -> SearchResult:
+def found(path: str = GROUNDED_PATH) -> SearchResult:
     return SearchResult(
         tool="search",
         query=USER_TEXT,
         globs=GLOBS,
-        matches=[
-            SearchMatch(path="tutor/transport.py", line=24, text="        self._inbound = queue")
-        ],
+        matches=[SearchMatch(path=path, line=24, text="        self._inbound = queue")],
         truncated=False,
         oversized=False,
         byte_count=64,
@@ -142,20 +176,26 @@ class FakeSearch:
         result: SearchResult,
         gate: asyncio.Event | None = None,
         fails: str | None = None,
+        later: SearchResult | None = None,
+        holds: str | None = None,
     ) -> None:
         self._log = log
         self._result = result
         self._gate = gate
         self._fails = fails
+        self._later = later
+        self._holds = holds
         self.calls: list[tuple[str, list[str], Path, SearchBudget]] = []
         self.entered = asyncio.Event()
+        self.held = asyncio.Event()
 
     async def __call__(
         self, query: str, globs: Sequence[str], root: Path, budget: SearchBudget
     ) -> SearchResult:
         self.calls.append((query, list(globs), root, budget))
         self.entered.set()
-        if self._gate is not None:
+        if self._gate is not None and (self._holds is None or self._holds == query):
+            self.held.set()
             try:
                 await self._gate.wait()
             except asyncio.CancelledError:
@@ -164,6 +204,8 @@ class FakeSearch:
         if query == self._fails:
             raise SearchFailed
         self._log.append(("search_done", query))
+        if self._later is not None and len(self.calls) > 1:
+            return self._later
         return self._result
 
 
@@ -179,6 +221,9 @@ class FakeRegistry:
 
     def abandon(self, turn_id: str) -> None:
         self._log.append(("abandon", turn_id))
+
+    def verify_chunk(self, turn_id: str, text: str, source: str = "model") -> GroundingVerdict:
+        return GroundingVerdict(ok=True)
 
 
 class FakeSpeaker:
@@ -868,4 +913,158 @@ async def test_a_lone_tool_call_missing_its_id_skips_the_follow_up(
     ]
     assert [message for message in messages if message.startswith("turn.failed")] == []
     assert [message for message in messages if message.startswith("turn.reasoning_failed")] == []
+    await loop.aclose()
+
+
+async def test_an_ungrounded_chunk_is_withheld_from_the_speaker(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    registry = TurnRegistry()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in PATH_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received)
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    loop = TurnLoop(config(tmp_path), source, search, speaker, reasoning, registry, FakeClock())
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert speaker.utterances == [[lead_in_sentence([result]), PATH_CLAUSES[0], PATH_CLAUSES[2]]]
+
+    messages = session_messages(caplog)
+    assert "turn.chunk_withheld turn_id=turn-1 source=model ungrounded=1" in messages
+    assert all(UNGROUNDED_PATH not in message for message in messages)
+    await loop.aclose()
+
+
+async def test_a_recorded_position_reaches_the_speaker_unchanged(tmp_path: Path) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    registry = TurnRegistry()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in LINE_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received)
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    loop = TurnLoop(config(tmp_path), source, search, speaker, reasoning, registry, FakeClock())
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert speaker.utterances == [[lead_in_sentence([result])] + LINE_CLAUSES]
+    await loop.aclose()
+
+
+async def test_last_turns_position_does_not_authorize_this_turn(tmp_path: Path) -> None:
+    log: list[tuple[str, object]] = []
+    first = found()
+    second = found(UNGROUNDED_PATH)
+    registry = TurnRegistry()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, first, later=second)
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in PATH_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received)
+    source = ScriptedSource(
+        [EndOfTurn(text=USER_TEXT), speaker.finished, EndOfTurn(text=SECOND_TEXT)]
+    )
+    loop = TurnLoop(config(tmp_path), source, search, speaker, reasoning, registry, FakeClock())
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert speaker.utterances == [
+        [lead_in_sentence([first]), PATH_CLAUSES[0], PATH_CLAUSES[2]],
+        [lead_in_sentence([second]), PATH_CLAUSES[1], PATH_CLAUSES[2]],
+    ]
+    await loop.aclose()
+
+
+async def test_a_lead_in_the_gate_cannot_reparse_is_withheld(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found(UNPARSEABLE_PATH)
+    registry = TurnRegistry()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received)
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    loop = TurnLoop(config(tmp_path), source, search, speaker, reasoning, registry, FakeClock())
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert lead_in_sentence([result]) not in [text for name, text in log if name == "speak"]
+    assert speaker.utterances == [SPOKEN_CLAUSES]
+
+    messages = session_messages(caplog)
+    assert "turn.chunk_withheld turn_id=turn-1 source=lead_in ungrounded=1" in messages
+    assert all(UNPARSEABLE_PATH not in message for message in messages)
+    await loop.aclose()
+
+
+async def test_a_tool_result_answering_an_abandoned_turn_reaches_nobody(tmp_path: Path) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    registry = TurnRegistry()
+    speaker = FakeSpeaker(log)
+    gate = asyncio.Event()
+    search = FakeSearch(log, result, gate=gate, later=found(UNGROUNDED_PATH), holds=MODEL_QUERY)
+    deltas = [
+        TurnChunk(
+            kind="tool_call",
+            text=SEARCH_ARGUMENTS,
+            tool_call_id=SEARCH_CALL_ID,
+            tool_name="search_code",
+        )
+    ]
+    follow_up = [TurnChunk(kind="spoken", text=delta) for delta in PATH_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received, follow_up=follow_up)
+    release = asyncio.Event()
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), release])
+    loop = TurnLoop(config(tmp_path), source, search, speaker, reasoning, registry, FakeClock())
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(search.held.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    gate.set()
+    release.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert len(search.calls) == 2
+    assert ("search_cancelled", MODEL_QUERY) in log
+    assert ("search_done", MODEL_QUERY) not in log
+    assert not registry.known("turn-1", Position(path=UNGROUNDED_PATH, line=24))
+    assert not registry.known("turn-1", Position(path=UNGROUNDED_PATH))
+    assert speaker.utterances == [[lead_in_sentence([result])]]
+    assert PATH_CLAUSES[1] not in [text for name, text in log if name == "speak"]
+
+
+async def test_a_line_number_split_across_the_cut_never_reaches_the_speaker(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    registry = TurnRegistry()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPLIT_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received)
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    loop = TurnLoop(config(tmp_path), source, search, speaker, reasoning, registry, FakeClock())
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    clauses, remainder = split_clauses("".join(SPLIT_DELTAS), 3, 12)
+    spoken = [text for name, text in log if name == "speak"]
+    assert clauses + [remainder] == SPLIT_CLAUSES
+    assert speaker.utterances == [[lead_in_sentence([result]), *SPLIT_CLAUSES[:2]]]
+    assert all(str(SPLIT_LINE) not in chunk for chunk in spoken)
+
+    messages = session_messages(caplog)
+    assert "turn.chunk_withheld turn_id=turn-1 source=model ungrounded=1" in messages
     await loop.aclose()

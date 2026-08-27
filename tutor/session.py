@@ -177,13 +177,27 @@ class TurnLoop:
     async def _utterance(
         self, turn_id: str, lead_in: str, prompt: TurnPrompt
     ) -> AsyncIterator[str]:
-        yield lead_in
+        if self._admits(turn_id, lead_in, "lead_in"):
+            yield lead_in
         queue: asyncio.Queue[str | None] = asyncio.Queue(SPOKEN_DEPTH)
         self._drains[turn_id] = asyncio.create_task(
             self._drain(turn_id, prompt, queue), name=f"{turn_id}-drain"
         )
         async for clause in clause_chunks(_queued(queue)):
-            yield clause
+            if self._admits(turn_id, clause, "model"):
+                yield clause
+
+    def _admits(self, turn_id: str, text: str, source: str) -> bool:
+        verdict = self._registry.verify_chunk(turn_id, text, source=source)
+        if verdict.ok:
+            return True
+        logger.warning(
+            "turn.chunk_withheld turn_id=%s source=%s ungrounded=%d",
+            turn_id,
+            source,
+            len(verdict.ungrounded),
+        )
+        return False
 
     async def _drain(
         self, turn_id: str, prompt: TurnPrompt, queue: asyncio.Queue[str | None]
