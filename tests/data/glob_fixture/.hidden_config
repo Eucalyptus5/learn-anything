@@ -1,0 +1,2 @@
+FIXTURE_VALUE=placeholder-not-a-secret
+NOTE=SENTINEL must never leave the dotfile

@@ -1,18 +1,36 @@
 import asyncio
 import json
 import logging
+import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from tests.fakes import Spawned, match_record, record_spawns
+from tests.fakes import (
+    SPLIT_SEPARATORS,
+    Spawned,
+    forged_names_tree,
+    match_record,
+    record_spawns,
+)
 from tutor.tools.models import SearchBudget
-from tutor.tools.ripgrep import RipgrepFailed, RipgrepUnavailable, probe_ripgrep, run_ripgrep
+from tutor.tools.ripgrep import (
+    VISIBILITY_WALK_TIMEOUT_MS,
+    RipgrepFailed,
+    RipgrepUnavailable,
+    probe_ripgrep,
+    reap,
+    run_ripgrep,
+    visible_files,
+)
 
 FAKE_RG_DIR = str(Path(__file__).parent / "data" / "fake_rg")
 FIXTURE_ROOT = Path(__file__).parent / "data" / "fixture_repo"
+GLOB_FIXTURE = Path(__file__).parent / "data" / "glob_fixture"
+HANG_GUARD_S = 20.0
+OVER_READER_LIMIT_BYTES = 200000
 FIXTURE_PY = {
     "./generated/out.py",
     "./src/httpclient.py",
@@ -236,13 +254,13 @@ async def test_submatch_offsets_survive_non_ascii_lines(monkeypatch: pytest.Monk
         json.dumps(record) + "\n"
         for record in (
             match_record(
-                "./src/accents.py",
+                "./src/httpclient.py",
                 1,
                 accent * 300 + "NEEDLE\n",
                 [{"match": {"text": "NEEDLE"}, "start": 600, "end": 606}],
             ),
             match_record(
-                "./src/accents.py",
+                "./src/httpclient.py",
                 2,
                 accent * 398 + "NEEDLE" + accent * 50 + "\n",
                 [
@@ -292,3 +310,200 @@ async def test_timeout_kills_child_and_returns_truncated(blocking_child: Spawned
         False,
     )
     assert blocking_child.proc.returncode < 0
+
+
+async def test_records_outside_the_visible_tree_are_dropped_before_the_meter() -> None:
+    records, byte_count, truncated, oversized = await run_ripgrep(
+        "SENTINEL", ["**/*"], GLOB_FIXTURE, SearchBudget(max_bytes=2000)
+    )
+
+    assert {record["data"]["path"]["text"] for record in records} == {
+        "./sub/deep.py",
+        "./visible.py",
+    }
+    assert truncated is False
+    assert oversized is False
+    assert byte_count == metered(records)
+
+
+def install_walk_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str) -> None:
+    shim = tmp_path / "rg"
+    shim.write_text(f"#!/bin/sh\n{body}\n")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+
+def begin_record(path: str) -> dict:
+    return {"type": "begin", "data": {"path": {"text": path}}}
+
+
+def test_a_separator_in_a_filename_cannot_forge_a_visible_entry(tmp_path: Path) -> None:
+    root = forged_names_tree(tmp_path)
+
+    visible = visible_files(root)
+
+    assert "./private_notes/secret.txt" not in visible
+    assert "./visible.py" in visible
+    assert len(visible) == len(SPLIT_SEPARATORS) + 1
+
+
+async def test_a_forged_entry_cannot_admit_an_ignored_file(tmp_path: Path) -> None:
+    root = forged_names_tree(tmp_path)
+
+    records, _, _, _ = await run_ripgrep("CANARY", ["**/*"], root, SearchBudget())
+
+    paths = {record["data"]["path"]["text"] for record in matches(records)}
+    assert "./private_notes/secret.txt" not in paths
+    assert "./visible.py" in paths
+
+
+async def test_oversized_flags_a_visible_record_and_ignores_an_invisible_one() -> None:
+    hidden, _, _, hidden_oversized = await run_ripgrep(
+        "row 00", ["**/*"], GLOB_FIXTURE, SearchBudget(max_record_bytes=250)
+    )
+
+    assert hidden == []
+    assert hidden_oversized is False
+
+    shown, _, _, shown_oversized = await run_ripgrep(
+        "SENTINEL", ["**/*"], GLOB_FIXTURE, SearchBudget(max_record_bytes=150)
+    )
+
+    assert {record["data"]["path"]["text"] for record in shown} == {
+        "./sub/deep.py",
+        "./visible.py",
+    }
+    assert shown_oversized is True
+
+
+@pytest.mark.parametrize(("path", "flagged"), [("./src/pool.py", True), ("./ignored.py", False)])
+async def test_a_record_too_large_to_buffer_is_attributed_to_its_block(
+    monkeypatch: pytest.MonkeyPatch, path: str, flagged: bool
+) -> None:
+    huge = match_record(
+        path, 1, "x" * 70000 + "\n", [{"match": {"text": "x"}, "start": 0, "end": 1}]
+    )
+    payload = json.dumps(begin_record(path)) + "\n" + json.dumps(huge) + "\n"
+    record_spawns(
+        monkeypatch, [sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", payload]
+    )
+
+    records, _, truncated, oversized = await run_ripgrep(
+        "x", ["src/*.py"], FIXTURE_ROOT, SearchBudget(max_record_bytes=200)
+    )
+
+    assert records == []
+    assert truncated is False
+    assert oversized is flagged
+
+
+def test_a_walk_that_produced_nothing_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_walk_shim(tmp_path, monkeypatch, "echo 'rg: /nope: Permission denied' >&2\nexit 2")
+
+    with pytest.raises(RipgrepFailed, match="Permission denied"):
+        visible_files(FIXTURE_ROOT)
+
+
+def test_a_partial_walk_narrows_and_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="tutor.tools.ripgrep")
+    install_walk_shim(
+        tmp_path,
+        monkeypatch,
+        "printf './src/pool.py\\0'\necho 'rg: /nope: Permission denied' >&2\nexit 2",
+    )
+
+    assert visible_files(FIXTURE_ROOT) == frozenset({"./src/pool.py"})
+    assert any("ripgrep_walk_partial" in record.getMessage() for record in caplog.records)
+
+
+async def test_the_walk_is_bounded(spawned: Spawned, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[object] = []
+    real = subprocess.run
+
+    def capture(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        seen.append(kwargs.get("timeout"))
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", capture)
+
+    await run_ripgrep("acquire", ["src/*.py"], FIXTURE_ROOT, SearchBudget())
+
+    assert seen == [VISIBILITY_WALK_TIMEOUT_MS / 1000]
+
+
+async def test_a_timed_out_walk_fails_closed_and_visibly(
+    spawned: Spawned, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def timing_out(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise subprocess.TimeoutExpired(argv, 2.0)
+
+    monkeypatch.setattr(subprocess, "run", timing_out)
+
+    with pytest.raises(RipgrepFailed, match="timed out"):
+        await run_ripgrep("acquire", ["src/*.py"], FIXTURE_ROOT, SearchBudget())
+
+    assert spawned.calls == 0
+
+
+@pytest.mark.parametrize("pipe", ["stdout", "stderr"])
+async def test_reap_returns_when_a_pipe_reader_is_paused(pipe: str) -> None:
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import threading; threading.Event().wait()",
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    # Past the reader limit the transport is paused, so it never delivers EOF on its own.
+    getattr(proc, pipe).feed_data(b"x" * OVER_READER_LIMIT_BYTES)
+
+    await asyncio.wait_for(reap(proc), HANG_GUARD_S)
+
+    assert proc.returncode < 0
+
+
+async def test_a_truncated_final_walk_entry_cannot_admit_an_ignored_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".rgignore").write_text("/notes.txt\n")
+    (tmp_path / "notes.txt").write_text("CANARY ignored row\n")
+    (tmp_path / "notes.txt.md").write_text("CANARY visible row\n")
+
+    def cut_short(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(argv, 0, b"./notes.txt.md\x00./notes.txt", b"")
+
+    monkeypatch.setattr(subprocess, "run", cut_short)
+
+    assert visible_files(tmp_path) == frozenset({"./notes.txt.md"})
+
+    records, _, _, _ = await run_ripgrep("CANARY", ["**/*"], tmp_path, SearchBudget())
+
+    assert {record["data"]["path"]["text"] for record in records} == {"./notes.txt.md"}
+
+
+def test_a_signal_killed_walk_that_named_nothing_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_walk_shim(tmp_path, monkeypatch, "kill -9 $$")
+
+    with pytest.raises(RipgrepFailed, match="exited -9"):
+        visible_files(FIXTURE_ROOT)
+
+
+def test_a_signal_killed_walk_that_named_some_files_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="tutor.tools.ripgrep")
+    install_walk_shim(tmp_path, monkeypatch, "printf './src/pool.py\\0'\nkill -9 $$")
+
+    assert visible_files(FIXTURE_ROOT) == frozenset({"./src/pool.py"})
+    assert any("ripgrep_walk_partial" in record.getMessage() for record in caplog.records)
+
+
+def test_a_tree_holding_no_visible_files_is_not_a_walk_failure(tmp_path: Path) -> None:
+    assert visible_files(tmp_path) == frozenset()

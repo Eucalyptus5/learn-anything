@@ -1,6 +1,7 @@
 import asyncio
 import fractions
 import threading
+from pathlib import Path
 
 import av
 import numpy as np
@@ -34,6 +35,21 @@ def record_spawns(monkeypatch: pytest.MonkeyPatch, replacement: list[str] | None
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", passthrough)
     return holder
+
+
+SPLIT_SEPARATORS = ["\x0b", "\x1c", "\x85", "\u2028"]
+
+
+def forged_names_tree(root: Path) -> Path:
+    (root / ".rgignore").write_text("/private_notes/\n")
+    (root / "private_notes").mkdir()
+    (root / "private_notes" / "secret.txt").write_text("CANARY placeholder row\n")
+    (root / "visible.py").write_text("CANARY ordinary row\n")
+    for separator in SPLIT_SEPARATORS:
+        carrier = root / f"x{separator}." / "private_notes"
+        carrier.mkdir(parents=True)
+        (carrier / "secret.txt").write_text("CANARY decoy row\n")
+    return root
 
 
 def match_record(path: str, number: int, text: str, submatches: list[dict]) -> dict:

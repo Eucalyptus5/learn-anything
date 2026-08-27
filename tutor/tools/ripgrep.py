@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import subprocess
@@ -10,6 +11,7 @@ from tutor.tools.models import MAX_COLUMNS, SearchBudget
 logger = logging.getLogger(__name__)
 
 READ_CHUNK_BYTES = 65536
+VISIBILITY_WALK_TIMEOUT_MS = 5000
 
 
 class RipgrepUnavailable(ValueError):
@@ -34,6 +36,53 @@ def probe_ripgrep(minimum: tuple[int, int, int] = (14, 0, 0)) -> str:
             f"rg version {version} is below the required minimum {minimum_str}"
         )
     return version
+
+
+def decode_field(field: dict[str, str]) -> str | None:
+    if "text" in field:
+        return field["text"]
+    try:
+        return base64.b64decode(field["bytes"]).decode()
+    except UnicodeDecodeError:
+        return None
+
+
+def visible_files(root: Path) -> frozenset[str]:
+    try:
+        walk = subprocess.run(
+            ["rg", "--files", "--no-require-git", "--null", "."],
+            cwd=root,
+            capture_output=True,
+            check=False,
+            timeout=VISIBILITY_WALK_TIMEOUT_MS / 1000,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RipgrepFailed(f"rg --files timed out after {VISIBILITY_WALK_TIMEOUT_MS}ms") from exc
+
+    # NUL is the one byte a path cannot hold, so a filename carrying a line or record separator
+    # cannot split itself into a second entry.
+    entries = walk.stdout.split(b"\x00")
+    if entries[-1]:
+        # A walk cut off mid-write leaves a prefix of a path, and that prefix names another file.
+        entries.pop()
+
+    names: set[str] = set()
+    for raw in entries:
+        if not raw:
+            continue
+        try:
+            names.add(raw.decode())
+        except UnicodeDecodeError:
+            continue
+
+    # rg --files exits 1 when the tree holds nothing visible, which is not a failure.
+    if walk.returncode not in (0, 1):
+        detail = walk.stderr.decode(errors="replace").strip()
+        if not names:
+            raise RipgrepFailed(f"rg --files exited {walk.returncode}: {detail}")
+        logger.warning("ripgrep_walk_partial exit=%d stderr=%s", walk.returncode, detail)
+
+    return frozenset(names)
 
 
 def record_size(record: dict) -> int:
@@ -62,6 +111,13 @@ def _clip(record: dict) -> None:
 async def reap(proc: asyncio.subprocess.Process) -> None:
     if proc.returncode is None:
         proc.kill()
+    # A reader left over its limit has paused its transport, which then never reports EOF, and
+    # wait() blocks until every pipe has reported it.
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is None:
+            continue
+        while await pipe.read(READ_CHUNK_BYTES):
+            pass
     await proc.wait()
 
 
@@ -70,6 +126,8 @@ async def run_ripgrep(
 ) -> tuple[list[dict], int, bool, bool]:
     if not globs:
         raise ValueError("run_ripgrep needs at least one glob")
+
+    visible = await asyncio.to_thread(visible_files, root)
 
     argv = [
         "rg",
@@ -96,6 +154,7 @@ async def run_ripgrep(
     oversized = False
     buffer = b""
     skipping = False
+    block: str | None = None
 
     try:
         try:
@@ -117,10 +176,17 @@ async def run_ripgrep(
                             skipping = False
                             continue
                         if len(raw) > budget.max_record_bytes:
-                            oversized = True
+                            # An oversized record is never parsed, so the begin record that
+                            # opened its block is the only thing naming the file it came from.
+                            oversized = oversized or block in visible
                             continue
                         record = json.loads(raw)
+                        if record["type"] == "begin":
+                            block = decode_field(record["data"]["path"])
+                            continue
                         if record["type"] not in ("match", "context"):
+                            continue
+                        if decode_field(record["data"]["path"]) not in visible:
                             continue
                         _clip(record)
                         size = record_size(record)
@@ -133,7 +199,7 @@ async def run_ripgrep(
                     if truncated:
                         break
                     if len(buffer) > budget.max_record_bytes:
-                        oversized = True
+                        oversized = oversized or block in visible
                         skipping = True
                         buffer = b""
         except TimeoutError:

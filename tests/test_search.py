@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.fakes import match_record, record_spawns
+from tests.fakes import forged_names_tree, match_record, record_spawns
 from tutor.tools.models import ContextLine, SearchBudget, SearchResult
 from tutor.tools.ripgrep import run_ripgrep
 from tutor.tools.search import search
@@ -100,16 +100,16 @@ async def test_union_fields_decode_and_invalid_utf8_is_dropped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     submatches = [{"match": {"text": "acquire"}, "start": 0, "end": 7}]
-    valid_bytes = match_record("./src/b.py", 2, "", submatches)
+    valid_bytes = match_record("./src/httpclient.py", 2, "", submatches)
     valid_bytes["data"]["lines"] = {"bytes": base64.b64encode(b"caf\xc3\xa9 acquire\n").decode()}
-    invalid_line = match_record("./src/c.py", 3, "", submatches)
+    invalid_line = match_record("./src/wide.py", 3, "", submatches)
     invalid_line["data"]["lines"] = {"bytes": base64.b64encode(b"\xff\xfe acquire\n").decode()}
     invalid_path = match_record("", 4, "delta acquire\n", submatches)
     invalid_path["data"]["path"] = {"bytes": base64.b64encode(b"./src/\xff.py").decode()}
     payload = "".join(
         json.dumps(record) + "\n"
         for record in (
-            match_record("./src/a.py", 1, "alpha acquire\n", submatches),
+            match_record("./src/pool.py", 1, "alpha acquire\n", submatches),
             valid_bytes,
             invalid_line,
             invalid_path,
@@ -122,8 +122,8 @@ async def test_union_fields_decode_and_invalid_utf8_is_dropped(
     result = await search("acquire", ["src/*.py"], FIXTURE_ROOT, SearchBudget())
 
     assert [(match.path, match.line, match.text) for match in result.matches] == [
-        ("src/a.py", 1, "alpha acquire"),
-        ("src/b.py", 2, "caf\u00e9 acquire"),
+        ("src/httpclient.py", 2, "caf\u00e9 acquire"),
+        ("src/pool.py", 1, "alpha acquire"),
     ]
 
 
@@ -243,7 +243,7 @@ async def test_context_line_numbers_come_from_the_events(
     before = {
         "type": "context",
         "data": {
-            "path": {"text": "./src/a.py"},
+            "path": {"text": "./src/pool.py"},
             "lines": {"text": "eight\n"},
             "line_number": 8,
             "absolute_offset": 0,
@@ -253,7 +253,7 @@ async def test_context_line_numbers_come_from_the_events(
     after = {
         "type": "context",
         "data": {
-            "path": {"text": "./src/a.py"},
+            "path": {"text": "./src/pool.py"},
             "lines": {"text": "twelve\n"},
             "line_number": 12,
             "absolute_offset": 0,
@@ -263,7 +263,7 @@ async def test_context_line_numbers_come_from_the_events(
     other_file = {
         "type": "context",
         "data": {
-            "path": {"text": "./src/b.py"},
+            "path": {"text": "./src/httpclient.py"},
             "lines": {"text": "b eleven\n"},
             "line_number": 11,
             "absolute_offset": 0,
@@ -271,7 +271,10 @@ async def test_context_line_numbers_come_from_the_events(
         },
     }
     hit = match_record(
-        "./src/a.py", 10, "ten acquire\n", [{"match": {"text": "acquire"}, "start": 4, "end": 11}]
+        "./src/pool.py",
+        10,
+        "ten acquire\n",
+        [{"match": {"text": "acquire"}, "start": 4, "end": 11}],
     )
     payload = "".join(json.dumps(record) + "\n" for record in (before, hit, after, other_file))
     record_spawns(
@@ -282,7 +285,7 @@ async def test_context_line_numbers_come_from_the_events(
 
     assert len(result.matches) == 1
     match = result.matches[0]
-    assert (match.path, match.line) == ("src/a.py", 10)
+    assert (match.path, match.line) == ("src/pool.py", 10)
     assert match.before == [ContextLine(line=8, text="eight")]
     assert match.after == [ContextLine(line=12, text="twelve")]
 
@@ -346,7 +349,7 @@ async def test_dropped_matches_take_their_context_records_out_of_the_meter(
         return {
             "type": "context",
             "data": {
-                "path": {"text": "./src/a.py"},
+                "path": {"text": "./src/pool.py"},
                 "lines": {"text": text},
                 "line_number": number,
                 "absolute_offset": 0,
@@ -357,10 +360,10 @@ async def test_dropped_matches_take_their_context_records_out_of_the_meter(
     submatches = [{"match": {"text": "acquire"}, "start": 0, "end": 7}]
     emitted = [
         context_record(1, "one\n"),
-        match_record("./src/a.py", 2, "acquire two\n", submatches),
+        match_record("./src/pool.py", 2, "acquire two\n", submatches),
         context_record(3, "three\n"),
         context_record(4, "four\n"),
-        match_record("./src/a.py", 5, "acquire five\n", submatches),
+        match_record("./src/pool.py", 5, "acquire five\n", submatches),
         context_record(6, "six\n"),
         context_record(7, "seven\n"),
     ]
@@ -373,7 +376,7 @@ async def test_dropped_matches_take_their_context_records_out_of_the_meter(
 
     assert len(result.matches) == 1
     match = result.matches[0]
-    assert (match.path, match.line) == ("src/a.py", 2)
+    assert (match.path, match.line) == ("src/pool.py", 2)
     assert [line.line for line in match.before] == [1]
     assert [line.line for line in match.after] == [3, 4]
     assert result.truncated is True
@@ -402,3 +405,71 @@ async def test_byte_meter_alone_keeps_every_record_ripgrep_retained() -> None:
     assert result.truncated is True
     assert result.byte_count == raw_byte_count
     assert 18 <= len(result.matches) <= 22
+
+
+GLOB_FIXTURE = Path(__file__).parent / "data" / "glob_fixture"
+HIDDEN_LINE = "placeholder-not-a-secret"
+IGNORED_LINE = "SENTINEL row"
+
+WIDENING = [
+    ("**/*", ["sub/deep.py", "visible.py"]),
+    ("*", ["sub/deep.py", "visible.py"]),
+    ("**", ["sub/deep.py", "visible.py"]),
+    (".*", []),
+    ("**/.*", []),
+    (".hidden_config", []),
+    ("**/.hidden_config", []),
+    ("{.hidden_config,*.py}", ["sub/deep.py", "visible.py"]),
+    ("sub/**/*.py", ["sub/deep.py"]),
+]
+
+
+@pytest.mark.parametrize(("glob", "expected"), WIDENING, ids=[glob for glob, _ in WIDENING])
+async def test_globs_only_narrow_the_visible_tree(glob: str, expected: list[str]) -> None:
+    result = await search("SENTINEL", [glob], GLOB_FIXTURE, SearchBudget())
+
+    assert sorted({match.path for match in result.matches}) == expected
+    dumped = result.model_dump_json()
+    assert HIDDEN_LINE not in dumped
+    assert IGNORED_LINE not in dumped
+    root = GLOB_FIXTURE.resolve()
+    for match in result.matches:
+        assert (GLOB_FIXTURE / match.path).resolve().is_relative_to(root)
+
+
+@pytest.mark.parametrize("glob", ["../*", "../../*", "/etc/*"])
+async def test_globs_cannot_escape_the_search_root(glob: str) -> None:
+    result = await search("SENTINEL", [glob], GLOB_FIXTURE, SearchBudget())
+
+    assert result.matches == []
+    assert result.truncated is False
+
+
+async def test_invisible_records_never_spend_the_budget() -> None:
+    budget = SearchBudget(max_bytes=2000)
+    result = await search("SENTINEL", ["**/*"], GLOB_FIXTURE, budget)
+
+    assert sorted({match.path for match in result.matches}) == ["sub/deep.py", "visible.py"]
+    assert result.truncated is False
+    assert result.byte_count < budget.max_bytes
+    assert IGNORED_LINE not in result.model_dump_json()
+
+
+async def test_a_forged_walk_entry_cannot_leak_an_ignored_file(tmp_path: Path) -> None:
+    root = forged_names_tree(tmp_path)
+
+    result = await search("CANARY", ["**/*"], root, SearchBudget())
+
+    assert "private_notes/secret.txt" not in {match.path for match in result.matches}
+    assert "placeholder row" not in result.model_dump_json()
+
+
+async def test_an_invisible_oversized_record_is_not_a_content_oracle() -> None:
+    budget = SearchBudget(max_record_bytes=250)
+
+    hit = await search("row 00", ["**/*"], GLOB_FIXTURE, budget)
+    miss = await search("row 99", ["**/*"], GLOB_FIXTURE, budget)
+
+    assert hit.matches == miss.matches == []
+    assert hit.oversized is False
+    assert miss.oversized is False

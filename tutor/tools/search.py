@@ -1,18 +1,8 @@
-import base64
 from collections.abc import Sequence
 from pathlib import Path
 
 from tutor.tools.models import ContextLine, SearchBudget, SearchMatch, SearchResult
-from tutor.tools.ripgrep import record_size, run_ripgrep
-
-
-def _decode(field: dict) -> str | None:
-    if "text" in field:
-        return field["text"]
-    try:
-        return base64.b64decode(field["bytes"]).decode()
-    except UnicodeDecodeError:
-        return None
+from tutor.tools.ripgrep import decode_field, record_size, run_ripgrep
 
 
 async def search(
@@ -24,8 +14,8 @@ async def search(
     context: dict[tuple[str, int], tuple[str, dict]] = {}
     for record in records:
         data = record["data"]
-        path = _decode(data["path"])
-        text = _decode(data["lines"])
+        path = decode_field(data["path"])
+        text = decode_field(data["lines"])
         if path is None or text is None:
             continue
         path = path.removeprefix("./")
