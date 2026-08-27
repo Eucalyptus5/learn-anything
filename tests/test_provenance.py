@@ -772,3 +772,158 @@ def test_a_line_number_past_the_digit_bound_is_still_reported(
 
     assert not verdict.ok
     assert verdict.ungrounded == [expected]
+
+
+def test_a_withheld_chunk_does_not_wipe_the_line_evidence() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+
+    first = registry.verify_chunk("t1", "The acquire body lives in src/pool.py on line")
+    second = registry.verify_chunk("t1", "or maybe it is in src/absent.py instead")
+    third = registry.verify_chunk("t1", "ninety of that same file")
+
+    assert first.ok
+    assert not second.ok
+    assert second.ungrounded == [Position(path="src/absent.py")]
+    assert not third.ok
+    assert third.ungrounded == [Position(path="src/pool.py", line=90)]
+
+
+def test_a_withheld_chunk_lends_no_path_across_the_cut() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+
+    first = registry.verify_chunk("t1", "there is a copy in src/absent.py on")
+    second = registry.verify_chunk("t1", "line eleven of it")
+
+    assert not first.ok
+    assert first.ungrounded == [Position(path="src/absent.py")]
+    assert not second.ok
+    assert second.ungrounded == [Position(path="", line=11)]
+
+
+def test_a_spelled_range_across_the_cut_stays_withheld() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record(
+        "t1",
+        _result(
+            SearchMatch(path="tutor/transport.py", line=900, text="a", before=[], after=[]),
+            SearchMatch(path="tutor/transport.py", line=912, text="b", before=[], after=[]),
+            SearchMatch(path="tutor/transport.py", line=12, text="c", before=[], after=[]),
+        ),
+    )
+
+    first = registry.verify_chunk(
+        "t1", "It sits on lines nine hundred and twelve to nine hundred and"
+    )
+    second = registry.verify_chunk("t1", "forty of that file.")
+
+    assert not first.ok
+    assert not second.ok
+    assert second.ungrounded == [Position(path="", line=40)]
+
+
+def test_a_grounded_position_may_bind_across_a_withheld_gap() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+
+    first = registry.verify_chunk("t1", "The acquire body lives in src/pool.py on line")
+    second = registry.verify_chunk("t1", "or maybe it is in src/absent.py instead")
+    third = registry.verify_chunk("t1", "eleven of that same file")
+
+    assert first.ok
+    assert not second.ok
+    assert third.ok
+    assert third.ungrounded == []
+
+
+@pytest.mark.parametrize(
+    ("result", "deltas", "expected"),
+    [
+        pytest.param(
+            _sample_result(),
+            [
+                "The acquire body lives in src/pool.py on line, ",
+                "or maybe it is really in src/absent.py instead, ",
+                "ninety of that same file.",
+            ],
+            [True, False, False],
+            id="withheld-clause-between-line-and-number",
+        ),
+        pytest.param(
+            _sample_result(),
+            [
+                "The acquire body lives in src/pool.py and it sits right on line ",
+                "11 where the lock is taken.",
+            ],
+            [True, True],
+            id="split-mid-number",
+        ),
+        pytest.param(
+            _sample_result(),
+            [
+                "There is a copy in src/absent.py too, ",
+                "but the acquire body lives in src/pool.py on line 11 for real.",
+            ],
+            [False, True],
+            id="first-clause-withheld",
+        ),
+        pytest.param(
+            _result(
+                SearchMatch(path="tutor/transport.py", line=24, text="a", before=[], after=[]),
+                SearchMatch(path="tutor/playout.py", line=50, text="b", before=[], after=[]),
+            ),
+            [
+                "The queue reader lives in tutor/transport.py on line 24, ",
+                "and the playout side of it sits in tutor/playout.py on line 50 as well.",
+            ],
+            [True, True, True],
+            id="two-recorded-paths",
+        ),
+    ],
+)
+async def test_the_spoken_transcript_verifies_whole(
+    result: SearchResult, deltas: list[str], expected: list[bool]
+) -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", result)
+
+    pieces, verdicts = await _streamed(registry, "t1", deltas)
+
+    assert [verdict.ok for verdict in verdicts] == expected
+    spoken = " ".join(piece for piece, verdict in zip(pieces, verdicts) if verdict.ok)
+    assert registry.verify("t1", spoken).ok
+
+
+def test_open_turn_clears_the_heard_tail() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+    registry.verify_chunk("t1", "The acquire body lives in src/pool.py on line")
+
+    registry.open_turn("t2")
+    registry.record("t2", _sample_result())
+    verdict = registry.verify_chunk("t2", "eleven of that file")
+
+    assert verdict.ok
+    assert verdict.ungrounded == []
+
+
+def test_abandon_clears_the_heard_tail() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+    registry.verify_chunk("t1", "The acquire body lives in src/pool.py on line")
+
+    registry.abandon("t1")
+    registry.open_turn("t2")
+    registry.record("t2", _sample_result())
+    verdict = registry.verify_chunk("t2", "eleven of that file")
+
+    assert verdict.ok
+    assert verdict.ungrounded == []

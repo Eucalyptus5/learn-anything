@@ -363,6 +363,14 @@ def _seam_words(units: list[_Unit], stripped: list[str]) -> str:
     return " ".join(stripped[max(start, len(stripped) - _SEAM_LIMIT) :])
 
 
+def _window(tail: str, text: str, carry: str | None) -> tuple[list[Position], str | None, str]:
+    joined = f"{tail} {text}" if tail else text
+    offset = len(tail.split())
+    units, stripped = _scan(joined, offset)
+    positions, last = _bind(units, _mentions(units, stripped), carry, offset)
+    return positions, last, _seam_words(units, stripped)
+
+
 def extract_positions(text: str) -> list[Position]:
     units, stripped = _scan(text)
     positions, _ = _bind(units, _mentions(units, stripped), None, 0)
@@ -376,6 +384,7 @@ class TurnRegistry:
         self._keys: set[tuple[str, int | None]] = set()
         self._carry: dict[str, str] = {}
         self._seam: dict[str, str] = {}
+        self._heard: dict[str, str] = {}
 
     def open_turn(self, turn_id: str) -> None:
         self._turn_id = turn_id
@@ -383,6 +392,7 @@ class TurnRegistry:
         self._keys = set()
         self._carry = {}
         self._seam = {}
+        self._heard = {}
 
     def record(self, turn_id: str, result: SearchResult) -> None:
         if turn_id != self._turn_id:
@@ -401,6 +411,7 @@ class TurnRegistry:
         self._keys = set()
         self._carry = {}
         self._seam = {}
+        self._heard = {}
 
     def known(self, turn_id: str, position: Position) -> bool:
         return turn_id == self._turn_id and position.key() in self._keys
@@ -410,17 +421,30 @@ class TurnRegistry:
 
     def verify_chunk(self, turn_id: str, text: str, source: str = "model") -> GroundingVerdict:
         open_turn = turn_id == self._turn_id
+        heard = self._heard.get(source, "") if open_turn else ""
         seam = self._seam.get(source, "") if open_turn else ""
-        window = f"{seam} {text}" if seam else text
-        offset = len(seam.split())
-        units, stripped = _scan(window, offset)
         carry = self._carry.get(source) if open_turn else None
-        positions, last = _bind(units, _mentions(units, stripped), carry, offset)
+
+        positions, last, heard_tail = _window(heard, text, carry)
         verdict = self._verdict(turn_id, positions)
+        seam_tail = heard_tail
+        # A withheld chunk still asserted its line words, so the scanned tail can withhold on a
+        # number they mark; only the spoken tail may bind one to a path or advance the carry.
+        if seam != heard:
+            scanned, _, seam_tail = _window(seam, text, carry)
+            ungrounded = list(verdict.ungrounded)
+            for position in scanned:
+                if not self.known(turn_id, position) and position not in ungrounded:
+                    ungrounded.append(position)
+            if ungrounded:
+                verdict = GroundingVerdict(ok=False, ungrounded=ungrounded)
+
         if open_turn:
-            self._seam[source] = _seam_words(units, stripped)
-            if verdict.ok and last is not None:
-                self._carry[source] = last
+            self._seam[source] = seam_tail
+            if verdict.ok:
+                self._heard[source] = heard_tail
+                if last is not None:
+                    self._carry[source] = last
         return verdict
 
     def _verdict(self, turn_id: str, positions: list[Position]) -> GroundingVerdict:
