@@ -28,6 +28,7 @@ secrets/
 
 # model weights and captured media
 models/
+captures/
 recordings/
 *.onnx
 *.gguf
