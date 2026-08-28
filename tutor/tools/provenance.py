@@ -239,6 +239,17 @@ def _scan(text: str, offset: int = 0) -> tuple[list[_Unit], list[str]]:
                 run_at.append(index)
             continue
 
+        # "nine hundred and twelve" is one number because a hundred/thousand tier is pending;
+        # "nine and twelve" is two numbers because nothing is.
+        if (
+            token.lower() == "and"
+            and run
+            and run[-1][1] in ("hundred", "thousand")
+            and index + 1 < len(stripped)
+            and all(piece.lower() in _NUMBER_WORDS for piece in stripped[index + 1].split("-"))
+        ):
+            continue
+
         flush()
         if token.lower() in _RANGE_WORDS:
             units.append(_Unit(kind="range", index=index, end=index))

@@ -722,7 +722,10 @@ async def test_a_flag_chain_longer_than_four_words_survives_the_cut() -> None:
     assert verdicts[0].ok
     assert verdicts[1].ok
     assert not verdicts[2].ok
-    assert verdicts[2].ungrounded == [Position(path="tutor/transport.py", line=40)]
+    assert verdicts[2].ungrounded == [
+        Position(path="tutor/transport.py", line=940),
+        Position(path="tutor/transport.py", line=40),
+    ]
 
 
 async def test_a_number_before_the_cut_is_not_rebound_to_the_next_path() -> None:
@@ -823,7 +826,7 @@ def test_a_spelled_range_across_the_cut_stays_withheld() -> None:
 
     assert not first.ok
     assert not second.ok
-    assert second.ungrounded == [Position(path="", line=40)]
+    assert second.ungrounded == [Position(path="", line=940), Position(path="", line=40)]
 
 
 def test_a_grounded_position_may_bind_across_a_withheld_gap() -> None:
@@ -927,3 +930,111 @@ def test_abandon_clears_the_heard_tail() -> None:
 
     assert verdict.ok
     assert verdict.ungrounded == []
+
+
+def test_the_british_reading_of_a_line_number_is_one_number() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record(
+        "t1",
+        _result(
+            SearchMatch(path="src/pool.py", line=12, text="a", before=[], after=[]),
+            SearchMatch(path="src/pool.py", line=400, text="b", before=[], after=[]),
+        ),
+    )
+    text = "The acquire body is in src/pool.py on line four hundred and twelve."
+
+    verdict = registry.verify("t1", text)
+
+    assert not verdict.ok
+    assert verdict.ungrounded == [Position(path="src/pool.py", line=412)]
+
+    chunk_verdict = registry.verify_chunk("t1", text)
+
+    assert not chunk_verdict.ok
+    assert chunk_verdict.ungrounded == [Position(path="src/pool.py", line=412)]
+
+
+def test_and_still_joins_a_spoken_range() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record(
+        "t1",
+        _result(
+            SearchMatch(path="src/pool.py", line=900, text="a", before=[], after=[]),
+            SearchMatch(path="src/pool.py", line=912, text="b", before=[], after=[]),
+        ),
+    )
+    text = "The drain loop is in src/pool.py on lines nine hundred to nine hundred and twelve."
+
+    assert extract_positions(text) == [
+        Position(path="src/pool.py", line=900),
+        Position(path="src/pool.py", line=912),
+    ]
+    assert registry.verify("t1", text).ok
+
+
+def test_and_between_two_bare_numerals_is_two_numbers() -> None:
+    assert extract_positions("src/pool.py lines nine and twelve") == [
+        Position(path="src/pool.py", line=9),
+        Position(path="src/pool.py", line=12),
+    ]
+    assert extract_positions("on lines eleven and twelve") == [
+        Position(path="", line=11),
+        Position(path="", line=12),
+    ]
+
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record(
+        "t1",
+        _result(SearchMatch(path="tutor/transport.py", line=912, text="a", before=[], after=[])),
+    )
+
+    verdict = registry.verify("t1", "tutor/transport.py lines nine and twelve")
+
+    assert not verdict.ok
+    assert verdict.ungrounded == [
+        Position(path="tutor/transport.py", line=9),
+        Position(path="tutor/transport.py", line=12),
+    ]
+
+
+def test_an_ordinal_pair_joined_by_and_keeps_both_lines() -> None:
+    text = "the ninth and the twelfth lines of src/pool.py"
+
+    assert extract_positions(text) == [
+        Position(path="src/pool.py", line=9),
+        Position(path="src/pool.py", line=12),
+    ]
+
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+
+    assert registry.verify("t1", text).ok
+
+
+def test_and_after_a_joined_number_starts_a_second_number() -> None:
+    assert extract_positions("src/pool.py lines nine hundred and twelve and thirteen") == [
+        Position(path="src/pool.py", line=912),
+        Position(path="src/pool.py", line=13),
+    ]
+    assert extract_positions("src/pool.py lines nine hundred twelve and thirteen") == [
+        Position(path="src/pool.py", line=912),
+        Position(path="src/pool.py", line=13),
+    ]
+
+
+def test_and_between_two_paths_is_not_a_number() -> None:
+    text = "It shows up in src/pool.py and src/httpclient.py"
+
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+
+    assert registry.verify("t1", text).ok
+    assert extract_positions(text) == [
+        Position(path="src/pool.py"),
+        Position(path="src/httpclient.py"),
+    ]
