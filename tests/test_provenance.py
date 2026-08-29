@@ -623,11 +623,35 @@ def test_a_recorded_line_after_the_cut_still_verifies() -> None:
     assert second.ungrounded == []
 
 
+def test_leading_zeros_do_not_alias_onto_a_recorded_line() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    registry.record("t1", _sample_result())
+
+    verdict = registry.verify("t1", "src/pool.py line 00000000000000000009999")
+
+    assert not verdict.ok
+
+
+def test_a_zero_padded_recorded_line_is_not_that_line() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t1")
+    result = _sample_result()
+    registry.record("t1", result)
+
+    for position in result.positions():
+        padded = str(position.line).zfill(24)
+        verdict = registry.verify("t1", f"{position.path} line {padded}")
+
+        assert not verdict.ok
+        assert verdict.ungrounded == [Position(path=position.path, line=10**20)]
+
+
 @pytest.mark.parametrize(
     ("number", "expected"),
     [
         pytest.param("-".join(["one"] * 4301), int("1" * 16), id="number-words"),
-        pytest.param("1" * 4301, int("1" * 20), id="digits"),
+        pytest.param("1" * 4301, 10**20, id="digits"),
     ],
 )
 def test_a_number_no_one_could_speak_yields_a_verdict(number: str, expected: int) -> None:
@@ -639,7 +663,7 @@ def test_a_number_no_one_could_speak_yields_a_verdict(number: str, expected: int
 
     assert not verdict.ok
     assert verdict.ungrounded[0] == Position(path="", line=expected)
-    assert all(len(str(position.line)) <= 20 for position in verdict.ungrounded)
+    assert all(position.line <= expected for position in verdict.ungrounded)
 
 
 def test_a_number_word_run_stays_within_a_spoken_magnitude() -> None:

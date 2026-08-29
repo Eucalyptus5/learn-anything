@@ -12,10 +12,11 @@ _TRAILING = "`\"')]}.,;:!?"
 _LINE_SUFFIX = re.compile(r":(\d+)(?:-(\d+))?$")
 _DIGITS = re.compile(r"^\d+$")
 _DIGIT_ORDINAL = re.compile(r"^(\d+)(?:st|nd|rd|th)$", re.IGNORECASE)
-# Model text reaches this scanner. A number this wide cannot be a recorded line, so an over-long
-# run is clamped to a value nothing can match rather than parsed whole: int() on an unbounded
-# digit run raises.
+# Model text reaches this scanner. int() raises on an unbounded digit run, and no file has a
+# line this wide, so a run past _VALUE_DIGITS reads as one value no recorded line can equal
+# rather than as its own prefix, which could be one.
 _VALUE_DIGITS = 20
+_UNSPEAKABLE = 10**_VALUE_DIGITS
 _NUMBER_WORD_LIMIT = 16
 _SEAM_LIMIT = 32
 _SHORT_EXTENSION = re.compile(r"\.[A-Za-z0-9]{1,6}$")
@@ -108,7 +109,9 @@ def _is_path(token: str) -> bool:
 
 
 def _value(digits: str) -> int:
-    return int(digits[:_VALUE_DIGITS])
+    if len(digits) > _VALUE_DIGITS:
+        return _UNSPEAKABLE
+    return int(digits)
 
 
 def _digit_value(piece: str) -> tuple[int, bool] | None:
