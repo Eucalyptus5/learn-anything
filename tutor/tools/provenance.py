@@ -11,6 +11,7 @@ _LEADING = "`\"'([{"
 _TRAILING = "`\"')]}.,;:!?"
 _LINE_SUFFIX = re.compile(r":(\d+)(?:-(\d+))?$")
 _DIGITS = re.compile(r"^\d+$")
+_DIGIT_TOKEN = re.compile(r"^[#@L]?(\d+)$")
 _DIGIT_ORDINAL = re.compile(r"^(\d+)(?:st|nd|rd|th)$", re.IGNORECASE)
 # Model text reaches this scanner. int() raises on an unbounded digit run, and no file has a
 # line this wide, so a run past _VALUE_DIGITS reads as one value no recorded line can equal
@@ -92,6 +93,7 @@ class _Unit:
     ordinal: bool = False
     owner: int | None = None
     mirrors: int | None = None
+    digit: bool = False
 
 
 def _strip(token: str) -> str:
@@ -106,6 +108,10 @@ def _is_path(token: str) -> bool:
     if dot != -1 and segment[dot:] in PATH_EXTENSIONS:
         return True
     return "/" in token and _SHORT_EXTENSION.search(segment) is not None
+
+
+def _path_shaped(token: str) -> bool:
+    return "://" not in token and _SHORT_EXTENSION.search(token) is not None
 
 
 def _value(digits: str) -> int:
@@ -187,9 +193,23 @@ def _scan(text: str, offset: int = 0) -> tuple[list[_Unit], list[str]]:
         run = []
         run_at = []
 
-    def number(index: int, value: int, ordinal: bool = False, owner: int | None = None) -> None:
+    def number(
+        index: int,
+        value: int,
+        ordinal: bool = False,
+        owner: int | None = None,
+        digit: bool = False,
+    ) -> None:
         units.append(
-            _Unit(kind="number", index=index, end=index, value=value, ordinal=ordinal, owner=owner)
+            _Unit(
+                kind="number",
+                index=index,
+                end=index,
+                value=value,
+                ordinal=ordinal,
+                owner=owner,
+                digit=digit,
+            )
         )
 
     for index, token in enumerate(stripped):
@@ -198,25 +218,31 @@ def _scan(text: str, offset: int = 0) -> tuple[list[_Unit], list[str]]:
         if suffix:
             flush()
             start, end = suffix.groups()
-            if _is_path(head):
-                owner = len(units)
-                units.append(_Unit(kind="path", index=index, end=index, path=head))
-                number(index, _value(start), owner=owner)
-                if end:
-                    units.append(_Unit(kind="range", index=index, end=index))
-                    number(index, _value(end), owner=owner)
-            elif _DIGITS.match(head):
+            if _DIGITS.match(head):
                 number(index, _value(head))
                 units.append(_Unit(kind="range", index=index, end=index))
                 number(index, _value(start))
                 if end:
                     units.append(_Unit(kind="range", index=index, end=index))
                     number(index, _value(end))
+            elif _path_shaped(head):
+                owner = len(units)
+                units.append(_Unit(kind="path", index=index, end=index, path=head))
+                number(index, _value(start), owner=owner)
+                if end:
+                    units.append(_Unit(kind="range", index=index, end=index))
+                    number(index, _value(end), owner=owner)
             continue
 
         if _is_path(head):
             flush()
             units.append(_Unit(kind="path", index=index, end=index, path=head))
+            continue
+
+        digit = _DIGIT_TOKEN.match(head)
+        if digit:
+            flush()
+            number(index, _value(digit.group(1)), digit=True)
             continue
 
         pieces = token.split("-")
@@ -360,6 +386,11 @@ def _bind(
             positions.append(Position(path=targets[position], line=unit.value))
         elif unit.kind == "path" and position not in claimed:
             positions.append(Position(path=unit.path))
+
+    lines = {position.line for position in positions}
+    for position, unit in enumerate(units):
+        if unit.digit and _voiced(unit, evidence[position], offset) and unit.value not in lines:
+            positions.append(Position(path="", line=unit.value))
 
     return positions, units[paths[-1]].path if paths else None
 

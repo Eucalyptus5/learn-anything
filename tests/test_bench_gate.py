@@ -26,30 +26,30 @@ EXPECTED = {
     "current": [
         "admitted",
         "withheld_bound",
+        "withheld_bound",
         "admitted",
-        "admitted",
-        "admitted",
-        "admitted",
+        "withheld_bound",
+        "withheld_bound",
         "admitted",
         "admitted",
     ],
     "digits": [
         "admitted",
         "withheld_bound",
-        "withheld_digit",
+        "withheld_bound",
         "admitted",
-        "withheld_digit",
-        "admitted",
+        "withheld_bound",
+        "withheld_bound",
         "admitted",
         "admitted",
     ],
     "pathshape": [
         "admitted",
         "withheld_bound",
-        "withheld_digit",
+        "withheld_bound",
         "withheld_pathshape",
-        "withheld_digit",
-        "withheld_pathshape",
+        "withheld_bound",
+        "withheld_bound",
         "withheld_pathshape",
         "admitted",
     ],
@@ -90,7 +90,7 @@ def test_classify_over_the_eight_utterance_table(registry: TurnRegistry, policy:
 
 
 def test_classify_reproduces_a_seam_dependent_withhold(registry: TurnRegistry) -> None:
-    chunks = ["The queue reader sits on line", "90 of that same file and it never blocks."]
+    chunks = ["The queue reader sits on line", "ninety of that same file and it never blocks."]
 
     assert bench_gate.classify(chunks, registry, "t1", "model", "current") == [
         "admitted",
@@ -103,15 +103,15 @@ def test_classify_keeps_the_seam_per_source(registry: TurnRegistry) -> None:
     bench_gate.classify(["The queue reader sits on line"], registry, "t1", "lead_in", "current")
 
     assert bench_gate.classify(
-        ["90 of that same file and it never blocks."], registry, "t1", "model", "current"
+        ["ninety of that same file and it never blocks."], registry, "t1", "model", "current"
     ) == ["admitted"]
 
 
 def test_unbound_tokens_over_the_table() -> None:
     digits, shapes = bench_gate.unbound_tokens(TABLE)
 
-    assert set(digits) == {"3", "100"}
-    assert set(shapes) == {"3.12", "handler.php", "tutor/session"}
+    assert set(digits) == set()
+    assert set(shapes) == {"3.12", "tutor/session"}
 
 
 def test_policies_are_the_three_named() -> None:

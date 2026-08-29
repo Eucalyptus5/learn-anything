@@ -65,6 +65,7 @@ LINE_CLAUSES = [
     f"It lives in {GROUNDED_PATH} line 24,",
     "and the reader drains the track.",
 ]
+COUNT_DELTAS = [f"It lives in {GROUNDED_PATH} line 24, ", "There are 3 callers of it."]
 SPLIT_LINE = 4021
 SPLIT_DELTAS = [
     "It lives there. The queue reader that drains ",
@@ -937,6 +938,29 @@ async def test_an_ungrounded_chunk_is_withheld_from_the_speaker(
     messages = session_messages(caplog)
     assert "turn.chunk_withheld turn_id=turn-1 source=model ungrounded=1" in messages
     assert all(UNGROUNDED_PATH not in message for message in messages)
+    await loop.aclose()
+
+
+async def test_a_bare_count_is_withheld_from_the_speaker(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    registry = TurnRegistry()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in COUNT_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received)
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    loop = TurnLoop(config(tmp_path), source, search, speaker, reasoning, registry, FakeClock())
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert speaker.utterances == [[lead_in_sentence([result]), LINE_CLAUSES[0]]]
+
+    messages = session_messages(caplog)
+    assert "turn.chunk_withheld turn_id=turn-1 source=model ungrounded=1" in messages
     await loop.aclose()
 
 

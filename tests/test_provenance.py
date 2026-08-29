@@ -1062,3 +1062,207 @@ def test_and_between_two_paths_is_not_a_number() -> None:
         Position(path="src/pool.py"),
         Position(path="src/httpclient.py"),
     ]
+
+
+def _line_24() -> SearchResult:
+    return _result(SearchMatch(path="src/pool.py", line=24, text="a", before=[], after=[]))
+
+
+def test_an_unlisted_extension_is_an_ungrounded_position() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t")
+    registry.record(
+        "t", _result(SearchMatch(path="app/models/user.rb", line=3, text="a", before=[], after=[]))
+    )
+
+    php = registry.verify("t", "The handler is in handler.php:412.")
+    lua = registry.verify("t", "Look at ghost.lua:99.")
+
+    assert not php.ok
+    assert php.ungrounded == [Position(path="handler.php", line=412)]
+    assert not lua.ok
+    assert lua.ungrounded == [Position(path="ghost.lua", line=99)]
+
+
+def test_a_listed_extension_citation_is_unchanged() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t")
+    registry.record("t", _sample_result())
+
+    assert extract_positions("src/handler.php:412") == [Position(path="src/handler.php", line=412)]
+    assert registry.verify("t", "The acquire body is at src/pool.py:11 today.").ok
+
+
+def test_a_digit_no_position_carries_is_ungrounded() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t")
+    registry.record("t", _line_24())
+
+    bare = registry.verify("t", "There are 3 callers of it.")
+    tracker = registry.verify("t", "It is marked L4021 in the tracker.")
+
+    assert not bare.ok
+    assert bare.ungrounded == [Position(path="", line=3)]
+    assert not tracker.ok
+    assert tracker.ungrounded == [Position(path="", line=4021)]
+
+    chunk = registry.verify_chunk("t", "There are 3 callers of it.")
+
+    assert not chunk.ok
+    assert chunk.ungrounded == [Position(path="", line=3)]
+
+
+def test_a_digit_the_scan_binds_stays_admitted() -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t")
+    registry.record("t", _line_24())
+
+    assert registry.verify("t", "The acquire body is on line 24 of src/pool.py.").ok
+    repeated = "It is on line 24 of src/pool.py, so 24 is where it starts."
+    assert extract_positions(repeated) == [Position(path="src/pool.py", line=24)]
+    assert registry.verify("t", repeated).ok
+    assert registry.verify("t", "It runs on Python 3.12 without changes.").ok
+
+    first = registry.verify_chunk("t", "The acquire body lives in src/pool.py on line")
+    second = registry.verify_chunk("t", "24 of that same file")
+
+    assert first.ok
+    assert second.ok
+    assert second.ungrounded == []
+
+
+def test_the_suffix_branch_keeps_urls_and_clock_times_ahead_of_path_shapes() -> None:
+    assert extract_positions("the notes at https://example.com:8080 explain it") == []
+    assert extract_positions("the standup is at 10:30 today") == []
+    assert extract_positions("look at line 10:30 for the bug") == [
+        Position(path="", line=10),
+        Position(path="", line=30),
+    ]
+    assert extract_positions("24") == [Position(path="", line=24)]
+    assert extract_positions("handler.php") == []
+
+
+@pytest.mark.parametrize(
+    ("result", "grounded", "fabricated"),
+    [
+        pytest.param(
+            _sample_result(),
+            "The acquire body is in src/pool.py.",
+            "The acquire body is in src/queue.py.",
+            id="path",
+        ),
+        pytest.param(
+            _sample_result(),
+            "The acquire body is in pool.py.",
+            "The acquire body is in queue.py.",
+            id="unique-basename",
+        ),
+        pytest.param(
+            _sample_result(),
+            "The acquire body is at src/pool.py:11.",
+            "The acquire body is at src/pool.py:44.",
+            id="path-colon-line",
+        ),
+        pytest.param(
+            _sample_result(),
+            "The acquire body is at src/pool.py:9-11.",
+            "The acquire body is at src/pool.py:40-41.",
+            id="path-colon-range",
+        ),
+        pytest.param(
+            _sample_result(),
+            "The acquire body is in src/pool.py line 11.",
+            "The acquire body is in src/pool.py line 44.",
+            id="line",
+        ),
+        pytest.param(
+            _sample_result(),
+            "The acquire body is in src/pool.py lines 9 to 10.",
+            "The acquire body is in src/pool.py lines 40 to 41.",
+            id="lines-to",
+        ),
+        pytest.param(
+            _sample_result(),
+            "The acquire body is in src/pool.py lines 9 through 10.",
+            "The acquire body is in src/pool.py lines 40 through 41.",
+            id="lines-through",
+        ),
+        pytest.param(
+            _sample_result(),
+            "The acquire body is in src/pool.py line eleven.",
+            "The acquire body is in src/pool.py line forty four.",
+            id="line-spelled",
+        ),
+        pytest.param(
+            _sample_result(),
+            "The acquire body is in src/pool.py lines nine to ten.",
+            "The acquire body is in src/pool.py lines forty to forty one.",
+            id="lines-to-spelled",
+        ),
+        pytest.param(
+            _sample_result(),
+            "The acquire body is in src/pool.py lines nine through ten.",
+            "The acquire body is in src/pool.py lines forty through forty one.",
+            id="lines-through-spelled",
+        ),
+        pytest.param(
+            _sample_result(),
+            "The acquire body is on the eleventh line of src/pool.py.",
+            "The acquire body is on the twenty fifth line of src/pool.py.",
+            id="ordinal-line",
+        ),
+        pytest.param(
+            _result(SearchMatch(path="handler.php", line=412, text="a", before=[], after=[])),
+            "The handler is in handler.php:412.",
+            "The handler is in ghost.lua:99.",
+            id="unlisted-extension-colon-line",
+        ),
+        pytest.param(
+            _result(
+                SearchMatch(
+                    path="handler.php",
+                    line=412,
+                    text="a",
+                    before=[],
+                    after=[ContextLine(line=413, text="b")],
+                )
+            ),
+            "The handler is in handler.php:412-413.",
+            "The handler is in handler.php:412-500.",
+            id="unlisted-extension-colon-range",
+        ),
+        pytest.param(
+            _line_24(),
+            "It is on line 24 of src/pool.py, so 24 is where it starts.",
+            "There are 3 callers of it.",
+            id="digit",
+        ),
+        pytest.param(
+            _line_24(),
+            "It is on line 24 of src/pool.py, so L24 is where it starts.",
+            "It is marked L4021 in the tracker.",
+            id="digit-behind-L",
+        ),
+        pytest.param(
+            _line_24(),
+            "It is on line 24 of src/pool.py, so #24 is where it starts.",
+            "It is marked #4021 in the tracker.",
+            id="digit-behind-hash",
+        ),
+        pytest.param(
+            _line_24(),
+            "It is on line 24 of src/pool.py, so @24 is where it starts.",
+            "It is marked @4021 in the tracker.",
+            id="digit-behind-at",
+        ),
+    ],
+)
+def test_every_recognised_citation_shape_admits_grounded_and_withholds_fabricated(
+    result: SearchResult, grounded: str, fabricated: str
+) -> None:
+    registry = TurnRegistry()
+    registry.open_turn("t")
+    registry.record("t", result)
+
+    assert registry.verify("t", grounded).ok
+    assert not registry.verify("t", fabricated).ok
