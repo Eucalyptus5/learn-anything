@@ -213,6 +213,7 @@ class TurnLoop:
             if len(answerable) != len(calls):
                 logger.warning("turn.tool_call_incomplete turn_id=%s", turn_id)
             if answerable:
+                await queue.put("\n")
                 await self._follow_up(turn_id, prompt, answerable, queue)
         except BaseException:
             # Nothing consumes the queue once the turn unwinds, so the sentinel takes a slot

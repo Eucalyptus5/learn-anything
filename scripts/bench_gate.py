@@ -316,6 +316,7 @@ async def capture_turn(
                     )
                 follow_up = prompt.model_copy(update={"tool_exchange": exchange})
                 more, _ = await _stream(client, follow_up, None, ledger)
+                deltas.append("\n")
                 deltas.extend(more)
         except (openai.RateLimitError, openai.APIConnectionError):
             if attempt + 1 < MAX_ATTEMPTS:

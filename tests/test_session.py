@@ -78,7 +78,7 @@ SPLIT_CLAUSES = [
 ]
 CHAINED_CLAUSES = [
     "It lives in the reader,",
-    "which drains the track. Both call sites drain it.",
+    "which drains the track.\n Both call sites drain it.",
 ]
 REASONING_TEXT = "weighing two call sites"
 MODEL_QUERY = "class Connection"
@@ -645,6 +645,35 @@ async def test_a_search_code_call_dispatches_one_search_and_one_follow_up(tmp_pa
 
     assert [turn_id for name, turn_id in log if name == "record"] == ["turn-1", "turn-1"]
     assert speaker.utterances == [[lead_in_sentence([result])] + SPOKEN_CLAUSES]
+    await loop.aclose()
+
+
+async def test_a_tool_round_does_not_glue_the_sentences_around_it(tmp_path: Path) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    deltas = [
+        TurnChunk(kind="spoken", text="It lives there."),
+        TurnChunk(
+            kind="tool_call",
+            text=SEARCH_ARGUMENTS,
+            tool_call_id=SEARCH_CALL_ID,
+            tool_name="search_code",
+        ),
+    ]
+    follow_up = [TurnChunk(kind="spoken", text="Diagram incoming for the pool.")]
+    reasoning = FakeReasoning(log, deltas, speaker.received, follow_up=follow_up)
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    loop = TurnLoop(
+        config(tmp_path), source, search, speaker, reasoning, FakeRegistry(log), FakeClock()
+    )
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert speaker.utterances == [
+        [lead_in_sentence([result]), "It lives there.", "Diagram incoming for the pool."]
+    ]
     await loop.aclose()
 
 
