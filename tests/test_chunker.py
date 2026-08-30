@@ -1,9 +1,10 @@
 import asyncio
+from collections import Counter
 from collections.abc import AsyncIterator
 
 import pytest
 
-from tutor.chunker import clause_chunks, split_clauses
+from tutor.chunker import Scrubber, clause_chunks, split_clauses, spoken_text
 
 
 def test_splits_on_period_followed_by_whitespace() -> None:
@@ -291,3 +292,84 @@ async def test_boundary_free_run_is_forced_into_max_words_chunks() -> None:
         " ".join(f"w{i}" for i in range(24, 30)),
     ]
     assert all(len(clause.split()) <= 12 for clause in clauses)
+
+
+def _scrub(deltas: list[str]) -> tuple[str, Scrubber]:
+    scrubber = Scrubber()
+    text = "".join(scrubber.feed(delta) for delta in deltas) + scrubber.flush()
+    return text, scrubber
+
+
+def test_a_fenced_block_is_dropped_whole() -> None:
+    text, scrubber = _scrub(
+        ["lifecycle.\n\n``", '`json\n{"type":', '"diagram"}\n``', "`\n\nPhase: Teach."]
+    )
+    assert text == "lifecycle.\n\n \n\nPhase: Teach."
+    assert scrubber.dropped == Counter({"fence": 1})
+
+
+def test_a_json_payload_is_dropped_to_its_closing_brace() -> None:
+    text, scrubber = _scrub(['attempts.{"diag', 'ram":{"a":1}}We', "'re in"])
+    assert text == "attempts. We're in"
+    assert scrubber.dropped == Counter({"json": 1})
+
+
+def test_an_unbalanced_payload_gives_the_turn_back() -> None:
+    text, scrubber = _scrub(['{"' + "x" * 9000, " and so on."])
+    assert text.endswith(" and so on.")
+    assert scrubber.dropped == Counter({"json": 1, "json_unbalanced": 1})
+
+
+def test_inline_markers_are_removed_from_prose() -> None:
+    text, scrubber = _scrub(["the `acq", "uire` method is **free", "** now"])
+    assert text == "the acquire method is free now"
+    assert scrubber.dropped == Counter({"backtick": 2, "bold": 2})
+
+
+def test_a_tag_shaped_token_is_dropped() -> None:
+    text, scrubber = _scrub(["path.\n<", "/turn>"])
+    assert text == "path.\n"
+    assert scrubber.dropped == Counter({"tag": 1})
+
+    text, scrubber = _scrub(["a < b and", " c > d"])
+    assert text == "a < b and c > d"
+    assert scrubber.dropped == Counter()
+
+
+def test_a_lone_trailing_backtick_is_held_then_released() -> None:
+    scrubber = Scrubber()
+    fed = scrubber.feed("ends here `")
+    assert fed == "ends here "
+    assert scrubber.flush() == ""
+    assert scrubber.dropped == Counter({"backtick": 1})
+
+
+def test_the_first_delta_can_open_a_fence() -> None:
+    text, scrubber = _scrub(["```", "json\n{}\n```", "Speech."])
+    assert text == " Speech."
+    assert scrubber.dropped == Counter({"fence": 1})
+
+
+def test_a_payload_with_a_space_after_the_brace_is_dropped() -> None:
+    text, scrubber = _scrub(['forever.\n\n{ "d', 'iagram": 1}Next.'])
+    assert text == "forever.\n\n Next."
+    assert scrubber.dropped == Counter({"json": 1})
+
+
+def test_dropped_chars_counts_what_each_class_removed() -> None:
+    text, scrubber = _scrub(['a ```x``` b {"k":1} c </turn> `d` **e**'])
+    assert text == "a   b   c  d e"
+    assert scrubber.dropped == Counter({"fence": 1, "json": 1, "tag": 1, "backtick": 2, "bold": 2})
+    assert scrubber.dropped_chars == Counter(
+        {"fence": 7, "json": 7, "tag": 7, "backtick": 2, "bold": 4}
+    )
+
+
+async def test_spoken_text_feeds_the_chunker_clean_clauses() -> None:
+    pieces = [
+        "The pool is a free list. ",
+        '```json\n{"a":1}\n```',
+        " The acquire path takes a slot from it.",
+    ]
+    clauses = [clause async for clause in clause_chunks(spoken_text(_stream(pieces), Scrubber()))]
+    assert clauses == ["The pool is a free list.", "The acquire path takes a slot from it."]

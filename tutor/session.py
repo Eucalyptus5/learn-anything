@@ -7,7 +7,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from tutor.chunker import clause_chunks
+from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.input_path import EndOfTurn, InputPath
 from tutor.lead_in import lead_in_sentence
 from tutor.prompt import (
@@ -183,9 +183,13 @@ class TurnLoop:
         self._drains[turn_id] = asyncio.create_task(
             self._drain(turn_id, prompt, queue), name=f"{turn_id}-drain"
         )
-        async for clause in clause_chunks(_queued(queue)):
+        scrubber = Scrubber()
+        async for clause in clause_chunks(spoken_text(_queued(queue), scrubber)):
             if self._admits(turn_id, clause, "model"):
                 yield clause
+        if scrubber.dropped:
+            counts = " ".join(f"{key}={count}" for key, count in sorted(scrubber.dropped.items()))
+            logger.info("turn.markup_dropped turn_id=%s %s", turn_id, counts)
 
     def _admits(self, turn_id: str, text: str, source: str) -> bool:
         verdict = self._registry.verify_chunk(turn_id, text, source=source)

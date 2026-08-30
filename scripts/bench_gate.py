@@ -21,7 +21,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from scripts.bench_llm import SYSTEM_PROMPT_BODY
-from tutor.chunker import clause_chunks
+from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.config import Settings, settings
 from tutor.cost import UsageLedger
 from tutor.lead_in import lead_in_sentence
@@ -323,7 +323,7 @@ async def capture_turn(
                 await asyncio.sleep(RETRY_BACKOFF_S)
             continue
         chunks = [{"source": "lead_in", "text": lead_in}]
-        async for clause in clause_chunks(_replay(deltas)):
+        async for clause in clause_chunks(spoken_text(_replay(deltas), Scrubber())):
             chunks.append({"source": "model", "text": clause})
         return {
             "turn_id": turn_id,

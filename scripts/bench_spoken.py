@@ -4,10 +4,13 @@ tool-call control, and with --synth measures whether Kokoro voices each marker o
 """
 
 import argparse
+import asyncio
 import json
 import re
 import statistics
 import sys
+from collections import Counter
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import numpy as np
@@ -15,11 +18,13 @@ import numpy as np
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.constants import TTS_SAMPLE_RATE
 from tutor.tts import KokoroSynthesizer
 
 CLASSES = ("fence", "json", "tag", "backtick", "bold", "glued")
 UNION = ("fence", "json", "tag", "backtick", "bold")
+DROPPED = ("fence", "json", "json_unbalanced", "tag", "backtick", "bold")
 FENCE = "```"
 JSON_OPEN = re.compile(r'\{\s*"')
 TAG = re.compile(r"</?[a-z]+>")
@@ -28,6 +33,7 @@ GLUED = re.compile(r"[a-z][.?!][A-Z]")
 WEIGHTS = REPO / "models" / "kokoro" / "kokoro-v1.0.fp16.onnx"
 VOICES = REPO / "models" / "kokoro" / "voices-v1.0.bin"
 SYNTH_RUNS = 3
+DELTA_WIDTH = 4
 
 PAIRS = (
     ("the acquire method returns a connection", "the `acquire` method returns a connection"),
@@ -94,6 +100,47 @@ def report_corpus(path: Path, corpus: dict) -> None:
     print(f"union chunks={union_chunks} turns={union_turns}")
 
 
+def cut(text: str, width: int = DELTA_WIDTH) -> list[str]:
+    return [text[i : i + width] for i in range(0, len(text), width)]
+
+
+async def _stream(deltas: list[str]) -> AsyncIterator[str]:
+    for delta in deltas:
+        yield delta
+
+
+async def _replay(turns: list[dict]) -> tuple[int, int, Counter[str], int, Counter[str]]:
+    chunks_in = chunks_out = dropped_turns = 0
+    dropped_chars: Counter[str] = Counter()
+    remaining: Counter[str] = Counter()
+    for turn in turns:
+        texts = _model_texts(turn)
+        scrubber = Scrubber()
+        deltas = cut(" ".join(texts))
+        clauses = [c async for c in clause_chunks(spoken_text(_stream(deltas), scrubber))]
+        chunks_in += len(texts)
+        chunks_out += len(clauses)
+        dropped_chars.update(scrubber.dropped_chars)
+        dropped_turns += bool(scrubber.dropped)
+        for clause in clauses:
+            remaining.update(classes(clause))
+    return chunks_in, chunks_out, dropped_chars, dropped_turns, remaining
+
+
+def replay(turns: list[dict]) -> tuple[int, int, Counter[str], int, Counter[str]]:
+    return asyncio.run(_replay(turns))
+
+
+def report_replay(turns: list[dict]) -> None:
+    chunks_in, chunks_out, dropped_chars, dropped_turns, remaining = replay(turns)
+    print(f"replay turns={len(turns)} chunks_in={chunks_in} chunks_out={chunks_out}")
+    for name in DROPPED:
+        print(f"dropped class={name} chars={dropped_chars[name]}")
+    print(f"dropped turns={dropped_turns}")
+    for name in CLASSES:
+        print(f"remaining class={name} chunks={remaining[name]}")
+
+
 def _synth_median(synthesizer: KokoroSynthesizer, text: str) -> int:
     runs = [synthesizer.synthesize(text) for _ in range(SYNTH_RUNS)]
     lengths = [len(audio) * 1000 // TTS_SAMPLE_RATE for audio in runs]
@@ -116,13 +163,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--corpus", type=Path, default=REPO / "captures" / "gate_corpus.json")
     parser.add_argument("--synth", action="store_true")
+    parser.add_argument("--replay", action="store_true")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
     if args.corpus.exists():
-        report_corpus(args.corpus, json.loads(args.corpus.read_text()))
+        corpus = json.loads(args.corpus.read_text())
+        report_corpus(args.corpus, corpus)
+        if args.replay:
+            report_replay(corpus["turns"])
     if args.synth:
         report_synth()
     return 0

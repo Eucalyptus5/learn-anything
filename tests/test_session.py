@@ -677,6 +677,39 @@ async def test_a_tool_round_does_not_glue_the_sentences_around_it(tmp_path: Path
     await loop.aclose()
 
 
+async def test_a_payload_in_the_stream_never_reaches_the_speaker(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    deltas = [
+        TurnChunk(kind="spoken", text="The pool is a free list. "),
+        TurnChunk(kind="spoken", text='```json\n{"type":"diagram"}\n```'),
+        TurnChunk(kind="spoken", text=" The acquire path takes a slot from it."),
+    ]
+    reasoning = FakeReasoning(log, deltas, speaker.received)
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    loop = TurnLoop(
+        config(tmp_path), source, search, speaker, reasoning, FakeRegistry(log), FakeClock()
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert speaker.utterances == [
+        [
+            lead_in_sentence([result]),
+            "The pool is a free list.",
+            "The acquire path takes a slot from it.",
+        ]
+    ]
+    dropped = [m for m in session_messages(caplog) if m.startswith("turn.markup_dropped")]
+    assert dropped == ["turn.markup_dropped turn_id=turn-1 fence=1"]
+    await loop.aclose()
+
+
 async def test_a_rate_limit_ends_the_turn_and_keeps_the_loop_running(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

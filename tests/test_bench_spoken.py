@@ -1,4 +1,5 @@
 import importlib.util
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -64,3 +65,37 @@ def test_classes_over_the_nine_chunk_table(text: str, expected: set[str]) -> Non
 
 def test_glue_control_over_the_four_turn_table() -> None:
     assert bench_spoken.glue_control(GLUE_TURNS) == (2, 1, 2, 0)
+
+
+FENCED_TURN = {
+    "turn_id": "turn-5",
+    "tool_calls": 1,
+    "chunks": [
+        {"source": "lead_in", "text": "The search found acquire in src/pool.py."},
+        {
+            "source": "model",
+            "text": 'lifecycle.\n\n```json\n{"type":"diagram"}\n```\n\nPhase: Teach.',
+        },
+    ],
+}
+
+
+def test_cut_slices_four_characters_at_a_time() -> None:
+    assert bench_spoken.cut("abcdefghij") == ["abcd", "efgh", "ij"]
+    assert bench_spoken.cut("") == []
+
+
+def test_replay_over_the_four_clean_turns_drops_nothing() -> None:
+    chunks_in, chunks_out, dropped_chars, dropped_turns, remaining = bench_spoken.replay(GLUE_TURNS)
+    assert (chunks_in, chunks_out, dropped_turns) == (4, 4, 0)
+    assert dropped_chars == Counter()
+    assert remaining == Counter({"glued": 1})
+
+
+def test_replay_counts_a_fenced_turn_once() -> None:
+    chunks_in, chunks_out, dropped_chars, dropped_turns, remaining = bench_spoken.replay(
+        GLUE_TURNS + [FENCED_TURN]
+    )
+    assert (chunks_in, chunks_out, dropped_turns) == (5, 5, 1)
+    assert dropped_chars == Counter({"fence": len('```json\n{"type":"diagram"}\n```')})
+    assert remaining == Counter({"glued": 1})
