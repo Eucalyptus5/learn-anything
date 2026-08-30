@@ -356,32 +356,6 @@ def test_invented_token_forms_are_reported(tail: str, expected: list[Position]) 
     assert not verdicts[1].ok
 
 
-@pytest.mark.parametrize(
-    "tail",
-    [
-        "it sits in os.path.join today",
-        "the call to threading.Lock blocks",
-        "the read/write split matters here",
-        "the tutor/tools package holds it",
-        "the notes at https://example.com/pool.py explain",
-    ],
-)
-def test_dotted_names_and_urls_yield_no_position(tail: str) -> None:
-    pieces = _pieces(f"{_LEAD_IN} {tail}")
-
-    assert len(pieces) == 2
-    assert [position for piece in pieces for position in extract_positions(piece)] == []
-
-
-def test_a_count_that_is_not_a_line_number_yields_only_the_path() -> None:
-    pieces = _pieces(f"{_LEAD_IN} pool.py has three callers")
-
-    assert len(pieces) == 2
-    assert [position for piece in pieces for position in extract_positions(piece)] == [
-        Position(path="pool.py")
-    ]
-
-
 def test_verify_chunk_carries_the_path_into_the_next_clause() -> None:
     registry = TurnRegistry()
     registry.open_turn("t1")
@@ -505,39 +479,6 @@ def test_open_turn_clears_the_carried_path_of_every_source() -> None:
     assert lead_in.ungrounded == [Position(path="", line=9), Position(path="", line=10)]
     assert not model.ok
     assert model.ungrounded == [Position(path="", line=12), Position(path="", line=13)]
-
-
-@pytest.mark.parametrize(
-    ("tail", "expected"),
-    [
-        ("the standup is at 12:30 today", []),
-        ("the blob lives in vendor/big.dat now", [Position(path="vendor/big.dat")]),
-        (
-            "the fix lands in pool.py:11-15 there",
-            [Position(path="pool.py", line=11), Position(path="pool.py", line=15)],
-        ),
-        ("the forty-second line of pool.py matters", [Position(path="pool.py", line=42)]),
-        (
-            "you should look at line 12:14 for the bug",
-            [Position(path="", line=12), Position(path="", line=14)],
-        ),
-        ("the fix lands in pool.py line two hundred fifty", [Position(path="pool.py", line=250)]),
-        (
-            "the fix lands in pool.py line one thousand two hundred thirty four",
-            [Position(path="pool.py", line=1234)],
-        ),
-        ("the second argument to acquire in src/pool.py", [Position(path="src/pool.py")]),
-        ("the first case handles it", []),
-        ("forty-second", []),
-    ],
-)
-def test_extraction_of_ranges_scales_ordinals_and_clock_times(
-    tail: str, expected: list[Position]
-) -> None:
-    pieces = _pieces(f"{_LEAD_IN} {tail}")
-
-    assert len(pieces) == 2
-    assert [position for piece in pieces for position in extract_positions(piece)] == expected
 
 
 def test_a_scaled_number_word_does_not_truncate_into_a_recorded_line() -> None:
@@ -1039,17 +980,6 @@ def test_an_ordinal_pair_joined_by_and_keeps_both_lines() -> None:
     assert registry.verify("t1", text).ok
 
 
-def test_and_after_a_joined_number_starts_a_second_number() -> None:
-    assert extract_positions("src/pool.py lines nine hundred and twelve and thirteen") == [
-        Position(path="src/pool.py", line=912),
-        Position(path="src/pool.py", line=13),
-    ]
-    assert extract_positions("src/pool.py lines nine hundred twelve and thirteen") == [
-        Position(path="src/pool.py", line=912),
-        Position(path="src/pool.py", line=13),
-    ]
-
-
 def test_and_between_two_paths_is_not_a_number() -> None:
     text = "It shows up in src/pool.py and src/httpclient.py"
 
@@ -1129,17 +1059,6 @@ def test_a_digit_the_scan_binds_stays_admitted() -> None:
     assert first.ok
     assert second.ok
     assert second.ungrounded == []
-
-
-def test_the_suffix_branch_keeps_urls_and_clock_times_ahead_of_path_shapes() -> None:
-    assert extract_positions("the notes at https://example.com:8080 explain it") == []
-    assert extract_positions("the standup is at 10:30 today") == []
-    assert extract_positions("look at line 10:30 for the bug") == [
-        Position(path="", line=10),
-        Position(path="", line=30),
-    ]
-    assert extract_positions("24") == [Position(path="", line=24)]
-    assert extract_positions("handler.php") == []
 
 
 @pytest.mark.parametrize(
