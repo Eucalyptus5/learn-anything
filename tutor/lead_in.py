@@ -1,4 +1,5 @@
 import re
+from collections.abc import Iterator
 
 from tutor.tools.models import SearchMatch, SearchResult
 
@@ -38,6 +39,11 @@ def _match_sentence(match: SearchMatch) -> str:
     if symbol:
         return f"The definition of {symbol} is in {where}."
     return f"The match is in {where}."
+
+
+def lead_in_stages(result: SearchResult) -> Iterator[str]:
+    for match in result.matches:
+        yield _match_sentence(match)
 
 
 def lead_in_sentence(results: list[SearchResult]) -> str:

@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.input_path import EndOfTurn, InputPath
-from tutor.lead_in import lead_in_sentence
+from tutor.lead_in import lead_in_sentence, lead_in_stages, opener_key
 from tutor.prompt import (
     SEARCH_CODE_TOOL,
     Message,
@@ -82,6 +82,7 @@ class TurnLoopConfig(BaseModel):
     subject: str
     root: Path
     budget: SearchBudget = Field(default_factory=SearchBudget)
+    stage_gap_ms: int = Field(default=2000, gt=0)
 
 
 class TurnLoop:
@@ -94,6 +95,7 @@ class TurnLoop:
         reasoning: ReasoningClient,
         registry: TurnRegistry,
         clock: Callable[[], float] = time.perf_counter,
+        pace: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._cfg = cfg
         self._source = source
@@ -102,8 +104,11 @@ class TurnLoop:
         self._reasoning = reasoning
         self._registry = registry
         self._clock = clock
+        self._pace = pace
         self._turns: set[asyncio.Task[None]] = set()
         self._drains: dict[str, asyncio.Task[None]] = {}
+        self._pumps: dict[str, asyncio.Task[None]] = {}
+        self._stagers: dict[str, asyncio.Task[None]] = {}
         self._dispatched = 0
 
     async def run(self) -> None:
@@ -142,20 +147,21 @@ class TurnLoop:
             logger.info(
                 "turn.grounding turn_id=%s ms=%d", turn_id, _elapsed_ms(start, self._clock())
             )
+            await self._speaker.speak_opener(opener_key([result]))
             prompt = TurnPrompt(
                 system=f"{self._cfg.system}\n\nSubject: {self._cfg.subject}",
                 tool_context=[result],
                 user_text=user_text,
             )
-            await self._speaker.speak(self._utterance(turn_id, lead_in_sentence([result]), prompt))
+            await self._speaker.speak(self._utterance(turn_id, result, prompt))
             await self._report_drain(turn_id)
         except asyncio.CancelledError:
             # The drain has to stop before the id is cleared, or a late record() finds no turn.
-            await self._stop_drain(turn_id)
+            await self._stop_turn(turn_id)
             self._registry.abandon(turn_id)
             raise
         finally:
-            await self._stop_drain(turn_id)
+            await self._stop_turn(turn_id)
         logger.info("turn.spoken turn_id=%s ms=%d", turn_id, _elapsed_ms(start, self._clock()))
 
     async def _report_drain(self, turn_id: str) -> None:
@@ -169,26 +175,87 @@ class TurnLoop:
         if error is not None:
             logger.error("turn.reasoning_failed turn_id=%s error=%s", turn_id, type(error).__name__)
 
-    async def _stop_drain(self, turn_id: str) -> None:
-        drain = self._drains.pop(turn_id, None)
-        if drain is None or drain.done():
+    async def _stop_turn(self, turn_id: str) -> None:
+        await self._stop(self._pumps, turn_id)
+        await self._stop(self._stagers, turn_id)
+        await self._stop(self._drains, turn_id)
+
+    async def _stop(self, tasks: dict[str, asyncio.Task[None]], turn_id: str) -> None:
+        task = tasks.pop(turn_id, None)
+        if task is None or task.done():
             return
-        drain.cancel()
-        await asyncio.gather(drain, return_exceptions=True)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     async def _utterance(
-        self, turn_id: str, lead_in: str, prompt: TurnPrompt
+        self, turn_id: str, result: SearchResult, prompt: TurnPrompt
     ) -> AsyncIterator[str]:
+        lead_in = lead_in_sentence([result])
         if self._admits(turn_id, lead_in, "lead_in"):
             yield lead_in
+        stages = [sentence for sentence in lead_in_stages(result) if sentence != lead_in]
         queue: asyncio.Queue[str | None] = asyncio.Queue(SPOKEN_DEPTH)
+        spoken: asyncio.Queue[str | None] = asyncio.Queue(SPOKEN_DEPTH)
+        demand = asyncio.Event()
         self._drains[turn_id] = asyncio.create_task(
             self._drain(turn_id, prompt, queue), name=f"{turn_id}-drain"
         )
+        self._stagers[turn_id] = asyncio.create_task(
+            self._stage(turn_id, stages, spoken, demand), name=f"{turn_id}-stager"
+        )
+        self._pumps[turn_id] = asyncio.create_task(
+            self._pump(turn_id, queue, spoken, demand), name=f"{turn_id}-pump"
+        )
+        while True:
+            demand.set()
+            text = await spoken.get()
+            if text is None:
+                return
+            yield text
+
+    async def _stage(
+        self,
+        turn_id: str,
+        sentences: list[str],
+        spoken: asyncio.Queue[str | None],
+        demand: asyncio.Event,
+    ) -> None:
+        # The gap runs from the speaker asking for more, not from the previous put, so stage
+        # audio never piles up in the playout buffer ahead of the model's first clause.
+        staged = 0
+        for sentence in sentences:
+            await demand.wait()
+            await self._pace(self._cfg.stage_gap_ms / 1000)
+            if not self._admits(turn_id, sentence, "lead_in"):
+                continue
+            demand.clear()
+            await spoken.put(sentence)
+            staged += 1
+            logger.info("turn.stage turn_id=%s n=%d", turn_id, staged)
+
+    async def _pump(
+        self,
+        turn_id: str,
+        queue: asyncio.Queue[str | None],
+        spoken: asyncio.Queue[str | None],
+        demand: asyncio.Event,
+    ) -> None:
         scrubber = Scrubber()
-        async for clause in clause_chunks(spoken_text(_queued(queue), scrubber)):
-            if self._admits(turn_id, clause, "model"):
-                yield clause
+        clauses = clause_chunks(spoken_text(_queued(queue), scrubber))
+        # A clause is pulled only once the speaker has asked for one, so a stalled speaker still
+        # backs the model stream up at SPOKEN_DEPTH deltas rather than at the chunker's buffer.
+        while True:
+            await demand.wait()
+            clause = await anext(clauses, None)
+            if clause is None:
+                break
+            if not self._admits(turn_id, clause, "model"):
+                continue
+            await self._stop(self._stagers, turn_id)
+            demand.clear()
+            await spoken.put(clause)
+        await self._stop(self._stagers, turn_id)
+        await spoken.put(None)
         if scrubber.dropped:
             counts = " ".join(f"{key}={count}" for key, count in sorted(scrubber.dropped.items()))
             logger.info("turn.markup_dropped turn_id=%s %s", turn_id, counts)

@@ -23,7 +23,7 @@ from tutor.input_path import (
     PartialTranscript,
     SpeechStarted,
 )
-from tutor.lead_in import lead_in_sentence
+from tutor.lead_in import lead_in_sentence, lead_in_stages, opener_key
 from tutor.prompt import SEARCH_CODE_TOOL, TurnPrompt
 from tutor.reasoning import TurnChunk
 from tutor.session import BAD_ARGUMENTS, SPOKEN_DEPTH, TurnLoop, TurnLoopConfig
@@ -97,6 +97,17 @@ VISUAL_ARGUMENTS = json.dumps({"mermaid": "graph TD; reader-->queue"})
 VISUAL_CALL_ID = "call-visual-1"
 RATE_LIMIT_DETAIL = "quota exhausted for project acct-9"
 DRAIN_TASK = "turn-1-drain"
+STAGER_TASK = "turn-1-stager"
+SECOND_PATH = "tutor/resample.py"
+CARRY_DELTAS = [
+    "Line 30 is the reader. ",
+    f"It lives in the queue reader inside {GROUNDED_PATH}, ",
+    "line 24 is where it drains.",
+]
+CARRY_CLAUSES = [
+    f"It lives in the queue reader inside {GROUNDED_PATH},",
+    "line 24 is where it drains.",
+]
 FIRST_CLAUSE_DELTA = "It lives in the reader, "
 FILLER_DELTA = "and "
 # One delta reaches the chunker, SPOKEN_DEPTH sit in the queue, and the next put blocks.
@@ -129,6 +140,22 @@ def found(path: str = GROUNDED_PATH) -> SearchResult:
     )
 
 
+def found_many() -> SearchResult:
+    return SearchResult(
+        tool="search",
+        query=USER_TEXT,
+        globs=GLOBS,
+        matches=[
+            SearchMatch(path=GROUNDED_PATH, line=24, text="        self._inbound = queue"),
+            SearchMatch(path=UNGROUNDED_PATH, line=30, text="        frame = await self.recv()"),
+            SearchMatch(path=SECOND_PATH, line=41, text="        return self._state.resample(pcm)"),
+        ],
+        truncated=False,
+        oversized=False,
+        byte_count=192,
+    )
+
+
 def config(root: Path) -> TurnLoopConfig:
     return TurnLoopConfig(system=SYSTEM, subject=SUBJECT, root=root)
 
@@ -141,6 +168,26 @@ class FakeClock:
         elapsed = self.calls * TICK_S
         self.calls += 1
         return elapsed
+
+
+class HeldPace:
+    def __init__(self, log: list[tuple[str, object]] | None = None) -> None:
+        self._log = log
+        self.waits: list[float] = []
+        self.held = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, wait: float) -> None:
+        self.waits.append(wait)
+        if self._log is not None:
+            self._log.append(("pace", wait))
+        self.held.set()
+        await self.release.wait()
+        self.release.clear()
+
+    def release_once(self) -> None:
+        self.held.clear()
+        self.release.set()
 
 
 class ScriptedSource:
@@ -224,6 +271,16 @@ class FakeRegistry:
         self._log.append(("abandon", turn_id))
 
     def verify_chunk(self, turn_id: str, text: str, source: str = "model") -> GroundingVerdict:
+        return GroundingVerdict(ok=True)
+
+
+class RecordingRegistry(FakeRegistry):
+    def __init__(self, log: list[tuple[str, object]]) -> None:
+        super().__init__(log)
+        self.verified: list[tuple[str, str, str]] = []
+
+    def verify_chunk(self, turn_id: str, text: str, source: str = "model") -> GroundingVerdict:
+        self.verified.append((turn_id, text, source))
         return GroundingVerdict(ok=True)
 
 
@@ -452,8 +509,12 @@ async def test_the_cached_opener_is_enqueued_before_the_search_returns(tmp_path:
     assert steps.index("speak_opener") < steps.index("search_done") < steps.index("start_turn")
     assert ("stream_open", True) in log
     spoken = [entry for entry in log if entry[0] in ("speak_opener", "speak")]
-    assert spoken[:2] == [("speak_opener", "thinking"), ("speak", lead_in_sentence([result]))]
-    assert speaker.openers == ["thinking"]
+    assert spoken[:3] == [
+        ("speak_opener", "thinking"),
+        ("speak_opener", opener_key([result])),
+        ("speak", lead_in_sentence([result])),
+    ]
+    assert speaker.openers == ["thinking", opener_key([result])]
     assert speaker.utterances == [[lead_in_sentence([result])] + SPOKEN_CLAUSES]
     await loop.aclose()
 
@@ -1190,4 +1251,213 @@ async def test_a_line_number_split_across_the_cut_never_reaches_the_speaker(
 
     messages = session_messages(caplog)
     assert "turn.chunk_withheld turn_id=turn-1 source=model ungrounded=1" in messages
+    await loop.aclose()
+
+
+async def test_a_stage_waits_out_the_gap_and_stops_once_the_model_speaks(tmp_path: Path) -> None:
+    log: list[tuple[str, object]] = []
+    result = found_many()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result, later=found())
+    gate = asyncio.Event()
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
+    source = ScriptedSource(
+        [EndOfTurn(text=USER_TEXT), speaker.finished, EndOfTurn(text=SECOND_TEXT)]
+    )
+    pace = HeldPace()
+    cfg = config(tmp_path)
+    loop = TurnLoop(
+        cfg, source, search, speaker, reasoning, FakeRegistry(log), FakeClock(), pace=pace
+    )
+    running = asyncio.create_task(loop.run())
+    lead_in = lead_in_sentence([result])
+    stages = list(lead_in_stages(result))
+
+    await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(pace.held.wait(), HANG_GUARD_S)
+    stagers = [task for task in asyncio.all_tasks() if task.get_name() == STAGER_TASK]
+    assert len(stagers) == 1
+    assert speaker.utterances == [[lead_in]]
+    assert pace.waits == [cfg.stage_gap_ms / 1000]
+
+    speaker.received.clear()
+    pace.release_once()
+    await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(pace.held.wait(), HANG_GUARD_S)
+    assert speaker.utterances == [[lead_in, stages[0]]]
+    assert pace.waits == [cfg.stage_gap_ms / 1000] * 2
+    assert not stagers[0].done()
+
+    gate.set()
+    await asyncio.wait_for(speaker.finished.wait(), HANG_GUARD_S)
+    assert stagers[0].done()
+    assert stagers[0].cancelled()
+
+    pace.release_once()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert pace.waits == [cfg.stage_gap_ms / 1000] * 2
+    assert speaker.utterances == [
+        [lead_in, stages[0], *SPOKEN_CLAUSES],
+        [lead_in_sentence([found()]), *SPOKEN_CLAUSES],
+    ]
+    await loop.aclose()
+
+
+async def test_every_stage_is_verified_as_a_lead_in_chunk_on_the_turn(tmp_path: Path) -> None:
+    log: list[tuple[str, object]] = []
+    result = found_many()
+    registry = RecordingRegistry(log)
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    gate = asyncio.Event()
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    pace = HeldPace()
+    loop = TurnLoop(
+        config(tmp_path), source, search, speaker, reasoning, registry, FakeClock(), pace=pace
+    )
+    running = asyncio.create_task(loop.run())
+    stages = list(lead_in_stages(result))
+
+    for _ in stages[:2]:
+        await asyncio.wait_for(pace.held.wait(), HANG_GUARD_S)
+        speaker.received.clear()
+        pace.release_once()
+        await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+    gate.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert speaker.utterances == [[lead_in_sentence([result]), *stages[:2], *SPOKEN_CLAUSES]]
+    for sentence in stages[:2]:
+        assert ("turn-1", sentence, "lead_in") in registry.verified
+    sources = {source for _, text, source in registry.verified if text in stages}
+    assert sources == {"lead_in"}
+    assert [source for _, text, source in registry.verified if text in SPOKEN_CLAUSES] == [
+        "model",
+        "model",
+    ]
+    await loop.aclose()
+
+
+async def test_a_stage_never_lends_its_path_to_the_model_stream(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found_many()
+    registry = TurnRegistry()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    gate = asyncio.Event()
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in CARRY_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    pace = HeldPace()
+    loop = TurnLoop(
+        config(tmp_path), source, search, speaker, reasoning, registry, FakeClock(), pace=pace
+    )
+    running = asyncio.create_task(loop.run())
+    stages = list(lead_in_stages(result))
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        for _ in stages[:2]:
+            await asyncio.wait_for(pace.held.wait(), HANG_GUARD_S)
+            speaker.received.clear()
+            pace.release_once()
+            await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+        gate.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert UNGROUNDED_PATH in stages[1]
+    assert speaker.utterances == [[lead_in_sentence([result]), *stages[:2], *CARRY_CLAUSES]]
+    assert CARRY_DELTAS[0].strip() not in [text for name, text in log if name == "speak"]
+    messages = session_messages(caplog)
+    assert "turn.chunk_withheld turn_id=turn-1 source=model ungrounded=1" in messages
+    assert [message for message in messages if message.startswith("turn.stage")] == [
+        "turn.stage turn_id=turn-1 n=1",
+        "turn.stage turn_id=turn-1 n=2",
+    ]
+    await loop.aclose()
+
+
+async def test_the_first_spoken_chunk_mid_stage_rides_the_turns_one_iterator(
+    tmp_path: Path,
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found_many()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    gate = asyncio.Event()
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    pace = HeldPace()
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+        pace=pace,
+    )
+    running = asyncio.create_task(loop.run())
+    stages = list(lead_in_stages(result))
+
+    for _ in stages[:2]:
+        await asyncio.wait_for(pace.held.wait(), HANG_GUARD_S)
+        speaker.received.clear()
+        pace.release_once()
+        await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(pace.held.wait(), HANG_GUARD_S)
+    gate.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert len(speaker.utterances) == 1
+    assert speaker.utterances == [[lead_in_sentence([result]), *stages[:2], *SPOKEN_CLAUSES]]
+    assert len([entry for entry in log if entry[0] == "speak"]) == 3 + len(SPOKEN_CLAUSES)
+    await loop.aclose()
+
+
+async def test_a_stalled_speaker_holds_the_next_stage_back(tmp_path: Path) -> None:
+    log: list[tuple[str, object]] = []
+    result = found_many()
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold)
+    search = FakeSearch(log, result)
+    gate = asyncio.Event()
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    pace = HeldPace(log)
+    cfg = config(tmp_path)
+    loop = TurnLoop(
+        cfg, source, search, speaker, reasoning, FakeRegistry(log), FakeClock(), pace=pace
+    )
+    running = asyncio.create_task(loop.run())
+    lead_in = lead_in_sentence([result])
+    stages = list(lead_in_stages(result))
+
+    await asyncio.wait_for(pace.held.wait(), HANG_GUARD_S)
+    speaker.received.clear()
+    pace.release_once()
+    await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+    assert speaker.utterances == [[lead_in, stages[0]]]
+
+    log.append(("gate_released", None))
+    hold.set()
+    await asyncio.wait_for(pace.held.wait(), HANG_GUARD_S)
+
+    assert pace.waits == [cfg.stage_gap_ms / 1000] * 2
+    paces = [i for i, entry in enumerate(log) if entry[0] == "pace"]
+    assert log.index(("speak", stages[0])) < log.index(("gate_released", None)) < paces[1]
+
+    gate.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert pace.waits == [cfg.stage_gap_ms / 1000] * 2
+    assert speaker.utterances == [[lead_in, stages[0], *SPOKEN_CLAUSES]]
     await loop.aclose()

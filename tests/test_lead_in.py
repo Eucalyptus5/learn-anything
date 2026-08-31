@@ -2,7 +2,7 @@ from collections.abc import Callable
 
 import pytest
 
-from tutor.lead_in import lead_in_sentence, opener_key
+from tutor.lead_in import lead_in_sentence, lead_in_stages, opener_key
 from tutor.openers import OPENER_PHRASES
 from tutor.tools.models import ContextLine, Position, SearchMatch, SearchResult
 from tutor.tools.provenance import TurnRegistry, extract_positions
@@ -255,3 +255,32 @@ def test_empty_results_say_nothing_was_found(results: list[SearchResult]) -> Non
 def test_opener_key_on_no_results_is_a_key_the_opener_table_holds() -> None:
     assert opener_key([]) in OPENER_PHRASES
     assert opener_key([]) == "empty"
+
+
+def test_stages_walk_the_matches_in_order_without_repeating_one() -> None:
+    result = _many_files()[0]
+    stages = lead_in_stages(result)
+
+    spoken = [next(stages) for _ in result.matches]
+    with pytest.raises(StopIteration):
+        next(stages)
+
+    assert len(set(spoken)) == len(result.matches)
+    for sentence, match in zip(spoken, result.matches, strict=True):
+        assert extract_positions(sentence) == [Position(path=match.path, line=match.line)]
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_every_stage_verifies_clean_as_a_lead_in_chunk(shape: Shape) -> None:
+    results = shape()
+    registry = _registry(results)
+    stages = list(lead_in_stages(results[0]))
+
+    assert len(stages) == len(results[0].matches)
+    for sentence in stages:
+        assert len({position.path for position in extract_positions(sentence)}) == 1
+        assert registry.verify_chunk("t1", sentence, source="lead_in").ok is True
+
+
+def test_stages_are_empty_for_an_empty_result() -> None:
+    assert list(lead_in_stages(_empty_matches()[0])) == []
