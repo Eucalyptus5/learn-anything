@@ -8,7 +8,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from tutor.chunker import Scrubber, clause_chunks, spoken_text
-from tutor.input_path import EndOfTurn, InputPath
+from tutor.input_path import EndOfTurn, InputPath, SpeechStarted
 from tutor.lead_in import lead_in_sentence, lead_in_stages, opener_key
 from tutor.prompt import (
     SEARCH_CODE_TOOL,
@@ -22,6 +22,7 @@ from tutor.reasoning import ReasoningClient, TurnChunk
 from tutor.speech import Speaker
 from tutor.tools.models import SearchBudget, SearchResult
 from tutor.tools.provenance import TurnRegistry
+from tutor.transport import Connection
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,7 @@ class TurnLoop:
         source: InputPath,
         search: SearchCall,
         speaker: Speaker,
+        transport: Connection,
         reasoning: ReasoningClient,
         registry: TurnRegistry,
         clock: Callable[[], float] = time.perf_counter,
@@ -101,6 +103,7 @@ class TurnLoop:
         self._source = source
         self._search = search
         self._speaker = speaker
+        self._transport = transport
         self._reasoning = reasoning
         self._registry = registry
         self._clock = clock
@@ -113,6 +116,8 @@ class TurnLoop:
 
     async def run(self) -> None:
         async for event in self._source.events():
+            if isinstance(event, SpeechStarted):
+                self._interrupt()
             if not isinstance(event, EndOfTurn):
                 continue
             self._dispatched += 1
@@ -121,6 +126,17 @@ class TurnLoop:
             self._turns.add(turn)
             turn.add_done_callback(self._turn_done)
         await asyncio.gather(*self._turns, return_exceptions=True)
+
+    def _interrupt(self) -> None:
+        for turn in self._turns:
+            if turn.cancelling():
+                continue
+            drain = self._drains.get(turn.get_name())
+            if drain is not None:
+                drain.cancel()
+            turn.cancel()
+        # Playout outlives the turn task, so what is queued drops even with no turn in flight.
+        self._transport.flush_playout()
 
     def _turn_done(self, turn: asyncio.Task[None]) -> None:
         self._turns.discard(turn)
@@ -184,7 +200,8 @@ class TurnLoop:
         task = tasks.pop(turn_id, None)
         if task is None or task.done():
             return
-        task.cancel()
+        if not task.cancelling():
+            task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
     async def _utterance(
