@@ -232,8 +232,13 @@ class FakeSpeaker:
         self._log = log
         self._gate = gate
         self.utterances: list[list[str]] = []
+        self.openers: list[str] = []
         self.received = asyncio.Event()
         self.finished = asyncio.Event()
+
+    async def speak_opener(self, key: str) -> None:
+        self.openers.append(key)
+        self._log.append(("speak_opener", key))
 
     async def speak(self, chunks: AsyncIterator[str]) -> None:
         spoken: list[str] = []
@@ -418,6 +423,38 @@ async def test_grounding_lands_before_the_reasoning_call(
     assert any(GROUNDING_SPAN.match(message) for message in messages)
     assert any(SPOKEN_SPAN.match(message) for message in messages)
     assert all(USER_TEXT not in message for message in messages)
+    await loop.aclose()
+
+
+async def test_the_cached_opener_is_enqueued_before_the_search_returns(tmp_path: Path) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    gate = asyncio.Event()
+    search = FakeSearch(log, result, gate=gate)
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received)
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    loop = TurnLoop(
+        config(tmp_path), source, search, speaker, reasoning, FakeRegistry(log), FakeClock()
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(search.held.wait(), HANG_GUARD_S)
+    assert ("speak_opener", "thinking") in log
+    assert ("search_done", USER_TEXT) not in log
+    assert not [entry for entry in log if entry[0] == "speak"]
+
+    gate.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
+    steps = [name for name, _ in log]
+    assert steps.index("speak_opener") < steps.index("search_done") < steps.index("start_turn")
+    assert ("stream_open", True) in log
+    spoken = [entry for entry in log if entry[0] in ("speak_opener", "speak")]
+    assert spoken[:2] == [("speak_opener", "thinking"), ("speak", lead_in_sentence([result]))]
+    assert speaker.openers == ["thinking"]
+    assert speaker.utterances == [[lead_in_sentence([result])] + SPOKEN_CLAUSES]
     await loop.aclose()
 
 

@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 SearchCall = Callable[[str, Sequence[str], Path, SearchBudget], Awaitable[SearchResult]]
 
 SEARCH_CODE = "search_code"
+OPENER = "thinking"
 SPOKEN_DEPTH = 32
 BAD_ARGUMENTS = "search_code takes a query string and a non-empty list of glob strings"
 
@@ -134,6 +135,7 @@ class TurnLoop:
         start = self._clock()
         self._registry.open_turn(turn_id)
         try:
+            await self._speaker.speak_opener(OPENER)
             globs = await derive_globs(user_text, self._cfg.root)
             result = await self._search(user_text, globs, self._cfg.root, self._cfg.budget)
             self._registry.record(turn_id, result)
