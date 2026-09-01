@@ -26,7 +26,7 @@ from tutor.input_path import (
 from tutor.lead_in import lead_in_sentence, lead_in_stages, opener_key
 from tutor.prompt import SEARCH_CODE_TOOL, TurnPrompt
 from tutor.reasoning import TurnChunk
-from tutor.session import BAD_ARGUMENTS, SPOKEN_DEPTH, TurnLoop, TurnLoopConfig
+from tutor.session import BAD_ARGUMENTS, OPENER, SPOKEN_DEPTH, TurnLoop, TurnLoopConfig
 from tutor.tools.models import (
     GroundingVerdict,
     Position,
@@ -43,6 +43,8 @@ SYSTEM = "you tutor an engineer through a codebase"
 SUBJECT = "the inbound frame queue"
 USER_TEXT = "walk me through tutor/transport.py"
 SECOND_TEXT = "and where does tutor/playout.py fit"
+FIRST_PARTIAL = "walk me"
+PARTIAL_TEXT = "walk me through"
 GROUNDED_PATH = "tutor/transport.py"
 UNGROUNDED_PATH = "tutor/playout.py"
 UNPARSEABLE_PATH = "tutor/my transport.py"
@@ -99,6 +101,7 @@ RATE_LIMIT_DETAIL = "quota exhausted for project acct-9"
 TURN_TASK = "turn-1"
 DRAIN_TASK = "turn-1-drain"
 STAGER_TASK = "turn-1-stager"
+SPECULATION_TASK = "turn-1-speculation"
 SECOND_PATH = "tutor/resample.py"
 CARRY_DELTAS = [
     "Line 30 is the reader. ",
@@ -2030,4 +2033,493 @@ async def test_a_stalled_speaker_holds_the_next_stage_back(tmp_path: Path) -> No
 
     assert pace.waits == [cfg.stage_gap_ms / 1000] * 2
     assert speaker.utterances == [[lead_in, stages[0], *SPOKEN_CLAUSES]]
+    await loop.aclose()
+
+
+def speculative(root: Path) -> TurnLoopConfig:
+    cfg = TurnLoopConfig(system=SYSTEM, subject=SUBJECT, root=root, speculative_reasoning=True)
+    assert cfg.speculative_reasoning
+    return cfg
+
+
+def speculation_task() -> asyncio.Task[None]:
+    tasks = [task for task in asyncio.all_tasks() if task.get_name() == SPECULATION_TASK]
+    assert len(tasks) == 1
+    return tasks[0]
+
+
+def spoken_spans(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [message for message in session_messages(caplog) if message.startswith("turn.spoken")]
+
+
+async def test_partials_are_ignored_with_speculation_off(tmp_path: Path) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received)
+    endpoint = asyncio.Event()
+    source = ScriptedSource(
+        [
+            PartialTranscript(text=PARTIAL_TEXT),
+            endpoint,
+            EndOfTurn(text=USER_TEXT),
+            speaker.finished,
+        ]
+    )
+    cfg = config(tmp_path)
+    assert cfg.speculative_reasoning is False
+    loop = TurnLoop(
+        cfg,
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(source.blocked.wait(), HANG_GUARD_S)
+    assert search.calls == []
+    assert reasoning.prompts == []
+    assert log == []
+
+    await pull_past(source, endpoint)
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert search.calls == [(USER_TEXT, GLOBS, tmp_path, SearchBudget())]
+    assert [entry for entry in log if entry[0] == "start_turn"] == [("start_turn", USER_TEXT)]
+    assert speaker.utterances == [[lead_in_sentence([result])] + SPOKEN_CLAUSES]
+    await loop.aclose()
+
+
+async def test_a_partial_issues_the_request_and_a_matching_final_reuses_it(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    gate = asyncio.Event()
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
+    endpoint = asyncio.Event()
+    source = ScriptedSource(
+        [
+            PartialTranscript(text=""),
+            PartialTranscript(text=PARTIAL_TEXT),
+            endpoint,
+            EndOfTurn(text=USER_TEXT),
+            speaker.finished,
+        ]
+    )
+    loop = TurnLoop(
+        speculative(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+    lead_in = lead_in_sentence([result])
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+
+        await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+        await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+        assert [call[0] for call in search.calls] == [PARTIAL_TEXT]
+        assert [entry for entry in log if entry[0] == "start_turn"] == [
+            ("start_turn", PARTIAL_TEXT)
+        ]
+        assert ("stream_open", False) in log
+        assert reasoning.streams[0].iterations == 1
+        assert reasoning.prompts[0].tool_context == [result]
+        assert speaker.openers == []
+        assert speaker.utterances == []
+
+        await pull_past(source, endpoint)
+        await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+        assert speaker.openers == [OPENER, opener_key([result])]
+        assert speaker.utterances == [[lead_in]]
+        assert [entry for entry in log if entry[0] == "start_turn"] == [
+            ("start_turn", PARTIAL_TEXT)
+        ]
+
+        gate.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert [entry for entry in log if entry[0] == "start_turn"] == [("start_turn", PARTIAL_TEXT)]
+    assert reasoning.streams[-1].iterations == 1
+    assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]]
+    assert [entry for entry in log if entry[0] == "open_turn"] == [("open_turn", TURN_TASK)]
+    assert [entry for entry in log if entry[0] == "record"] == [("record", TURN_TASK)]
+    assert "abandon" not in [name for name, _ in log]
+    assert len(spoken_spans(caplog)) == 1
+    messages = session_messages(caplog)
+    assert all(PARTIAL_TEXT not in message for message in messages)
+    await loop.aclose()
+
+
+async def test_a_later_partial_cancels_and_reissues_the_request(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    gate = asyncio.Event()
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
+    longer = asyncio.Event()
+    endpoint = asyncio.Event()
+    source = ScriptedSource(
+        [
+            PartialTranscript(text=FIRST_PARTIAL),
+            longer,
+            PartialTranscript(text=PARTIAL_TEXT),
+            endpoint,
+            EndOfTurn(text=USER_TEXT),
+            speaker.finished,
+        ]
+    )
+    loop = TurnLoop(
+        speculative(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+
+        await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+        await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+        first = speculation_task()
+        reasoning.started.clear()
+
+        await pull_past(source, longer)
+        await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+        await asyncio.wait_for(reasoning.streams[1].held.wait(), HANG_GUARD_S)
+
+        assert first.cancelled()
+        assert reasoning.streams[0].cancels == 0
+        assert [entry for entry in log if entry[0] == "start_turn"] == [
+            ("start_turn", FIRST_PARTIAL),
+            ("start_turn", PARTIAL_TEXT),
+        ]
+        opens = [i for i, entry in enumerate(log) if entry == ("open_turn", TURN_TASK)]
+        assert len(opens) == 2
+        assert log.index(("stream_closed", 0)) < log.index(("abandon", TURN_TASK)) < opens[1]
+        assert [name for name, _ in log].count("abandon") == 1
+        assert speaker.utterances == []
+
+        await pull_past(source, endpoint)
+        gate.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert [name for name, _ in log].count("start_turn") == 2
+    assert reasoning.streams[-1].iterations == 1
+    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
+    assert [name for name, _ in log].count("abandon") == 1
+    assert len(spoken_spans(caplog)) == 1
+    await loop.aclose()
+
+
+async def test_a_mismatching_final_discards_the_speculation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    gate = asyncio.Event()
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
+    endpoint = asyncio.Event()
+    source = ScriptedSource(
+        [
+            PartialTranscript(text=PARTIAL_TEXT),
+            endpoint,
+            EndOfTurn(text=SECOND_TEXT),
+            speaker.finished,
+        ]
+    )
+    loop = TurnLoop(
+        speculative(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+
+        await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+        await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+        speculation = speculation_task()
+        reasoning.started.clear()
+
+        await pull_past(source, endpoint)
+        await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+        gate.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert speculation.cancelled()
+    assert reasoning.streams[0].cancels == 0
+    assert [entry for entry in log if entry[0] == "start_turn"] == [
+        ("start_turn", PARTIAL_TEXT),
+        ("start_turn", SECOND_TEXT),
+    ]
+    opens = [i for i, entry in enumerate(log) if entry == ("open_turn", TURN_TASK)]
+    assert len(opens) == 2
+    assert (
+        log.index(("stream_closed", 0))
+        < log.index(("abandon", TURN_TASK))
+        < opens[1]
+        < log.index(("start_turn", SECOND_TEXT))
+    )
+    assert [name for name, _ in log].count("abandon") == 1
+    assert search.calls[1][0] == SECOND_TEXT
+    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
+    assert len(spoken_spans(caplog)) == 1
+    await loop.aclose()
+
+
+async def test_speech_start_cancels_the_speculation(tmp_path: Path) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    gate = asyncio.Event()
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
+    barge = asyncio.Event()
+    resume = asyncio.Event()
+    source = ScriptedSource(
+        [
+            PartialTranscript(text=PARTIAL_TEXT),
+            barge,
+            SpeechStarted(),
+            resume,
+            EndOfTurn(text=USER_TEXT),
+            speaker.finished,
+        ]
+    )
+    loop = TurnLoop(
+        speculative(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+    speculation = speculation_task()
+    reasoning.started.clear()
+
+    await pull_past(source, barge)
+    await asyncio.wait_for(asyncio.wait([speculation]), HANG_GUARD_S)
+    assert speculation.cancelled()
+    assert reasoning.streams[0].cancels == 0
+    steps = [name for name, _ in log]
+    assert steps.index("flush_playout") < steps.index("stream_closed") < steps.index("abandon")
+    assert speaker.utterances == []
+
+    await pull_past(source, resume)
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    gate.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert [entry for entry in log if entry[0] == "start_turn"] == [
+        ("start_turn", PARTIAL_TEXT),
+        ("start_turn", USER_TEXT),
+    ]
+    assert log.index(("abandon", TURN_TASK)) < log.index(("start_turn", USER_TEXT))
+    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
+    await loop.aclose()
+
+
+async def test_aclose_cancels_a_speculation_in_flight(tmp_path: Path) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    gate = asyncio.Event()
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
+    release = asyncio.Event()
+    source = ScriptedSource([PartialTranscript(text=PARTIAL_TEXT), release])
+    loop = TurnLoop(
+        speculative(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+    speculation = speculation_task()
+
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert speculation.cancelled()
+    assert ("stream_closed", 0) in log
+    assert reasoning.streams[0].cancels == 0
+    assert ("abandon", TURN_TASK) in log
+    assert speaker.openers == []
+    assert speaker.utterances == []
+
+    release.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert speaker.utterances == []
+    assert [name for name, _ in log].count("start_turn") == 1
+
+
+async def test_a_failed_speculation_is_reported_and_the_final_grounds_itself(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    gate = asyncio.Event()
+    search = FakeSearch(log, result, gate=gate, fails=PARTIAL_TEXT, holds=PARTIAL_TEXT)
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received)
+    endpoint = asyncio.Event()
+    source = ScriptedSource(
+        [
+            PartialTranscript(text=PARTIAL_TEXT),
+            endpoint,
+            EndOfTurn(text=USER_TEXT),
+            speaker.finished,
+        ]
+    )
+    loop = TurnLoop(
+        speculative(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+
+        await asyncio.wait_for(search.held.wait(), HANG_GUARD_S)
+        speculation = speculation_task()
+        gate.set()
+        await asyncio.wait_for(asyncio.wait([speculation]), HANG_GUARD_S)
+        assert not speculation.cancelled()
+        assert reasoning.prompts == []
+
+        await pull_past(source, endpoint)
+        await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert [call[0] for call in search.calls] == [PARTIAL_TEXT, USER_TEXT]
+    assert [entry for entry in log if entry[0] == "start_turn"] == [("start_turn", USER_TEXT)]
+    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
+    messages = session_messages(caplog)
+    assert [message for message in messages if message.startswith("turn.speculation_failed")] == [
+        "turn.speculation_failed turn_id=turn-1 error=SearchFailed"
+    ]
+    assert [message for message in messages if message.startswith("turn.failed")] == []
+    assert len(spoken_spans(caplog)) == 1
+    captured = [record.getMessage() for record in caplog.records]
+    assert all(PARTIAL_TEXT not in message for message in captured)
+    await loop.aclose()
+
+
+async def test_a_claimed_speculation_that_fails_fails_the_turn(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    gate = asyncio.Event()
+    search = FakeSearch(log, result, gate=gate, fails=PARTIAL_TEXT, holds=PARTIAL_TEXT)
+    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
+    reasoning = FakeReasoning(log, deltas, speaker.received)
+    endpoint = asyncio.Event()
+    second = asyncio.Event()
+    source = ScriptedSource(
+        [
+            PartialTranscript(text=PARTIAL_TEXT),
+            endpoint,
+            EndOfTurn(text=USER_TEXT),
+            second,
+            EndOfTurn(text=SECOND_TEXT),
+            speaker.finished,
+        ]
+    )
+    loop = TurnLoop(
+        speculative(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+
+        await asyncio.wait_for(search.held.wait(), HANG_GUARD_S)
+        speculation = speculation_task()
+
+        await pull_past(source, endpoint)
+        assert speaker.openers == [OPENER]
+        turn = next(task for task in asyncio.all_tasks() if task.get_name() == TURN_TASK)
+
+        gate.set()
+        await asyncio.wait_for(asyncio.wait([speculation, turn]), HANG_GUARD_S)
+        assert not turn.cancelled()
+        assert isinstance(turn.exception(), SearchFailed)
+        assert isinstance(speculation.exception(), SearchFailed)
+        assert speaker.utterances == []
+        assert reasoning.prompts == []
+        assert [entry for entry in log if entry[0] in ("open_turn", "record", "abandon")] == [
+            ("open_turn", TURN_TASK)
+        ]
+
+        await pull_past(source, second)
+        await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert [call[0] for call in search.calls] == [PARTIAL_TEXT, SECOND_TEXT]
+    assert speaker.openers == [OPENER, OPENER, opener_key([result])]
+    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
+    assert [prompt.user_text for prompt in reasoning.prompts] == [SECOND_TEXT]
+    messages = session_messages(caplog)
+    assert [message for message in messages if message.startswith("turn.failed")] == [
+        "turn.failed turn_id=turn-1 error=SearchFailed"
+    ]
+    assert [message for message in messages if message.startswith("turn.speculation_failed")] == []
+    assert len(spoken_spans(caplog)) == 1
+    assert "turn_id=turn-2" in spoken_spans(caplog)[0]
+    captured = [record.getMessage() for record in caplog.records]
+    assert all(PARTIAL_TEXT not in message for message in captured)
     await loop.aclose()

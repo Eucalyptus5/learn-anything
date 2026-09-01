@@ -8,7 +8,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from tutor.chunker import Scrubber, clause_chunks, spoken_text
-from tutor.input_path import EndOfTurn, InputPath, SpeechStarted
+from tutor.input_path import EndOfTurn, InputPath, PartialTranscript, SpeechStarted
 from tutor.lead_in import lead_in_sentence, lead_in_stages, opener_key
 from tutor.prompt import (
     SEARCH_CODE_TOOL,
@@ -27,6 +27,7 @@ from tutor.transport import Connection
 logger = logging.getLogger(__name__)
 
 SearchCall = Callable[[str, Sequence[str], Path, SearchBudget], Awaitable[SearchResult]]
+Grounded = tuple[SearchResult, TurnPrompt, asyncio.Queue[str | None]]
 
 SEARCH_CODE = "search_code"
 OPENER = "thinking"
@@ -84,6 +85,20 @@ class TurnLoopConfig(BaseModel):
     root: Path
     budget: SearchBudget = Field(default_factory=SearchBudget)
     stage_gap_ms: int = Field(default=2000, gt=0)
+    speculative_reasoning: bool = False
+
+
+class Speculation:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.claimed = False
+        self.grounded: asyncio.Future[Grounded] = asyncio.get_running_loop().create_future()
+        self.task: asyncio.Task[None]
+
+    def live(self) -> bool:
+        if not self.task.done():
+            return not self.task.cancelling()
+        return not self.task.cancelled() and self.task.exception() is None
 
 
 class TurnLoop:
@@ -112,22 +127,56 @@ class TurnLoop:
         self._drains: dict[str, asyncio.Task[None]] = {}
         self._pumps: dict[str, asyncio.Task[None]] = {}
         self._stagers: dict[str, asyncio.Task[None]] = {}
+        self._speculations: dict[str, Speculation] = {}
         self._dispatched = 0
 
     async def run(self) -> None:
         async for event in self._source.events():
             if isinstance(event, SpeechStarted):
                 self._interrupt()
-            if not isinstance(event, EndOfTurn):
-                continue
-            self._dispatched += 1
-            turn_id = f"turn-{self._dispatched}"
-            turn = asyncio.create_task(self._turn(turn_id, event.text), name=turn_id)
-            self._turns.add(turn)
-            turn.add_done_callback(self._turn_done)
-        await asyncio.gather(*self._turns, return_exceptions=True)
+            elif isinstance(event, PartialTranscript):
+                if self._cfg.speculative_reasoning and event.text:
+                    self._prime(event.text)
+            elif isinstance(event, EndOfTurn):
+                self._dispatched += 1
+                turn_id = f"turn-{self._dispatched}"
+                turn = asyncio.create_task(self._turn(turn_id, event.text), name=turn_id)
+                self._turns.add(turn)
+                turn.add_done_callback(self._turn_done)
+        speculations = [speculation.task for speculation in self._speculations.values()]
+        for task in speculations:
+            task.cancel()
+        await asyncio.gather(*self._turns, *speculations, return_exceptions=True)
+
+    def _prime(self, text: str) -> None:
+        turn_id = f"turn-{self._dispatched + 1}"
+        previous = self._speculations.get(turn_id)
+        if previous is not None and previous.text == text and previous.live():
+            return
+        if previous is not None and not previous.task.cancelling():
+            previous.task.cancel()
+        speculation = Speculation(text)
+        speculation.task = asyncio.create_task(
+            self._speculate(turn_id, speculation, None if previous is None else previous.task),
+            name=f"{turn_id}-speculation",
+        )
+        speculation.task.add_done_callback(lambda _: self._speculation_done(turn_id, speculation))
+        self._speculations[turn_id] = speculation
+
+    def _speculation_done(self, turn_id: str, speculation: Speculation) -> None:
+        task = speculation.task
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None and not (speculation.claimed and speculation.grounded.done()):
+            logger.error(
+                "turn.speculation_failed turn_id=%s error=%s", turn_id, type(error).__name__
+            )
 
     def _interrupt(self) -> None:
+        for speculation in self._speculations.values():
+            if not speculation.task.cancelling():
+                speculation.task.cancel()
         for turn in self._turns:
             if turn.cancelling():
                 continue
@@ -147,29 +196,85 @@ class TurnLoop:
             logger.error("turn.failed turn_id=%s error=%s", turn.get_name(), type(error).__name__)
 
     async def aclose(self) -> None:
-        turns = list(self._turns)
-        for turn in turns:
-            turn.cancel()
-        await asyncio.gather(*turns, return_exceptions=True)
+        tasks = [*self._turns, *(speculation.task for speculation in self._speculations.values())]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _turn(self, turn_id: str, user_text: str) -> None:
+    async def _speculate(
+        self, turn_id: str, speculation: Speculation, previous: asyncio.Task[None] | None
+    ) -> None:
+        if previous is not None:
+            await asyncio.gather(previous, return_exceptions=True)
         start = self._clock()
         self._registry.open_turn(turn_id)
         try:
-            await self._speaker.speak_opener(OPENER)
-            globs = await derive_globs(user_text, self._cfg.root)
-            result = await self._search(user_text, globs, self._cfg.root, self._cfg.budget)
+            globs = await derive_globs(speculation.text, self._cfg.root)
+            result = await self._search(speculation.text, globs, self._cfg.root, self._cfg.budget)
             self._registry.record(turn_id, result)
             logger.info(
-                "turn.grounding turn_id=%s ms=%d", turn_id, _elapsed_ms(start, self._clock())
+                "turn.speculation turn_id=%s ms=%d", turn_id, _elapsed_ms(start, self._clock())
             )
+            prompt = self._prompt(result, speculation.text)
+            queue: asyncio.Queue[str | None] = asyncio.Queue(SPOKEN_DEPTH)
+            speculation.grounded.set_result((result, prompt, queue))
+            await self._drain(turn_id, prompt, queue)
+        except asyncio.CancelledError:
+            if not speculation.claimed:
+                self._registry.abandon(turn_id)
+            raise
+        except Exception as error:
+            if speculation.claimed and not speculation.grounded.done():
+                speculation.grounded.set_exception(error)
+            raise
+        finally:
+            if not speculation.grounded.done():
+                speculation.grounded.cancel()
+
+    async def _claim(self, turn_id: str, user_text: str) -> asyncio.Future[Grounded] | None:
+        speculation = self._speculations.pop(turn_id, None)
+        if (
+            speculation is not None
+            and speculation.live()
+            and user_text.startswith(speculation.text)
+        ):
+            speculation.claimed = True
+            self._drains[turn_id] = speculation.task
+            return speculation.grounded
+        if speculation is not None:
+            if not speculation.task.cancelling():
+                speculation.task.cancel()
+            await asyncio.gather(speculation.task, return_exceptions=True)
+        self._registry.open_turn(turn_id)
+        return None
+
+    def _prompt(self, result: SearchResult, user_text: str) -> TurnPrompt:
+        return TurnPrompt(
+            system=f"{self._cfg.system}\n\nSubject: {self._cfg.subject}",
+            tool_context=[result],
+            user_text=user_text,
+        )
+
+    async def _turn(self, turn_id: str, user_text: str) -> None:
+        start = self._clock()
+        grounded = await self._claim(turn_id, user_text)
+        try:
+            await self._speaker.speak_opener(OPENER)
+            queue: asyncio.Queue[str | None] | None = None
+            if grounded is None:
+                globs = await derive_globs(user_text, self._cfg.root)
+                result = await self._search(user_text, globs, self._cfg.root, self._cfg.budget)
+                self._registry.record(turn_id, result)
+                logger.info(
+                    "turn.grounding turn_id=%s ms=%d", turn_id, _elapsed_ms(start, self._clock())
+                )
+                prompt = self._prompt(result, user_text)
+            else:
+                # A cancelled turn must not cancel the future the speculation is about to
+                # resolve, or set_result() raises inside the speculation.
+                result, prompt, queue = await asyncio.shield(grounded)
             await self._speaker.speak_opener(opener_key([result]))
-            prompt = TurnPrompt(
-                system=f"{self._cfg.system}\n\nSubject: {self._cfg.subject}",
-                tool_context=[result],
-                user_text=user_text,
-            )
-            await self._speaker.speak(self._utterance(turn_id, result, prompt))
+            await self._speaker.speak(self._utterance(turn_id, result, prompt, queue))
             await self._report_drain(turn_id)
         except asyncio.CancelledError:
             # The drain has to stop before the id is cleared, or a late record() finds no turn.
@@ -205,18 +310,23 @@ class TurnLoop:
         await asyncio.gather(task, return_exceptions=True)
 
     async def _utterance(
-        self, turn_id: str, result: SearchResult, prompt: TurnPrompt
+        self,
+        turn_id: str,
+        result: SearchResult,
+        prompt: TurnPrompt,
+        queue: asyncio.Queue[str | None] | None,
     ) -> AsyncIterator[str]:
         lead_in = lead_in_sentence([result])
         if self._admits(turn_id, lead_in, "lead_in"):
             yield lead_in
         stages = [sentence for sentence in lead_in_stages(result) if sentence != lead_in]
-        queue: asyncio.Queue[str | None] = asyncio.Queue(SPOKEN_DEPTH)
+        if queue is None:
+            queue = asyncio.Queue(SPOKEN_DEPTH)
+            self._drains[turn_id] = asyncio.create_task(
+                self._drain(turn_id, prompt, queue), name=f"{turn_id}-drain"
+            )
         spoken: asyncio.Queue[str | None] = asyncio.Queue(SPOKEN_DEPTH)
         demand = asyncio.Event()
-        self._drains[turn_id] = asyncio.create_task(
-            self._drain(turn_id, prompt, queue), name=f"{turn_id}-drain"
-        )
         self._stagers[turn_id] = asyncio.create_task(
             self._stage(turn_id, stages, spoken, demand), name=f"{turn_id}-stager"
         )
