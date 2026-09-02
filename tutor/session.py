@@ -235,7 +235,8 @@ class TurnLoop:
     async def aclose(self) -> None:
         tasks = [*self._turns, *(speculation.task for speculation in self._speculations.values())]
         for task in tasks:
-            task.cancel()
+            if not task.cancelling():
+                task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _speculate(

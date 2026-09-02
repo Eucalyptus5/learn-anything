@@ -1394,6 +1394,60 @@ async def test_a_second_speech_start_during_cancellation_is_idempotent(
     await loop.aclose()
 
 
+async def test_aclose_during_cancellation_lets_the_turn_finish_its_cleanup(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold)
+    search = FakeSearch(log, result)
+    gate = asyncio.Event()
+    close_gate = asyncio.Event()
+    deltas = spoken_chunks(SPOKEN_DELTAS)
+    reasoning = FakeReasoning(
+        log, deltas, speaker.received, gate=gate, holds_at=3, close_gate=close_gate
+    )
+    barge = asyncio.Event()
+    resume = asyncio.Event()
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), barge, SpeechStarted(), resume])
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+
+        await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+        await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+        await asyncio.wait_for(speaker.held.wait(), HANG_GUARD_S)
+        turn = turn_task()
+
+        await pull_past(source, barge)
+        await asyncio.wait_for(reasoning.streams[0].closing.wait(), HANG_GUARD_S)
+        assert ("stream_closed", 3) in log
+        assert [name for name, _ in log].count("abandon") == 0
+
+        closing = asyncio.create_task(loop.aclose())
+        close_gate.set()
+        await asyncio.wait_for(closing, HANG_GUARD_S)
+
+        assert turn.cancelled()
+        assert [name for name, _ in log].count("abandon") == 1
+        assert ("stream_released", 3) in log
+        messages = session_messages(caplog)
+        assert [message for message in messages if message.startswith("turn.failed")] == []
+
+        resume.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+
+
 async def test_a_cancelled_turns_tool_results_do_not_ground_the_next_turn(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -2662,6 +2716,55 @@ async def test_a_misconception_in_reverse_feynman_scopes_the_next_turn_to_where_
     spoken = [str(text) for name, text in log if name == "speak"]
     assert all(OUTCOME_MARKER not in text for text in spoken)
     assert all("signal" not in text and "{" not in text for text in spoken)
+    await loop.aclose()
+
+
+@pytest.mark.parametrize("path", ["", "!" + GROUNDED_PATH], ids=["empty", "negated"])
+async def test_an_unusable_settling_path_never_reaches_the_search(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, path: str
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    outcome = OUTCOME_MARKER + json.dumps(
+        {
+            "signal": "misconception",
+            "settling_positions": [{"path": GROUNDED_PATH, "line": 24}, {"path": path, "line": 1}],
+        }
+    )
+    turns = [
+        spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME]),
+        spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME]),
+        spoken_chunks([*SPOKEN_DELTAS, outcome]),
+        spoken_chunks(SPOKEN_DELTAS),
+    ]
+    reasoning = FakeReasoning(log, [], speaker.received, turns=turns)
+    source = SerialSource([USER_TEXT] * 4)
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert [call[1] for call in search.calls] == [GLOBS] * 4
+    assert outcome_lines(caplog) == [
+        "turn.outcome turn_id=turn-1 signal=covered phase=explore",
+        "turn.outcome turn_id=turn-2 signal=covered phase=reverse_feynman",
+        "turn.outcome turn_id=turn-3 signal=None phase=reverse_feynman",
+        "turn.outcome turn_id=turn-4 signal=None phase=reverse_feynman",
+    ]
+    assert REVERSE_FEYNMAN_DIRECTIVE in reasoning.prompts[3].system
+    lead_in = lead_in_sentence([result])
+    assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]] * 4
     await loop.aclose()
 
 

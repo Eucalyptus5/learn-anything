@@ -1,6 +1,9 @@
+import json
+
 import pytest
 
 from tutor.pedagogy import PedagogyState, Phase, TurnOutcome, parse_outcome
+from tutor.prompt import MAX_GLOBS
 from tutor.tools.models import Position
 
 SETTLING = [
@@ -18,6 +21,19 @@ MALFORMED = [
     '{"signal": 7}',
     '{"signal": "misconception", "settling_positions": [{"line": 11}]}',
     '{"settling_positions": "src/pool.py"}',
+]
+
+
+def settling(*paths: str) -> str:
+    positions = [{"path": path, "line": n} for n, path in enumerate(paths, start=11)]
+    return json.dumps({"signal": "misconception", "settling_positions": positions})
+
+
+BAD_SCOPES = [
+    settling(""),
+    settling(" "),
+    settling("!src/pool.py"),
+    settling(*[f"src/pool_{n}.py" for n in range(MAX_GLOBS + 1)]),
 ]
 
 
@@ -116,12 +132,40 @@ def test_extra_model_fields_do_not_defeat_the_parse() -> None:
 
 
 @pytest.mark.parametrize("phase", list(Phase))
-@pytest.mark.parametrize("text", MALFORMED)
+@pytest.mark.parametrize("text", [*MALFORMED, *BAD_SCOPES])
 def test_malformed_model_text_leaves_the_phase_unchanged(text: str, phase: Phase) -> None:
     state = PedagogyState(phase=phase)
 
     assert state.advance(parse_outcome(text)) is phase
     assert state.phase is phase
+
+
+@pytest.mark.parametrize("text", BAD_SCOPES)
+def test_an_unusable_settling_path_neutralizes_the_whole_outcome(text: str) -> None:
+    outcome = parse_outcome(text)
+
+    assert outcome.signal is None
+    assert outcome.settling_positions == []
+    state = questioning()
+    assert state.advance(outcome) is Phase.REVERSE_FEYNMAN
+    assert state.settling_positions == []
+
+
+def test_the_settling_scope_admits_max_globs_distinct_paths() -> None:
+    paths = [f"src/pool_{n}.py" for n in range(MAX_GLOBS)]
+    state = questioning()
+
+    assert state.advance(parse_outcome(settling(*paths))) is Phase.EXPLORE
+    assert [position.path for position in state.settling_positions] == paths
+
+
+def test_the_settling_cap_counts_distinct_paths_not_positions() -> None:
+    paths = ["src/pool.py"] * MAX_GLOBS + ["src/lease.py"]
+    state = questioning()
+
+    assert state.advance(parse_outcome(settling(*paths))) is Phase.EXPLORE
+    assert [position.path for position in state.settling_positions] == paths
+    assert len(state.settling_positions) == MAX_GLOBS + 1
 
 
 def test_malformed_model_text_leaves_the_settling_scope_in_place() -> None:

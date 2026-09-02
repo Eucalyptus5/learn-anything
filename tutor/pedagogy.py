@@ -2,8 +2,9 @@ import logging
 from enum import StrEnum, auto
 from typing import Literal
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
+from tutor.prompt import MAX_GLOBS
 from tutor.tools.models import Position
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,18 @@ class Phase(StrEnum):
 class TurnOutcome(BaseModel):
     signal: Literal["covered", "follow_up", "correct", "misconception"] | None = None
     settling_positions: list[Position] = Field(default_factory=list)
+
+    @field_validator("settling_positions", mode="after")
+    @classmethod
+    def _bound_search_scope(cls, positions: list[Position]) -> list[Position]:
+        for position in positions:
+            if not position.path.strip():
+                raise ValueError("a settling path is blank")
+            if position.path.startswith("!"):
+                raise ValueError("a settling path is negated")
+        if len({position.path for position in positions}) > MAX_GLOBS:
+            raise ValueError(f"more than {MAX_GLOBS} distinct settling paths")
+        return positions
 
 
 TRANSITIONS: dict[tuple[Phase, str | None], Phase] = {
