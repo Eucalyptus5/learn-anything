@@ -846,7 +846,7 @@ wheels = [
 [[package]]
 name = "learn-anything"
 version = "0.0.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiortc" },

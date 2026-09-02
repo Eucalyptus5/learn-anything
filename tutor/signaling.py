@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 from aiohttp import web
@@ -10,7 +11,6 @@ from tutor.transport import Connection, negotiate
 
 CLIENT_ROOT = Path(__file__).resolve().parent.parent / "client"
 HOST = "127.0.0.1"
-PORT = 8080
 CONNECTIONS = web.AppKey("connections", set[Connection])
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,10 @@ async def _close_connections(app: web.Application) -> None:
     app[CONNECTIONS].clear()
 
 
-def create_app(client_root: Path = CLIENT_ROOT) -> web.Application:
+def create_app(
+    client_root: Path = CLIENT_ROOT,
+    on_connection: Callable[[Connection], None] | None = None,
+) -> web.Application:
     app = web.Application()
     app[CONNECTIONS] = set()
 
@@ -61,6 +64,8 @@ def create_app(client_root: Path = CLIENT_ROOT) -> web.Application:
             request.app[CONNECTIONS].discard(connection)
 
         connection.on_close(forget)
+        if on_connection is not None:
+            on_connection(connection)
         logger.info("offer_answered live=%d", len(request.app[CONNECTIONS]))
         return web.json_response({"sdp": answer.sdp, "type": answer.type})
 
@@ -69,19 +74,3 @@ def create_app(client_root: Path = CLIENT_ROOT) -> web.Application:
     app.router.add_post("/offer", offer)
     app.on_shutdown.append(_close_connections)
     return app
-
-
-async def main() -> int | None:
-    logging.basicConfig(level=logging.INFO)
-    runner = web.AppRunner(create_app())
-    await runner.setup()
-    await web.TCPSite(runner, HOST, PORT).start()
-    logger.info("signaling_listening host=%s port=%d", HOST, PORT)
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await runner.cleanup()
-
-
-if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))

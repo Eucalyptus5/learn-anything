@@ -631,13 +631,13 @@ def load_kokoro() -> "KokoroSynthesizer":
 
 async def bench_chunked(samples: int) -> None:
     from tutor.chunker import clause_chunks
+    from tutor.openers import synthesize_openers
     from tutor.speech import Speaker
 
     b = begin("output path (kokoro fp16 through the clause chunker)")
     synth = TimedSynthesizer(load_kokoro())
     transport = StampingTransport()
-    speaker = Speaker(synth, transport)
-    await speaker.warm()
+    speaker = Speaker(synth, transport, await asyncio.to_thread(synthesize_openers, synth))
 
     first: list[float] = []
     full: list[float] = []
@@ -714,7 +714,7 @@ async def bench_cancel(samples: int) -> None:
     b = begin("barge-in (cancel a full turn, replace it with a clause)")
     synth = TimedSynthesizer(load_kokoro())
     transport = StampingTransport()
-    speaker = Speaker(synth, transport)
+    speaker = Speaker(synth, transport, {})
     replacement_words = len(REPLACEMENT_TEXT.split())
 
     to_first: list[float] = []

@@ -20,12 +20,11 @@ from pydantic import ValidationError
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from scripts.bench_llm import SYSTEM_PROMPT_BODY
 from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.config import Settings, settings
 from tutor.cost import UsageLedger
 from tutor.lead_in import lead_in_sentence
-from tutor.prompt import SEARCH_CODE_TOOL, Message, TurnPrompt, derive_globs
+from tutor.prompt import SEARCH_CODE_TOOL, SYSTEM_PROMPT, Message, TurnPrompt, derive_globs
 from tutor.reasoning import ReasoningClient, TurnChunk
 from tutor.session import BAD_ARGUMENTS, SEARCH_CODE, _assistant_calls, _search_arguments
 from tutor.tools.models import SearchBudget, SearchResult
@@ -401,7 +400,7 @@ async def main() -> int:
             print("BLOCKED: REASONING_API_BASE or REASONING_API_KEY is empty in .env.")
             print("No model corpus can be captured. Populate .env and rerun.")
             return 2
-        system = f"{SYSTEM_PROMPT_BODY}\n\nSubject: {SUBJECT}"
+        system = f"{SYSTEM_PROMPT}\n\nSubject: {SUBJECT}"
         client = ReasoningClient(cfg)
         try:
             await capture(client, cfg, args, system)

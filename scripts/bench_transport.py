@@ -8,7 +8,7 @@ samples, 4.0 or 8.0 ms, mean 6.1 ms over n=31, which the figure carries as a pos
 Both blocks discard one warm-up and report n, median, p95, min and max in whole milliseconds.
 No STUN server is contacted, so nothing leaves the machine.
 
-Browser tab RSS is measured by hand instead: start `uv run python -m tutor.signaling`, open the
+Browser tab RSS is measured by hand instead: start `uv run tutor`, open the
 page in Chrome, connect, hold 60 s, read the tab's memory footprint from Chrome's Task Manager,
 n=5 with a fresh tab each time.
 """

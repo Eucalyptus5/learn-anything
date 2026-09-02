@@ -63,7 +63,9 @@ def test_non_int16_audio_raises_before_the_call() -> None:
     assert model.calls == []
 
 
-def test_load_whisper_pins_the_thread_count(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_whisper_pins_the_thread_count_and_the_local_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     assert PARTIAL_CPU_THREADS == 1
     assert FINAL_CPU_THREADS == 4
     monkeypatch.setattr(stt, "WhisperModel", FakeWhisperModel)
@@ -77,5 +79,6 @@ def test_load_whisper_pins_the_thread_count(monkeypatch: pytest.MonkeyPatch) -> 
         "compute_type": "int8",
         "download_root": "models/whisper",
         "cpu_threads": FINAL_CPU_THREADS,
+        "local_files_only": True,
     }
     assert partial.kwargs["cpu_threads"] == PARTIAL_CPU_THREADS

@@ -9,6 +9,7 @@ from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import AudioStreamTrack
 
 from tutor.signaling import CLIENT_ROOT, CONNECTIONS, HOST, create_app
+from tutor.transport import Connection
 
 LOOPBACK_TIMEOUT_S = 20.0
 INDEX = "<!doctype html><title>tutor</title>"
@@ -80,6 +81,23 @@ async def test_an_offer_is_answered_with_a_gathered_answer(client: TestClient) -
     assert answer["type"] == "answer"
     assert "a=candidate" in answer["sdp"]
     await pc.close()
+
+
+async def test_a_negotiated_connection_is_handed_to_the_callback(tmp_path: Path) -> None:
+    (tmp_path / "index.html").write_text(INDEX)
+    (tmp_path / "client.js").write_text(SCRIPT)
+    handed: list[Connection] = []
+    client = TestClient(TestServer(create_app(tmp_path, on_connection=handed.append)))
+    await client.start_server()
+    pc = offering_peer()
+    try:
+        await offer(client, pc)
+
+        assert handed == list(client.app[CONNECTIONS])
+        assert len(handed) == 1
+    finally:
+        await pc.close()
+        await client.close()
 
 
 @pytest.mark.parametrize("body", MALFORMED)

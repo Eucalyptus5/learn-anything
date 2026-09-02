@@ -91,6 +91,9 @@ def test_filled_template_yields_defaults(tmp_path: Path) -> None:
     assert cfg.reasoning_model == "glm-5.3-flash"
     assert cfg.reasoning_effort == "low"
     assert cfg.reasoning_max_tokens == 400
+    assert cfg.repo_root == Path(".")
+    assert cfg.subject == "this repository"
+    assert cfg.signaling_port == 8080
 
 
 async def test_key_absent_from_the_error_text(tmp_path: Path) -> None:

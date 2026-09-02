@@ -7,7 +7,6 @@ from collections.abc import AsyncIterator
 import numpy as np
 
 from tutor.constants import TTS_SAMPLE_RATE
-from tutor.openers import synthesize_openers
 from tutor.transport import Connection
 from tutor.tts import KokoroSynthesizer
 
@@ -19,14 +18,13 @@ def _elapsed_ms(start: float) -> int:
 
 
 class Speaker:
-    def __init__(self, synth: KokoroSynthesizer, transport: Connection) -> None:
+    def __init__(
+        self, synth: KokoroSynthesizer, transport: Connection, openers: dict[str, np.ndarray]
+    ) -> None:
         self._synth = synth
         self._transport = transport
+        self._openers = openers
         self._utterance: asyncio.Task[None] | None = None
-        self._openers: dict[str, np.ndarray] = {}
-
-    async def warm(self) -> None:
-        self._openers = await asyncio.to_thread(synthesize_openers, self._synth)
 
     async def speak_opener(self, key: str) -> None:
         audio = self._openers[key]

@@ -20,47 +20,12 @@ sys.path.insert(0, str(REPO))
 
 from tutor.config import settings
 from tutor.cost import TurnUsage
-from tutor.prompt import TurnPrompt
+from tutor.prompt import SYSTEM_PROMPT, TurnPrompt
 from tutor.reasoning import ReasoningClient
 
 WARMUP = 1
 RETRY_BACKOFF_S = 20
 SAMPLES = 30
-
-SYSTEM_PROMPT_BODY = """
-You are a demanding systems architect running a spoken, hands-free code walkthrough for an
-experienced engineer. You direct the curriculum. You do not wait to be asked.
-
-Rhythm. You move through three phases and you name the phase you are in.
-Teach: introduce one subsystem, give its design pattern and its control flow, and push a
-diagram to the canvas at the same moment you begin speaking about it.
-Explore: walk the engineer into concrete files. Name entry points, structural invariants,
-and failure propagation paths. Never read raw syntax aloud; describe the mechanism.
-Reverse Feynman: stop lecturing and interrogate. Pose an edge case, a race, or a failure
-mode, and make the engineer explain the mechanism back to you. On a misconception, cut in,
-correct it in one sentence, and drop back to Explore on the exact lines that settle it.
-
-Grounding. Every file path, symbol name, and line number you speak comes from a tool result
-in the current turn. You have never seen this repository before this session. If a tool has
-not returned a position, you do not have one, and you say so and call the tool.
-
-Speech. You are being synthesized to audio and interrupted freely. Keep each turn under
-four sentences unless the engineer asks for depth. No lists, no markdown, no code blocks,
-no headings; none of it survives text to speech. Numbers spoken as words. When you need a
-file, say its name naturally rather than spelling a path character by character.
-
-Interruption. If the engineer speaks while you are speaking, you stop. You do not repeat
-the sentence you were cut off in. You answer what they just said.
-
-Visuals. When a topology, a lifecycle, or a state machine is the point, emit a diagram
-payload before the sentence that explains it, so the picture is on screen slightly ahead of
-your voice. Diagrams are structural, never decorative.
-
-Tools. You have lexical search over the repository, structural search over its syntax
-trees, a ranked symbol map, and a file reader that returns numbered lines. Search before
-you assert. Cap what you pull; a wide search that floods your context makes you slower and
-less accurate, and the engineer hears the pause.
-""".strip()
 
 TERSE_REASONING = (
     "Reasoning budget. You are being synthesized to audio and the engineer waits in silence while "
@@ -139,7 +104,7 @@ async def run_mode(
     cache_bust: bool,
 ) -> None:
     name = f"{mode}{' +terse' if terse else ''}"
-    system_prompt = pad_to_tokens(SYSTEM_PROMPT_BODY, 1500)
+    system_prompt = pad_to_tokens(SYSTEM_PROMPT, 1500)
     if cache_bust:
         system_prompt = uuid.uuid4().hex + " " + system_prompt
     if terse:

@@ -8,12 +8,13 @@ import numpy as np
 import pytest
 
 from tests.fakes import FakeSynthesizer, FakeTransport
-from tutor.openers import OPENER_PHRASES
+from tutor.openers import OPENER_PHRASES, synthesize_openers
 from tutor.speech import Speaker
 
 CHUNKS = ["one", "a longer clause", "two words"]
 TIMING_CHUNKS = ["quorum", "the acquire path", "zebra crossing"]
 SPAN_PATTERN = re.compile(r"^tts\.(synthesize|first_audio|opener)( [a-z_]+=\d+)+$")
+OPENERS = synthesize_openers(FakeSynthesizer())
 
 
 class LoggingSynthesizer(FakeSynthesizer):
@@ -131,7 +132,7 @@ async def source(chunks: list[str]) -> AsyncIterator[str]:
 async def test_one_array_per_chunk_in_source_order() -> None:
     synth = FakeSynthesizer()
     transport = FakeTransport()
-    speaker = Speaker(synth, transport)
+    speaker = Speaker(synth, transport, OPENERS)
 
     await speaker.speak(source(CHUNKS))
 
@@ -142,7 +143,7 @@ async def test_one_array_per_chunk_in_source_order() -> None:
 
 async def test_a_chunk_is_synthesized_only_after_the_previous_one_is_enqueued() -> None:
     log: list[tuple[str, object]] = []
-    speaker = Speaker(LoggingSynthesizer(log), LoggingTransport(log))
+    speaker = Speaker(LoggingSynthesizer(log), LoggingTransport(log), OPENERS)
 
     await speaker.speak(source(CHUNKS))
 
@@ -158,7 +159,7 @@ async def test_a_chunk_is_synthesized_only_after_the_previous_one_is_enqueued() 
 
 async def test_speak_returns_when_the_source_is_exhausted() -> None:
     transport = FakeTransport()
-    speaker = Speaker(FakeSynthesizer(), transport)
+    speaker = Speaker(FakeSynthesizer(), transport, OPENERS)
 
     await speaker.speak(source(CHUNKS))
 
@@ -169,7 +170,7 @@ async def test_speak_returns_when_the_source_is_exhausted() -> None:
 async def test_an_empty_source_enqueues_nothing() -> None:
     synth = FakeSynthesizer()
     transport = FakeTransport()
-    speaker = Speaker(synth, transport)
+    speaker = Speaker(synth, transport, OPENERS)
 
     await speaker.speak(source([]))
 
@@ -184,7 +185,7 @@ async def test_synthesis_does_not_run_on_the_event_loop(release: threading.Event
     started = asyncio.Event()
     synth = HeldSynthesizer(release, started, loop)
     transport = FakeTransport()
-    speaker = Speaker(synth, transport)
+    speaker = Speaker(synth, transport, OPENERS)
 
     utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
     await started.wait()
@@ -207,7 +208,7 @@ async def test_a_second_speak_while_one_is_in_flight_is_refused(
     started = asyncio.Event()
     synth = HeldSynthesizer(release, started, loop)
     transport = FakeTransport()
-    speaker = Speaker(synth, transport)
+    speaker = Speaker(synth, transport, OPENERS)
 
     utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
     await started.wait()
@@ -240,7 +241,7 @@ async def test_cancel_drops_playout_once_before_speak_unwinds(
     synth = HeldSynthesizer(release, started, loop)
     log: list[str] = []
     transport = FlushLoggingTransport(log)
-    speaker = Speaker(synth, transport)
+    speaker = Speaker(synth, transport, OPENERS)
 
     async def unwinding() -> None:
         try:
@@ -267,7 +268,7 @@ async def test_the_caller_awaiting_speak_sees_cancelled_error(
     loop = asyncio.get_running_loop()
     started = asyncio.Event()
     synth = HeldSynthesizer(release, started, loop)
-    speaker = Speaker(synth, FakeTransport())
+    speaker = Speaker(synth, FakeTransport(), OPENERS)
 
     utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
     await started.wait()
@@ -293,7 +294,7 @@ async def test_cancel_while_suspended_on_the_source_stops_the_utterance() -> Non
 
     synth = FakeSynthesizer()
     transport = FakeTransport()
-    speaker = Speaker(synth, transport)
+    speaker = Speaker(synth, transport, OPENERS)
 
     utterance = asyncio.create_task(speaker.speak(gated()))
     await waiting.wait()
@@ -315,7 +316,7 @@ async def test_cancel_returns_normally_to_a_task_that_was_not_cancelled(
     loop = asyncio.get_running_loop()
     started = asyncio.Event()
     synth = HeldSynthesizer(release, started, loop)
-    speaker = Speaker(synth, FakeTransport())
+    speaker = Speaker(synth, FakeTransport(), OPENERS)
     log: list[str] = []
     cancelling: list[int] = []
 
@@ -347,7 +348,7 @@ async def test_audio_already_in_the_worker_thread_is_never_enqueued(
     finished = asyncio.Event()
     synth = SignallingSynthesizer(release, started, finished, loop)
     transport = FakeTransport()
-    speaker = Speaker(synth, transport)
+    speaker = Speaker(synth, transport, OPENERS)
 
     utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
     await started.wait()
@@ -368,7 +369,7 @@ async def test_speak_accepts_a_new_utterance_after_cancel(release: threading.Eve
     finished = asyncio.Event()
     synth = SignallingSynthesizer(release, started, finished, loop)
     transport = FakeTransport()
-    speaker = Speaker(synth, transport)
+    speaker = Speaker(synth, transport, OPENERS)
 
     utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
     await started.wait()
@@ -388,7 +389,7 @@ async def test_speak_accepts_a_new_utterance_after_cancel(release: threading.Eve
 
 async def test_cancel_on_an_idle_speaker_is_a_no_op() -> None:
     transport = FakeTransport()
-    speaker = Speaker(FakeSynthesizer(), transport)
+    speaker = Speaker(FakeSynthesizer(), transport, OPENERS)
 
     await speaker.cancel()
 
@@ -409,7 +410,7 @@ async def test_the_replacement_utterance_runs_while_the_abandoned_call_is_in_fli
     finished = asyncio.Event()
     synth = OverlappingSynthesizer(release, started, finished, loop)
     transport = FakeTransport()
-    speaker = Speaker(synth, transport)
+    speaker = Speaker(synth, transport, OPENERS)
 
     utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
     await started.wait()
@@ -427,55 +428,35 @@ async def test_the_replacement_utterance_runs_while_the_abandoned_call_is_in_fli
     assert transport.flushes == 1
 
 
-async def test_warm_fills_the_cache_and_calls_the_synth_once_per_opener() -> None:
+async def test_speak_opener_plays_the_array_handed_in_for_its_key_without_the_synth() -> None:
     synth = FakeSynthesizer()
-    speaker = Speaker(synth, FakeTransport())
+    transport = FakeTransport()
+    openers = {key: np.full(index + 1, index, dtype=np.int16) for index, key in enumerate(OPENERS)}
+    speaker = Speaker(synth, transport, openers)
 
-    await speaker.warm()
+    for key in openers:
+        await speaker.speak_opener(key)
 
-    assert synth.calls == list(OPENER_PHRASES.values())
-    assert set(speaker._openers) == set(OPENER_PHRASES)
-
-
-async def test_warm_does_not_block_the_event_loop(release: threading.Event) -> None:
-    loop = asyncio.get_running_loop()
-    loop_thread = threading.get_ident()
-    started = asyncio.Event()
-    synth = HeldSynthesizer(release, started, loop)
-    speaker = Speaker(synth, FakeTransport())
-
-    warming = asyncio.create_task(speaker.warm())
-    await started.wait()
-
-    assert synth.log == ["call"]
-    assert speaker._openers == {}
-
-    release.set()
-    await warming
-
-    assert len(synth.threads) == len(OPENER_PHRASES)
-    assert all(ident != loop_thread for ident in synth.threads)
-    assert set(speaker._openers) == set(OPENER_PHRASES)
+    assert synth.calls == []
+    assert all(pcm is openers[key] for pcm, key in zip(transport.played, openers, strict=True))
 
 
 async def test_speak_opener_enqueues_the_cached_array_without_resynthesizing() -> None:
     synth = FakeSynthesizer()
     transport = FakeTransport()
-    speaker = Speaker(synth, transport)
-
-    await speaker.warm()
-    calls_after_warm = list(synth.calls)
+    speaker = Speaker(synth, transport, OPENERS)
 
     await speaker.speak_opener("thinking")
+    await speaker.speak_opener("thinking")
 
-    assert synth.calls == calls_after_warm
-    assert len(transport.played) == 1
-    np.testing.assert_array_equal(transport.played[0], speaker._openers["thinking"])
+    assert synth.calls == []
+    assert len(transport.played) == 2
+    for pcm in transport.played:
+        np.testing.assert_array_equal(pcm, OPENERS["thinking"])
 
 
 async def test_speak_opener_with_an_unknown_key_raises_key_error() -> None:
-    speaker = Speaker(FakeSynthesizer(), FakeTransport())
-    await speaker.warm()
+    speaker = Speaker(FakeSynthesizer(), FakeTransport(), OPENERS)
 
     with pytest.raises(KeyError):
         await speaker.speak_opener("nope")
@@ -488,7 +469,7 @@ def tutor_speech_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRe
 async def test_one_utterance_logs_a_first_audio_span_and_one_synthesize_span_per_chunk(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    speaker = Speaker(FakeSynthesizer(), FakeTransport())
+    speaker = Speaker(FakeSynthesizer(), FakeTransport(), OPENERS)
 
     with caplog.at_level(logging.DEBUG, logger="tutor.speech"):
         await speaker.speak(source(TIMING_CHUNKS))
@@ -512,7 +493,7 @@ async def test_one_utterance_logs_a_first_audio_span_and_one_synthesize_span_per
 
 
 async def test_no_span_carries_the_spoken_text(caplog: pytest.LogCaptureFixture) -> None:
-    speaker = Speaker(FakeSynthesizer(), FakeTransport())
+    speaker = Speaker(FakeSynthesizer(), FakeTransport(), OPENERS)
 
     with caplog.at_level(logging.DEBUG, logger="tutor.speech"):
         await speaker.speak(source(TIMING_CHUNKS))
@@ -524,7 +505,7 @@ async def test_no_span_carries_the_spoken_text(caplog: pytest.LogCaptureFixture)
 
 
 async def test_an_empty_source_logs_no_spans(caplog: pytest.LogCaptureFixture) -> None:
-    speaker = Speaker(FakeSynthesizer(), FakeTransport())
+    speaker = Speaker(FakeSynthesizer(), FakeTransport(), OPENERS)
 
     with caplog.at_level(logging.DEBUG, logger="tutor.speech"):
         await speaker.speak(source([]))
@@ -535,15 +516,12 @@ async def test_an_empty_source_logs_no_spans(caplog: pytest.LogCaptureFixture) -
 async def test_speak_opener_logs_one_opener_span_without_the_phrase_or_key(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    speaker = Speaker(FakeSynthesizer(), FakeTransport())
+    speaker = Speaker(FakeSynthesizer(), FakeTransport(), OPENERS)
 
     with caplog.at_level(logging.DEBUG, logger="tutor.speech"):
-        await speaker.warm()
-        warm_records = tutor_speech_records(caplog)
         await speaker.speak_opener("thinking")
-        opener_records = tutor_speech_records(caplog)[len(warm_records) :]
 
-    assert warm_records == []
+    opener_records = tutor_speech_records(caplog)
     assert len(opener_records) == 1
 
     message = opener_records[0].getMessage()
@@ -559,7 +537,7 @@ async def test_cancel_before_first_audio_logs_no_first_audio_span(
     loop = asyncio.get_running_loop()
     started = asyncio.Event()
     synth = HeldSynthesizer(release, started, loop)
-    speaker = Speaker(synth, FakeTransport())
+    speaker = Speaker(synth, FakeTransport(), OPENERS)
 
     with caplog.at_level(logging.DEBUG, logger="tutor.speech"):
         utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))

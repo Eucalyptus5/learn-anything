@@ -14,6 +14,7 @@ def load_whisper(model_dir: Path, cpu_threads: int = FINAL_CPU_THREADS) -> Whisp
         compute_type="int8",
         download_root=str(model_dir),
         cpu_threads=cpu_threads,
+        local_files_only=True,
     )
 
 
