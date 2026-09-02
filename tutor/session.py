@@ -4,12 +4,14 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
 
 from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.input_path import EndOfTurn, InputPath, PartialTranscript, SpeechStarted
 from tutor.lead_in import lead_in_sentence, lead_in_stages, opener_key
+from tutor.pedagogy import PedagogyState, TurnOutcome, parse_outcome
 from tutor.prompt import (
     SEARCH_CODE_TOOL,
     Message,
@@ -33,6 +35,13 @@ SEARCH_CODE = "search_code"
 OPENER = "thinking"
 SPOKEN_DEPTH = 32
 BAD_ARGUMENTS = "search_code takes a query string and a non-empty list of glob strings"
+OUTCOME_MARKER = "<outcome>"
+OUTCOME_INSTRUCTION = (
+    f"End every reply with a line holding exactly {OUTCOME_MARKER} followed by one JSON object "
+    'with "signal" (one of covered, follow_up, correct, misconception, or null) and '
+    '"settling_positions" (a list of objects with "path" and "line") naming where a '
+    "misconception is settled. Nothing after the marker is spoken."
+)
 
 
 def _elapsed_ms(start: float, now: float) -> int:
@@ -79,6 +88,33 @@ async def _queued(queue: asyncio.Queue[str | None]) -> AsyncIterator[str]:
         yield text
 
 
+class OutcomeSplitter:
+    def __init__(self) -> None:
+        self._held = ""
+        self._tail: str | None = None
+
+    def feed(self, delta: str) -> str:
+        if self._tail is not None:
+            self._tail += delta
+            return ""
+        text = self._held + delta
+        at = text.find(OUTCOME_MARKER)
+        if at >= 0:
+            self._held = ""
+            self._tail = text[at + len(OUTCOME_MARKER) :]
+            return text[:at]
+        prefixes = range(1, len(OUTCOME_MARKER))
+        held = max((n for n in prefixes if text.endswith(OUTCOME_MARKER[:n])), default=0)
+        self._held = text[len(text) - held :]
+        return text[: len(text) - held]
+
+    def finish(self) -> tuple[str, TurnOutcome]:
+        if self._tail is None:
+            held, self._held = self._held, ""
+            return held, TurnOutcome()
+        return "", parse_outcome(self._tail.strip())
+
+
 class TurnLoopConfig(BaseModel):
     system: str
     subject: str
@@ -93,7 +129,7 @@ class Speculation:
         self.text = text
         self.claimed = False
         self.grounded: asyncio.Future[Grounded] = asyncio.get_running_loop().create_future()
-        self.task: asyncio.Task[None]
+        self.task: asyncio.Task[TurnOutcome]
 
     def live(self) -> bool:
         if not self.task.done():
@@ -123,8 +159,9 @@ class TurnLoop:
         self._registry = registry
         self._clock = clock
         self._pace = pace
+        self._pedagogy = PedagogyState()
         self._turns: set[asyncio.Task[None]] = set()
-        self._drains: dict[str, asyncio.Task[None]] = {}
+        self._drains: dict[str, asyncio.Task[TurnOutcome]] = {}
         self._pumps: dict[str, asyncio.Task[None]] = {}
         self._stagers: dict[str, asyncio.Task[None]] = {}
         self._speculations: dict[str, Speculation] = {}
@@ -202,14 +239,14 @@ class TurnLoop:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _speculate(
-        self, turn_id: str, speculation: Speculation, previous: asyncio.Task[None] | None
-    ) -> None:
+        self, turn_id: str, speculation: Speculation, previous: asyncio.Task[TurnOutcome] | None
+    ) -> TurnOutcome:
         if previous is not None:
             await asyncio.gather(previous, return_exceptions=True)
         start = self._clock()
         self._registry.open_turn(turn_id)
         try:
-            globs = await derive_globs(speculation.text, self._cfg.root)
+            globs = await self._globs(speculation.text)
             result = await self._search(speculation.text, globs, self._cfg.root, self._cfg.budget)
             self._registry.record(turn_id, result)
             logger.info(
@@ -218,7 +255,7 @@ class TurnLoop:
             prompt = self._prompt(result, speculation.text)
             queue: asyncio.Queue[str | None] = asyncio.Queue(SPOKEN_DEPTH)
             speculation.grounded.set_result((result, prompt, queue))
-            await self._drain(turn_id, prompt, queue)
+            return await self._drain(turn_id, prompt, queue)
         except asyncio.CancelledError:
             if not speculation.claimed:
                 self._registry.abandon(turn_id)
@@ -248,12 +285,18 @@ class TurnLoop:
         self._registry.open_turn(turn_id)
         return None
 
+    async def _globs(self, user_text: str) -> list[str]:
+        settled = list(dict.fromkeys(p.path for p in self._pedagogy.settling_positions))
+        if settled:
+            return settled
+        return await derive_globs(user_text, self._cfg.root)
+
     def _prompt(self, result: SearchResult, user_text: str) -> TurnPrompt:
-        return TurnPrompt(
-            system=f"{self._cfg.system}\n\nSubject: {self._cfg.subject}",
-            tool_context=[result],
-            user_text=user_text,
+        system = (
+            f"{self._cfg.system}\n\nSubject: {self._cfg.subject}\n\n"
+            f"{self._pedagogy.prompt_directive()}\n\n{OUTCOME_INSTRUCTION}"
         )
+        return TurnPrompt(system=system, tool_context=[result], user_text=user_text)
 
     async def _turn(self, turn_id: str, user_text: str) -> None:
         start = self._clock()
@@ -262,7 +305,7 @@ class TurnLoop:
             await self._speaker.speak_opener(OPENER)
             queue: asyncio.Queue[str | None] | None = None
             if grounded is None:
-                globs = await derive_globs(user_text, self._cfg.root)
+                globs = await self._globs(user_text)
                 result = await self._search(user_text, globs, self._cfg.root, self._cfg.budget)
                 self._registry.record(turn_id, result)
                 logger.info(
@@ -275,7 +318,7 @@ class TurnLoop:
                 result, prompt, queue = await asyncio.shield(grounded)
             await self._speaker.speak_opener(opener_key([result]))
             await self._speaker.speak(self._utterance(turn_id, result, prompt, queue))
-            await self._report_drain(turn_id)
+            outcome = await self._report_drain(turn_id)
         except asyncio.CancelledError:
             # The drain has to stop before the id is cleared, or a late record() finds no turn.
             await self._stop_turn(turn_id)
@@ -284,24 +327,28 @@ class TurnLoop:
         finally:
             await self._stop_turn(turn_id)
         logger.info("turn.spoken turn_id=%s ms=%d", turn_id, _elapsed_ms(start, self._clock()))
+        phase = self._pedagogy.advance(outcome)
+        logger.info("turn.outcome turn_id=%s signal=%s phase=%s", turn_id, outcome.signal, phase)
 
-    async def _report_drain(self, turn_id: str) -> None:
+    async def _report_drain(self, turn_id: str) -> TurnOutcome:
         drain = self._drains.get(turn_id)
         if drain is None:
-            return
+            return TurnOutcome()
         if not drain.done():
             await asyncio.gather(drain, return_exceptions=True)
         del self._drains[turn_id]
         error = drain.exception()
         if error is not None:
             logger.error("turn.reasoning_failed turn_id=%s error=%s", turn_id, type(error).__name__)
+            return TurnOutcome()
+        return drain.result()
 
     async def _stop_turn(self, turn_id: str) -> None:
         await self._stop(self._pumps, turn_id)
         await self._stop(self._stagers, turn_id)
         await self._stop(self._drains, turn_id)
 
-    async def _stop(self, tasks: dict[str, asyncio.Task[None]], turn_id: str) -> None:
+    async def _stop(self, tasks: dict[str, asyncio.Task[Any]], turn_id: str) -> None:
         task = tasks.pop(turn_id, None)
         if task is None or task.done():
             return
@@ -401,20 +448,26 @@ class TurnLoop:
 
     async def _drain(
         self, turn_id: str, prompt: TurnPrompt, queue: asyncio.Queue[str | None]
-    ) -> None:
+    ) -> TurnOutcome:
         try:
             calls: list[TurnChunk] = []
+            splitter = OutcomeSplitter()
             async for chunk in self._reasoning.start_turn(prompt, tools=[SEARCH_CODE_TOOL]):
                 if chunk.kind == "spoken":
-                    await queue.put(chunk.text)
+                    text = splitter.feed(chunk.text)
+                    if text:
+                        await queue.put(text)
                 elif chunk.kind == "tool_call":
                     calls.append(chunk)
+            text, outcome = splitter.finish()
+            if text:
+                await queue.put(text)
             answerable = [call for call in calls if call.tool_call_id and call.tool_name]
             if len(answerable) != len(calls):
                 logger.warning("turn.tool_call_incomplete turn_id=%s", turn_id)
             if answerable:
                 await queue.put("\n")
-                await self._follow_up(turn_id, prompt, answerable, queue)
+                outcome = await self._follow_up(turn_id, prompt, answerable, queue)
         except BaseException:
             # Nothing consumes the queue once the turn unwinds, so the sentinel takes a slot
             # instead of waiting for one.
@@ -423,6 +476,7 @@ class TurnLoop:
             queue.put_nowait(None)
             raise
         await queue.put(None)
+        return outcome
 
     async def _follow_up(
         self,
@@ -430,16 +484,23 @@ class TurnLoop:
         prompt: TurnPrompt,
         calls: list[TurnChunk],
         queue: asyncio.Queue[str | None],
-    ) -> None:
+    ) -> TurnOutcome:
         exchange = [_assistant_calls(calls)]
         for call in calls:
             answer = await self._answer(turn_id, call)
             exchange.append(Message(role="tool", content=answer, tool_call_id=call.tool_call_id))
+        splitter = OutcomeSplitter()
         follow_up = prompt.model_copy(update={"tool_exchange": exchange})
         # The follow-up carries no tools, so the model cannot open a round this loop will not serve.
         async for chunk in self._reasoning.start_turn(follow_up):
             if chunk.kind == "spoken":
-                await queue.put(chunk.text)
+                text = splitter.feed(chunk.text)
+                if text:
+                    await queue.put(text)
+        text, outcome = splitter.finish()
+        if text:
+            await queue.put(text)
+        return outcome
 
     async def _answer(self, turn_id: str, call: TurnChunk) -> str:
         if call.tool_name != SEARCH_CODE:

@@ -24,9 +24,18 @@ from tutor.input_path import (
     SpeechStarted,
 )
 from tutor.lead_in import lead_in_sentence, lead_in_stages, opener_key
+from tutor.pedagogy import PedagogyState, Phase, TurnOutcome
 from tutor.prompt import SEARCH_CODE_TOOL, TurnPrompt
 from tutor.reasoning import TurnChunk
-from tutor.session import BAD_ARGUMENTS, OPENER, SPOKEN_DEPTH, TurnLoop, TurnLoopConfig
+from tutor.session import (
+    BAD_ARGUMENTS,
+    OPENER,
+    OUTCOME_MARKER,
+    SPOKEN_DEPTH,
+    OutcomeSplitter,
+    TurnLoop,
+    TurnLoopConfig,
+)
 from tutor.tools.models import (
     GroundingVerdict,
     Position,
@@ -116,6 +125,27 @@ FIRST_CLAUSE_DELTA = "It lives in the reader, "
 FILLER_DELTA = "and "
 # One delta reaches the chunker, SPOKEN_DEPTH sit in the queue, and the next put blocks.
 QUEUE_FULL_DELTAS = SPOKEN_DEPTH + 2
+TEACH_DIRECTIVE = PedagogyState(Phase.TEACH).prompt_directive()
+EXPLORE_DIRECTIVE = PedagogyState(Phase.EXPLORE).prompt_directive()
+REVERSE_FEYNMAN_DIRECTIVE = PedagogyState(Phase.REVERSE_FEYNMAN).prompt_directive()
+SETTLING_PATHS = [GROUNDED_PATH, SECOND_PATH]
+COVERED_OUTCOME = OUTCOME_MARKER + json.dumps({"signal": "covered", "settling_positions": []})
+MISCONCEPTION_OUTCOME = OUTCOME_MARKER + json.dumps(
+    {
+        "signal": "misconception",
+        "settling_positions": [
+            {"path": GROUNDED_PATH, "line": 24},
+            {"path": SECOND_PATH, "line": 41},
+        ],
+    }
+)
+MALFORMED_OUTCOME = OUTCOME_MARKER + "not json at all"
+SPLIT_OUTCOME_DELTAS = [
+    *SPOKEN_DELTAS[:3],
+    "the track.<ou",
+    'tcome>{"signal": ',
+    '"covered", "settling_positions": []}',
+]
 GROUNDING_SPAN = re.compile(r"^turn\.grounding turn_id=\S+ ms=250$")
 SPOKEN_SPAN = re.compile(r"^turn\.spoken turn_id=\S+ ms=500$")
 
@@ -206,6 +236,17 @@ class ScriptedSource:
                 await item.wait()
             else:
                 yield item
+
+
+class SerialSource:
+    def __init__(self, texts: list[str]) -> None:
+        self._texts = texts
+
+    async def events(self) -> AsyncIterator[InputEvent]:
+        for n, text in enumerate(self._texts, start=1):
+            yield EndOfTurn(text=text)
+            turns = [task for task in asyncio.all_tasks() if task.get_name() == f"turn-{n}"]
+            await asyncio.wait(turns)
 
 
 class RecordingSource:
@@ -407,6 +448,7 @@ class FakeReasoning:
         fails: str | None = None,
         holds_at: int = 0,
         close_gate: asyncio.Event | None = None,
+        turns: list[list[TurnChunk]] | None = None,
     ) -> None:
         self._log = log
         self._chunks = chunks
@@ -416,6 +458,7 @@ class FakeReasoning:
         self._fails = fails
         self._holds_at = holds_at
         self._close_gate = close_gate
+        self._turns = deque(turns) if turns is not None else deque()
         self.prompts: list[TurnPrompt] = []
         self.tools: list[list[dict] | None] = []
         self.streams: list[FakeStream] = []
@@ -428,8 +471,14 @@ class FakeReasoning:
         if prompt.user_text == self._fails:
             raise RateLimited(RATE_LIMIT_DETAIL)
         answering = bool(prompt.tool_exchange)
+        if answering:
+            chunks = self._follow_up
+        elif self._turns:
+            chunks = self._turns.popleft()
+        else:
+            chunks = self._chunks
         stream = FakeStream(
-            self._follow_up if answering else self._chunks,
+            chunks,
             self._log,
             self._received,
             None if answering else self._gate,
@@ -493,6 +542,14 @@ class PacedTrack(MediaStreamTrack):
 
 def session_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [record.getMessage() for record in caplog.records if record.name == "tutor.session"]
+
+
+def outcome_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [message for message in session_messages(caplog) if message.startswith("turn.outcome")]
+
+
+def spoken_chunks(deltas: list[str]) -> list[TurnChunk]:
+    return [TurnChunk(kind="spoken", text=delta) for delta in deltas]
 
 
 async def test_grounding_lands_before_the_reasoning_call(
@@ -2523,3 +2580,381 @@ async def test_a_claimed_speculation_that_fails_fails_the_turn(
     captured = [record.getMessage() for record in caplog.records]
     assert all(PARTIAL_TEXT not in message for message in captured)
     await loop.aclose()
+
+
+async def test_the_prompt_carries_the_directive_for_the_current_phase(tmp_path: Path) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    system = reasoning.prompts[0].system
+    assert SYSTEM in system
+    assert SUBJECT in system
+    assert TEACH_DIRECTIVE in system
+    assert OUTCOME_MARKER in system
+    assert EXPLORE_DIRECTIVE not in system
+    assert REVERSE_FEYNMAN_DIRECTIVE not in system
+    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
+    await loop.aclose()
+
+
+async def test_a_misconception_in_reverse_feynman_scopes_the_next_turn_to_where_it_settles(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    turns = [
+        spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME]),
+        spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME]),
+        spoken_chunks([*SPOKEN_DELTAS, MISCONCEPTION_OUTCOME]),
+        spoken_chunks(SPOKEN_DELTAS),
+    ]
+    reasoning = FakeReasoning(log, [], speaker.received, turns=turns)
+    source = SerialSource([USER_TEXT] * 4)
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    systems = [prompt.system for prompt in reasoning.prompts]
+    assert len(systems) == 4
+    assert TEACH_DIRECTIVE in systems[0]
+    assert EXPLORE_DIRECTIVE in systems[1]
+    assert REVERSE_FEYNMAN_DIRECTIVE in systems[2]
+    assert EXPLORE_DIRECTIVE in systems[3]
+    assert REVERSE_FEYNMAN_DIRECTIVE not in systems[3]
+    assert all(SECOND_PATH not in system for system in systems)
+    assert [call[1] for call in search.calls] == [GLOBS, GLOBS, GLOBS, SETTLING_PATHS]
+    assert outcome_lines(caplog) == [
+        "turn.outcome turn_id=turn-1 signal=covered phase=explore",
+        "turn.outcome turn_id=turn-2 signal=covered phase=reverse_feynman",
+        "turn.outcome turn_id=turn-3 signal=misconception phase=explore",
+        "turn.outcome turn_id=turn-4 signal=None phase=explore",
+    ]
+    lead_in = lead_in_sentence([result])
+    assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]] * 4
+    spoken = [str(text) for name, text in log if name == "speak"]
+    assert all(OUTCOME_MARKER not in text for text in spoken)
+    assert all("signal" not in text and "{" not in text for text in spoken)
+    await loop.aclose()
+
+
+async def test_a_marker_split_across_deltas_is_still_stripped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    reasoning = FakeReasoning(log, spoken_chunks(SPLIT_OUTCOME_DELTAS), speaker.received)
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    registry = RecordingRegistry(log)
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        registry,
+        FakeClock(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
+    assert outcome_lines(caplog) == ["turn.outcome turn_id=turn-1 signal=covered phase=explore"]
+    verified = [text for _, text, _ in registry.verified]
+    assert verified
+    assert all("<" not in text and "{" not in text and "signal" not in text for text in verified)
+    await loop.aclose()
+
+
+async def test_a_malformed_outcome_holds_the_phase_and_finishes_the_turn(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    turns = [spoken_chunks([*SPOKEN_DELTAS, MALFORMED_OUTCOME]), spoken_chunks(SPOKEN_DELTAS)]
+    reasoning = FakeReasoning(log, [], speaker.received, turns=turns)
+    source = SerialSource([USER_TEXT, USER_TEXT])
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    spoken = [message for message in spoken_spans(caplog) if "turn_id=turn-1 " in message]
+    assert len(spoken) == 1
+    assert "turn.failed turn_id=turn-1" not in "\n".join(session_messages(caplog))
+    lead_in = lead_in_sentence([result])
+    assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]] * 2
+    assert all("not json" not in str(text) for name, text in log if name == "speak")
+    assert outcome_lines(caplog) == [
+        "turn.outcome turn_id=turn-1 signal=None phase=teach",
+        "turn.outcome turn_id=turn-2 signal=None phase=teach",
+    ]
+    assert TEACH_DIRECTIVE in reasoning.prompts[1].system
+    await loop.aclose()
+
+
+async def test_a_reply_without_a_marker_speaks_everything_and_holds_the_phase(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    source = SerialSource([USER_TEXT, USER_TEXT])
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    lead_in = lead_in_sentence([result])
+    assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]] * 2
+    assert outcome_lines(caplog) == [
+        "turn.outcome turn_id=turn-1 signal=None phase=teach",
+        "turn.outcome turn_id=turn-2 signal=None phase=teach",
+    ]
+    assert [TEACH_DIRECTIVE in prompt.system for prompt in reasoning.prompts] == [True, True]
+    await loop.aclose()
+
+
+async def test_a_barge_in_leaves_the_phase_where_it_was(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold)
+    search = FakeSearch(log, result)
+    gate = asyncio.Event()
+    deltas = spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME])
+    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate, holds_at=3)
+    barge = asyncio.Event()
+    resume = asyncio.Event()
+    source = ScriptedSource(
+        [EndOfTurn(text=USER_TEXT), barge, SpeechStarted(), resume, EndOfTurn(text=SECOND_TEXT)]
+    )
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+    lead_in = lead_in_sentence([result])
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+
+        await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+        await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+        await asyncio.wait_for(speaker.held.wait(), HANG_GUARD_S)
+        turn = turn_task()
+
+        await pull_past(source, barge)
+        gate.set()
+        hold.set()
+        await asyncio.wait_for(asyncio.wait([turn]), HANG_GUARD_S)
+        assert turn.cancelled()
+        assert outcome_lines(caplog) == []
+
+        resume.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert outcome_lines(caplog) == ["turn.outcome turn_id=turn-2 signal=covered phase=explore"]
+    assert [TEACH_DIRECTIVE in prompt.system for prompt in reasoning.prompts] == [True, True]
+    assert speaker.utterances == [[lead_in, SPOKEN_CLAUSES[0]], [lead_in, *SPOKEN_CLAUSES]]
+    await loop.aclose()
+
+
+async def test_a_discarded_speculation_never_advances_the_phase(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    close_gate = asyncio.Event()
+    speculative_deltas = [*SPOKEN_DELTAS, COVERED_OUTCOME]
+    turns = [
+        spoken_chunks(speculative_deltas),
+        spoken_chunks(SPOKEN_DELTAS),
+        spoken_chunks(SPOKEN_DELTAS),
+    ]
+    reasoning = FakeReasoning(log, [], speaker.received, close_gate=close_gate, turns=turns)
+    endpoint = asyncio.Event()
+    source = ScriptedSource(
+        [
+            PartialTranscript(text=PARTIAL_TEXT),
+            endpoint,
+            EndOfTurn(text=SECOND_TEXT),
+            speaker.finished,
+            EndOfTurn(text=USER_TEXT),
+        ]
+    )
+    loop = TurnLoop(
+        speculative(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+
+        await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+        await asyncio.wait_for(reasoning.streams[0].closing.wait(), HANG_GUARD_S)
+        speculation = speculation_task()
+        assert ("stream_closed", len(speculative_deltas)) in log
+
+        await pull_past(source, endpoint)
+        await asyncio.wait_for(asyncio.wait([speculation]), HANG_GUARD_S)
+        assert speculation.cancelled()
+        close_gate.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert ("stream_released", len(speculative_deltas)) not in log
+    assert [entry for entry in log if entry[0] == "start_turn"] == [
+        ("start_turn", PARTIAL_TEXT),
+        ("start_turn", SECOND_TEXT),
+        ("start_turn", USER_TEXT),
+    ]
+    assert outcome_lines(caplog) == [
+        "turn.outcome turn_id=turn-1 signal=None phase=teach",
+        "turn.outcome turn_id=turn-2 signal=None phase=teach",
+    ]
+    assert [TEACH_DIRECTIVE in prompt.system for prompt in reasoning.prompts] == [True] * 3
+    lead_in = lead_in_sentence([result])
+    assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]] * 2
+    await loop.aclose()
+
+
+async def test_a_misconception_in_the_follow_up_is_the_turns_outcome(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    call = TurnChunk(
+        kind="tool_call",
+        text=SEARCH_ARGUMENTS,
+        tool_call_id=SEARCH_CALL_ID,
+        tool_name="search_code",
+    )
+    turns = [
+        spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME]),
+        spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME]),
+        [call],
+        spoken_chunks(SPOKEN_DELTAS),
+    ]
+    follow_up = spoken_chunks([*SPOKEN_DELTAS, MISCONCEPTION_OUTCOME])
+    reasoning = FakeReasoning(log, [], speaker.received, follow_up=follow_up, turns=turns)
+    source = SerialSource([USER_TEXT] * 4)
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert [call[1] for call in search.calls] == [GLOBS, GLOBS, GLOBS, MODEL_GLOBS, SETTLING_PATHS]
+    assert reasoning.tools == [
+        [SEARCH_CODE_TOOL],
+        [SEARCH_CODE_TOOL],
+        [SEARCH_CODE_TOOL],
+        None,
+        [SEARCH_CODE_TOOL],
+    ]
+    assert outcome_lines(caplog) == [
+        "turn.outcome turn_id=turn-1 signal=covered phase=explore",
+        "turn.outcome turn_id=turn-2 signal=covered phase=reverse_feynman",
+        "turn.outcome turn_id=turn-3 signal=misconception phase=explore",
+        "turn.outcome turn_id=turn-4 signal=None phase=explore",
+    ]
+    assert EXPLORE_DIRECTIVE in reasoning.prompts[4].system
+    lead_in = lead_in_sentence([result])
+    assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]] * 4
+    spoken = [str(text) for name, text in log if name == "speak"]
+    assert all(OUTCOME_MARKER not in text and "{" not in text for text in spoken)
+    await loop.aclose()
+
+
+def test_the_splitter_releases_a_held_prefix_that_is_not_the_marker() -> None:
+    splitter = OutcomeSplitter()
+    assert splitter.feed("the reader <") == "the reader "
+    assert splitter.feed("3 drains <ou") == "<3 drains "
+    assert splitter.feed("r track.") == "<our track."
+    assert splitter.feed("done <outc") == "done "
+    assert splitter.finish() == ("<outc", TurnOutcome())
+
+
+def test_the_splitter_holds_everything_after_the_marker() -> None:
+    splitter = OutcomeSplitter()
+    assert splitter.feed('the track.<outcome>{"signal": ') == "the track."
+    assert splitter.feed('"correct", "settling_positions": []}\n') == ""
+    text, outcome = splitter.finish()
+    assert text == ""
+    assert outcome == TurnOutcome(signal="correct")
