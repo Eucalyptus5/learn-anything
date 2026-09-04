@@ -5,16 +5,39 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from tests.fakes import FakeConnection
+from tutor.tools.models import SearchMatch, SearchResult
+from tutor.tools.provenance import TurnRegistry
 from tutor.visuals import (
     AppPush,
     DiagramClear,
     DiagramPush,
     SourceHighlight,
+    UngroundedVisual,
     VisualChannel,
     VisualPayload,
 )
 
 _adapter = TypeAdapter(VisualPayload)
+
+
+def _search_result(path: str, lines: list[int]) -> SearchResult:
+    return SearchResult(
+        tool="search_code",
+        query="q",
+        globs=["**/*.py"],
+        matches=[SearchMatch(path=path, line=line, text="x") for line in lines],
+        truncated=False,
+        oversized=False,
+        byte_count=1,
+    )
+
+
+def _grounded_registry(turn_id: str, path: str, lines: list[int]) -> TurnRegistry:
+    registry = TurnRegistry()
+    registry.open_turn(turn_id)
+    registry.record(turn_id, _search_result(path, lines))
+    return registry
+
 
 _VALID_SHAPES = [
     {"type": "diagram.push", "id": "d1", "kind": "flowchart", "source": "graph TD; A-->B"},
@@ -116,6 +139,7 @@ async def test_seq_increases_by_one_per_push() -> None:
 async def test_push_order_is_preserved_on_the_wire() -> None:
     connection = FakeConnection()
     channel = VisualChannel(connection)
+    channel.set_grounding(_grounded_registry("t1", "src/pool.py", [3, 4, 5, 6, 7, 8, 9]), "t1")
     payloads: list[VisualPayload] = [
         DiagramPush(id="d1", kind="flowchart", source="graph TD; A-->B"),
         SourceHighlight(path="src/pool.py", start_line=3, end_line=9),
@@ -135,6 +159,7 @@ async def test_push_order_is_preserved_on_the_wire() -> None:
 async def test_payload_json_is_plain_types() -> None:
     connection = FakeConnection()
     channel = VisualChannel(connection)
+    channel.set_grounding(_grounded_registry("t1", "src/pool.py", [3, 4, 5, 6, 7, 8, 9]), "t1")
 
     await channel.push(DiagramPush(id="d1", kind="flowchart", source="graph TD; A-->B"))
     await channel.push(SourceHighlight(path="src/pool.py", start_line=3, end_line=9))
@@ -152,3 +177,197 @@ async def test_cancelling_a_push_reraises() -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await channel.push(DiagramClear())
+
+
+async def test_ungrounded_highlight_raises() -> None:
+    connection = FakeConnection()
+    channel = VisualChannel(connection)
+    registry = _grounded_registry("t1", "src/pool.py", [3, 4, 5, 6, 7, 8, 9])
+    channel.set_grounding(registry, "t1")
+
+    with pytest.raises(UngroundedVisual):
+        await channel.push(SourceHighlight(path="src/other.py", start_line=3, end_line=3))
+    assert connection.sent == []
+
+    fresh_channel = VisualChannel(connection)
+    with pytest.raises(UngroundedVisual):
+        await fresh_channel.push(SourceHighlight(path="src/pool.py", start_line=3, end_line=9))
+    assert connection.sent == []
+
+
+async def test_grounded_highlight_is_sent() -> None:
+    connection = FakeConnection()
+    channel = VisualChannel(connection)
+    registry = _grounded_registry("t1", "src/pool.py", [3, 4, 5, 6, 7, 8, 9])
+    channel.set_grounding(registry, "t1")
+
+    await channel.push(SourceHighlight(path="src/pool.py", start_line=3, end_line=9))
+
+    assert connection.sent == [
+        {
+            "type": "source.highlight",
+            "path": "src/pool.py",
+            "start_line": 3,
+            "end_line": 9,
+            "seq": 1,
+        }
+    ]
+
+    await channel.push(SourceHighlight(path="./src/pool.py", start_line=3, end_line=9))
+
+    assert connection.sent[1] == {
+        "type": "source.highlight",
+        "path": "./src/pool.py",
+        "start_line": 3,
+        "end_line": 9,
+        "seq": 2,
+    }
+
+
+async def test_grounding_is_cleared_between_turns() -> None:
+    connection = FakeConnection()
+    channel = VisualChannel(connection)
+    registry = _grounded_registry("t1", "src/pool.py", [3, 4, 5, 6, 7, 8, 9])
+    channel.set_grounding(registry, "t1")
+
+    registry.open_turn("t2")
+    channel.set_grounding(registry, "t2")
+
+    with pytest.raises(UngroundedVisual):
+        await channel.push(SourceHighlight(path="src/pool.py", start_line=3, end_line=9))
+    assert connection.sent == []
+
+    other_channel = VisualChannel(connection)
+    other_channel.set_grounding(registry, "t1")
+    registry.open_turn("t2")
+    registry.record("t2", _search_result("src/pool.py", [3, 4, 5, 6, 7, 8, 9]))
+
+    with pytest.raises(UngroundedVisual):
+        await other_channel.push(SourceHighlight(path="src/pool.py", start_line=3, end_line=9))
+    assert connection.sent == []
+
+
+async def test_every_highlighted_line_must_be_known_to_the_turn() -> None:
+    connection = FakeConnection()
+    channel = VisualChannel(connection)
+    registry = _grounded_registry("t1", "src/pool.py", [3, 4, 6])
+    channel.set_grounding(registry, "t1")
+
+    await channel.push(SourceHighlight(path="src/pool.py", start_line=3, end_line=4))
+    assert connection.sent == [
+        {
+            "type": "source.highlight",
+            "path": "src/pool.py",
+            "start_line": 3,
+            "end_line": 4,
+            "seq": 1,
+        }
+    ]
+
+    with pytest.raises(UngroundedVisual) as excinfo:
+        await channel.push(SourceHighlight(path="src/pool.py", start_line=3, end_line=6))
+    assert connection.sent == [
+        {
+            "type": "source.highlight",
+            "path": "src/pool.py",
+            "start_line": 3,
+            "end_line": 4,
+            "seq": 1,
+        }
+    ]
+    assert str(excinfo.value) == "ungrounded highlight 'src/pool.py':5"
+
+
+async def test_basename_alias_grounds_a_highlight() -> None:
+    connection = FakeConnection()
+    channel = VisualChannel(connection)
+    registry = _grounded_registry("t1", "src/pool.py", [3])
+    channel.set_grounding(registry, "t1")
+
+    await channel.push(SourceHighlight(path="pool.py", start_line=3, end_line=3))
+
+    assert connection.sent == [
+        {
+            "type": "source.highlight",
+            "path": "pool.py",
+            "start_line": 3,
+            "end_line": 3,
+            "seq": 1,
+        }
+    ]
+
+
+async def test_diagram_push_ignores_the_grounding_set() -> None:
+    connection = FakeConnection()
+    channel = VisualChannel(connection)
+
+    await channel.push(DiagramPush(id="d1", kind="flowchart", source="graph TD; A-->B"))
+    await channel.push(DiagramClear())
+    await channel.push(AppPush(id="a1", html="<p>hi</p>"))
+
+    assert [body["seq"] for body in connection.sent] == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "",
+        "..",
+        "../src/pool.py",
+        "/src/pool.py",
+        "src/pool.py\n",
+        "src/pool.py\x00",
+        "././src/pool.py",
+        "SRC/pool.py",
+    ],
+    ids=[
+        "empty",
+        "dotdot",
+        "relative-escape",
+        "absolute",
+        "trailing-newline",
+        "trailing-nul",
+        "doubled-dot-slash",
+        "uppercase-dir",
+    ],
+)
+async def test_hostile_paths_never_reach_the_wire(path: str) -> None:
+    connection = FakeConnection()
+    channel = VisualChannel(connection)
+    registry = _grounded_registry("t1", "src/pool.py", [3, 4, 5, 6, 7, 8, 9])
+    channel.set_grounding(registry, "t1")
+
+    with pytest.raises(UngroundedVisual):
+        await channel.push(SourceHighlight(path=path, start_line=3, end_line=3))
+    assert connection.sent == []
+
+
+async def test_laxly_coerced_lines_are_gated_as_ints() -> None:
+    connection = FakeConnection()
+    channel = VisualChannel(connection)
+    registry = _grounded_registry("t1", "src/pool.py", [3])
+    channel.set_grounding(registry, "t1")
+
+    await channel.push(SourceHighlight(path="src/pool.py", start_line="3", end_line=3.0))
+
+    assert connection.sent == [
+        {
+            "type": "source.highlight",
+            "path": "src/pool.py",
+            "start_line": 3,
+            "end_line": 3,
+            "seq": 1,
+        }
+    ]
+
+    with pytest.raises(UngroundedVisual):
+        await channel.push(SourceHighlight(path="src/pool.py", start_line=True, end_line="3"))
+    assert connection.sent == [
+        {
+            "type": "source.highlight",
+            "path": "src/pool.py",
+            "start_line": 3,
+            "end_line": 3,
+            "seq": 1,
+        }
+    ]

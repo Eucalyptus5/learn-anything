@@ -2,6 +2,8 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from tutor.tools.models import Position
+from tutor.tools.provenance import TurnRegistry
 from tutor.transport import Connection
 
 
@@ -48,12 +50,30 @@ VisualPayload = Annotated[
 ]
 
 
+class UngroundedVisual(Exception):
+    pass
+
+
 class VisualChannel:
     def __init__(self, connection: Connection) -> None:
         self._connection = connection
         self._seq = 0
+        self._registry: TurnRegistry | None = None
+        self._turn_id = ""
+
+    def set_grounding(self, registry: TurnRegistry, turn_id: str) -> None:
+        self._registry = registry
+        self._turn_id = turn_id
 
     async def push(self, payload: VisualPayload) -> None:
+        if isinstance(payload, SourceHighlight):
+            path = payload.path.removeprefix("./")
+            for line in range(payload.start_line, payload.end_line + 1):
+                if self._registry is None:
+                    raise UngroundedVisual(f"ungrounded highlight {path!r}:{line}")
+                if not self._registry.known(self._turn_id, Position(path=path, line=line)):
+                    raise UngroundedVisual(f"ungrounded highlight {path!r}:{line}")
+
         body = payload.model_dump(mode="json")
         self._seq += 1
         body["seq"] = self._seq
