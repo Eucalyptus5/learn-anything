@@ -103,3 +103,14 @@ def numbered_frames(count: int) -> list[av.AudioFrame]:
 
 def local_peer() -> RTCPeerConnection:
     return RTCPeerConnection(RTCConfiguration(iceServers=[]))
+
+
+class FakeConnection:
+    def __init__(self) -> None:
+        self.sent: list[dict[str, object]] = []
+        self.raises: BaseException | None = None
+
+    async def send_json(self, payload: dict[str, object]) -> None:
+        if self.raises is not None:
+            raise self.raises
+        self.sent.append(payload)

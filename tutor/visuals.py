@@ -2,6 +2,8 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from tutor.transport import Connection
+
 
 class DiagramPush(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -44,3 +46,15 @@ class AppPush(BaseModel):
 VisualPayload = Annotated[
     DiagramPush | DiagramClear | SourceHighlight | AppPush, Field(discriminator="type")
 ]
+
+
+class VisualChannel:
+    def __init__(self, connection: Connection) -> None:
+        self._connection = connection
+        self._seq = 0
+
+    async def push(self, payload: VisualPayload) -> None:
+        body = payload.model_dump(mode="json")
+        self._seq += 1
+        body["seq"] = self._seq
+        await self._connection.send_json(body)

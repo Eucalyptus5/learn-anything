@@ -1,7 +1,18 @@
+import asyncio
+import json
+
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from tutor.visuals import AppPush, DiagramPush, SourceHighlight, VisualPayload
+from tests.fakes import FakeConnection
+from tutor.visuals import (
+    AppPush,
+    DiagramClear,
+    DiagramPush,
+    SourceHighlight,
+    VisualChannel,
+    VisualPayload,
+)
 
 _adapter = TypeAdapter(VisualPayload)
 
@@ -73,3 +84,71 @@ def test_oversized_source_is_rejected() -> None:
         DiagramPush(id="i" * 65, kind="sequence", source="x")
     with pytest.raises(ValidationError):
         SourceHighlight(path="p" * 4097, start_line=1, end_line=1)
+
+
+async def test_push_sends_the_serialized_payload() -> None:
+    connection = FakeConnection()
+    channel = VisualChannel(connection)
+
+    await channel.push(DiagramPush(id="d1", kind="flowchart", source="graph TD; A-->B"))
+
+    assert connection.sent == [
+        {
+            "type": "diagram.push",
+            "id": "d1",
+            "kind": "flowchart",
+            "source": "graph TD; A-->B",
+            "seq": 1,
+        }
+    ]
+
+
+async def test_seq_increases_by_one_per_push() -> None:
+    connection = FakeConnection()
+    channel = VisualChannel(connection)
+
+    for _ in range(3):
+        await channel.push(DiagramClear())
+
+    assert [body["seq"] for body in connection.sent] == [1, 2, 3]
+
+
+async def test_push_order_is_preserved_on_the_wire() -> None:
+    connection = FakeConnection()
+    channel = VisualChannel(connection)
+    payloads: list[VisualPayload] = [
+        DiagramPush(id="d1", kind="flowchart", source="graph TD; A-->B"),
+        SourceHighlight(path="src/pool.py", start_line=3, end_line=9),
+        DiagramClear(),
+        AppPush(id="a1", html="<p>hi</p>"),
+    ]
+
+    for payload in payloads:
+        await channel.push(payload)
+
+    assert connection.sent == [
+        {**payload.model_dump(mode="json"), "seq": seq}
+        for seq, payload in enumerate(payloads, start=1)
+    ]
+
+
+async def test_payload_json_is_plain_types() -> None:
+    connection = FakeConnection()
+    channel = VisualChannel(connection)
+
+    await channel.push(DiagramPush(id="d1", kind="flowchart", source="graph TD; A-->B"))
+    await channel.push(SourceHighlight(path="src/pool.py", start_line=3, end_line=9))
+
+    for body in connection.sent:
+        json.dumps(body)
+        assert isinstance(body["seq"], int)
+        assert isinstance(body["type"], str)
+
+
+async def test_cancelling_a_push_reraises() -> None:
+    connection = FakeConnection()
+    connection.raises = asyncio.CancelledError()
+    channel = VisualChannel(connection)
+
+    with pytest.raises(asyncio.CancelledError):
+        await channel.push(DiagramClear())
