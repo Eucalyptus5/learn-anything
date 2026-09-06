@@ -50,6 +50,7 @@ dist/
 
 # node (visual client)
 node_modules/
+client/vendor/
 
 # editor / os
 .DS_Store
