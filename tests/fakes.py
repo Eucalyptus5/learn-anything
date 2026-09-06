@@ -9,6 +9,8 @@ import pytest
 from aiortc import RTCConfiguration, RTCPeerConnection
 
 from tutor.constants import FRAME_SAMPLES, SAMPLE_RATE
+from tutor.tools.models import SearchMatch, SearchResult
+from tutor.tools.provenance import TurnRegistry
 
 
 class Spawned:
@@ -114,3 +116,22 @@ class FakeConnection:
         if self.raises is not None:
             raise self.raises
         self.sent.append(payload)
+
+
+def search_result(path: str, lines: list[int]) -> SearchResult:
+    return SearchResult(
+        tool="search_code",
+        query="q",
+        globs=["**/*.py"],
+        matches=[SearchMatch(path=path, line=line, text="x") for line in lines],
+        truncated=False,
+        oversized=False,
+        byte_count=1,
+    )
+
+
+def grounded_registry(turn_id: str, path: str, lines: list[int]) -> TurnRegistry:
+    registry = TurnRegistry()
+    registry.open_turn(turn_id)
+    registry.record(turn_id, search_result(path, lines))
+    return registry
