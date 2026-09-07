@@ -36,6 +36,15 @@ def create_app(
     async def script(request: web.Request) -> web.FileResponse:
         return web.FileResponse(client_root / "client.js")
 
+    async def frame(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(client_root / "frame.html")
+
+    async def visuals(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(client_root / "visuals.js")
+
+    async def vendor(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(client_root / "vendor" / "mermaid.min.js")
+
     async def offer(request: web.Request) -> web.Response:
         try:
             payload = json.loads(await request.text())
@@ -71,6 +80,9 @@ def create_app(
 
     app.router.add_get("/", index)
     app.router.add_get("/client.js", script)
+    app.router.add_get("/frame.html", frame)
+    app.router.add_get("/visuals.js", visuals)
+    app.router.add_get("/vendor/mermaid.min.js", vendor)
     app.router.add_post("/offer", offer)
     app.on_shutdown.append(_close_connections)
     return app

@@ -1,0 +1,58 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<title>tutor diagram</title>
+<style>
+  body { font: 14px ui-monospace, Menlo, monospace; margin: 0; padding: 1rem; background: #fff; }
+  #d { overflow: auto; }
+  #d svg { max-width: 100%; height: auto; }
+</style>
+
+<div id="d"></div>
+
+<script src="/vendor/mermaid.min.js"></script>
+<script type="module">
+const KINDS = new Set(["flowchart", "sequence"]);
+const d = document.getElementById("d");
+let chain = Promise.resolve();
+
+mermaid.initialize({
+  startOnLoad: false,
+  securityLevel: "strict",
+  htmlLabels: false,
+  suppressErrorRendering: true,
+});
+
+async function render(m) {
+  try {
+    const { svg } = await mermaid.render("m" + m.seq, m.source);
+    d.innerHTML = svg;
+    for (const a of d.querySelectorAll("a")) a.replaceWith(...a.childNodes);
+    return true;
+  } catch (err) {
+    d.textContent = (err instanceof Error ? err.message : String(err)).split("\n")[0];
+    return false;
+  }
+}
+
+async function clear() {
+  d.replaceChildren();
+  return true;
+}
+
+window.addEventListener("message", (event) => {
+  if (event.origin !== new URL(location.href).origin) return;
+  const m = event.data;
+  if (typeof m !== "object" || m === null || typeof m.seq !== "number") return;
+  let step;
+  if (m.clear === true) {
+    step = clear;
+  } else if (KINDS.has(m.kind) && typeof m.source === "string") {
+    step = () => render(m);
+  } else {
+    return;
+  }
+  const { source, origin } = event;
+  chain = chain.then(step).then((ok) => source.postMessage({ seq: m.seq, ok }, origin));
+});
+</script>

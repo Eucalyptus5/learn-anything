@@ -14,6 +14,9 @@ from tutor.transport import Connection
 LOOPBACK_TIMEOUT_S = 20.0
 INDEX = "<!doctype html><title>tutor</title>"
 SCRIPT = "export const ready = true;\n"
+FRAME = "<!doctype html><title>frame</title><div id=d></div>"
+VISUALS = "export const visuals = true;\n"
+VENDOR = "globalThis.mermaid = {};\n"
 JSON_HEADERS = {"Content-Type": "application/json"}
 MALFORMED = [
     "not json at all",
@@ -31,6 +34,10 @@ MALFORMED = [
 async def client(tmp_path: Path) -> AsyncIterator[TestClient]:
     (tmp_path / "index.html").write_text(INDEX)
     (tmp_path / "client.js").write_text(SCRIPT)
+    (tmp_path / "frame.html").write_text(FRAME)
+    (tmp_path / "visuals.js").write_text(VISUALS)
+    (tmp_path / "vendor").mkdir()
+    (tmp_path / "vendor" / "mermaid.min.js").write_text(VENDOR)
     test_client = TestClient(TestServer(create_app(tmp_path)))
     await test_client.start_server()
     yield test_client
@@ -71,6 +78,35 @@ async def test_the_browser_files_are_served_from_the_client_root(client: TestCli
     assert await index.text() == INDEX
     assert script.status == 200
     assert await script.text() == SCRIPT
+
+
+async def test_the_frame_dispatcher_and_vendor_bundle_are_served(client: TestClient) -> None:
+    frame = await client.get("/frame.html")
+    visuals = await client.get("/visuals.js")
+    vendor = await client.get("/vendor/mermaid.min.js")
+
+    assert frame.status == 200
+    assert await frame.text() == FRAME
+    assert visuals.status == 200
+    assert await visuals.text() == VISUALS
+    assert vendor.status == 200
+    assert await vendor.text() == VENDOR
+
+
+async def test_a_missing_vendor_bundle_is_a_not_found_rather_than_a_crash(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "index.html").write_text(INDEX)
+    client = TestClient(TestServer(create_app(tmp_path)))
+    await client.start_server()
+    try:
+        vendor = await client.get("/vendor/mermaid.min.js")
+        index = await client.get("/")
+
+        assert vendor.status == 404
+        assert index.status == 200
+    finally:
+        await client.close()
 
 
 async def test_an_offer_is_answered_with_a_gathered_answer(client: TestClient) -> None:
