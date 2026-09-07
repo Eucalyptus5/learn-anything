@@ -1,0 +1,107 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>visual check</title>
+<style>
+  body { font: 14px ui-monospace, Menlo, monospace; margin: 2rem; max-width: 46rem; }
+  #log { white-space: pre-wrap; background: #f4f4f4; padding: .8rem; }
+  #canvas iframe { width: 100%; height: 8rem; border: 1px solid #999; }
+</style>
+
+<h2>Visual payload check</h2>
+
+<p>Runs <code>validate()</code> over good and hostile payloads, then pushes a mini app whose
+script tries to escape its sandbox and reports what each attempt threw. Load this page from the
+tutor server, not from a file URL.</p>
+
+<div id="log">starting</div>
+<div id="canvas"></div>
+
+<script type="module">
+import { validate, mount, receive } from "/visuals.js";
+
+const logEl = document.getElementById("log");
+const log = (line) => { logEl.textContent += "\n" + line; };
+
+const good = [
+  ["diagram.push flowchart", { type: "diagram.push", seq: 1, id: "a", kind: "flowchart", source: "graph TD; a-->b" }],
+  ["diagram.clear", { type: "diagram.clear", seq: 2 }],
+  ["source.highlight", { type: "source.highlight", seq: 3, path: "tutor/app.py", start_line: 1, end_line: 2 }],
+  ["app.push", { type: "app.push", seq: 4, id: "b", html: "<p>hi</p>" }],
+];
+
+const hostile = [
+  ["id of 65", { type: "app.push", seq: 5, id: "x".repeat(65), html: "" }],
+  ["source of 8001", { type: "diagram.push", seq: 5, id: "a", kind: "flowchart", source: "x".repeat(8001) }],
+  ["html of 64001", { type: "app.push", seq: 5, id: "a", html: "x".repeat(64001) }],
+  ["path of 4097", { type: "source.highlight", seq: 5, path: "x".repeat(4097), start_line: 1, end_line: 1 }],
+  ["kind pie", { type: "diagram.push", seq: 5, id: "a", kind: "pie", source: "pie" }],
+  ["start_line 0", { type: "source.highlight", seq: 5, path: "a", start_line: 0, end_line: 1 }],
+  ["end_line before start_line", { type: "source.highlight", seq: 5, path: "a", start_line: 5, end_line: 4 }],
+  ["start_line 1.5", { type: "source.highlight", seq: 5, path: "a", start_line: 1.5, end_line: 2 }],
+  ["type __proto__", { type: "__proto__", seq: 5 }],
+  ["type app.pull", { type: "app.pull", seq: 5, id: "a", html: "" }],
+  ["extra key", { type: "diagram.clear", seq: 5, extra: true }],
+  ["missing seq", { type: "diagram.clear" }],
+  ["seq 0", { type: "diagram.clear", seq: 0 }],
+  ["seq string", { type: "diagram.clear", seq: "5" }],
+  ["array payload", [] ],
+];
+
+let accepted = 0;
+let rejected = 0;
+let unexpected = 0;
+for (const [name, payload] of good) {
+  const ok = validate(payload);
+  log((ok ? "accept " : "reject ") + name);
+  if (ok) accepted += 1; else unexpected += 1;
+}
+for (const [name, payload] of hostile) {
+  const ok = validate(payload);
+  log((ok ? "accept " : "reject ") + name);
+  if (ok) unexpected += 1; else rejected += 1;
+}
+log("validate: " + accepted + " accepted, " + rejected + " rejected, " + unexpected + " unexpected");
+log(accepted === good.length && rejected === hostile.length ? "validate: ok" : "validate: FAIL");
+
+const PROBES = 5;
+const probeHtml = `<!doctype html><meta charset="utf-8"><p>probe</p><script>
+(async () => {
+  const lines = [];
+  const attempt = async (name, fn) => {
+    try { await fn(); lines.push(name + ": ESCAPED"); }
+    catch (error) { lines.push(name + ": " + error.name); }
+  };
+  await attempt("parent.document.title", () => parent.document.title);
+  await attempt("top.location.href", () => top.location.href);
+  await attempt("localStorage.getItem", () => localStorage.getItem("x"));
+  await attempt("fetch /offer", () => fetch("/offer", { method: "POST", body: "x" }));
+  await attempt("rewrite own sandbox", () => frameElement.setAttribute("sandbox", "allow-same-origin"));
+  parent.postMessage(lines, "*");
+})();
+<\/script>`;
+
+const canvas = document.getElementById("canvas");
+mount(canvas);
+receive({ type: "app.push", seq: 100, id: "probe", html: probeHtml });
+const frames = canvas.querySelectorAll("iframe");
+const appFrame = frames[frames.length - 1];
+log(
+  "app frame: sandbox=" + appFrame.getAttribute("sandbox") +
+  " allow=" + appFrame.getAttribute("allow") +
+  " referrerpolicy=" + appFrame.getAttribute("referrerpolicy") +
+  " srcdoc-length=" + appFrame.srcdoc.length
+);
+
+window.addEventListener("message", (event) => {
+  if (event.source !== appFrame.contentWindow) return;
+  if (!Array.isArray(event.data)) return;
+  let blocked = 0;
+  for (const line of event.data) {
+    log(String(line));
+    if (typeof line === "string" && !line.endsWith(": ESCAPED")) blocked += 1;
+  }
+  log(blocked === PROBES && event.data.length === PROBES
+    ? "probe: " + PROBES + " of " + PROBES + " blocked"
+    : "probe: " + blocked + " of " + PROBES + " blocked, FAIL");
+});
+</script>

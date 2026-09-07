@@ -10,7 +10,8 @@ GUARDED = [CLIENT, VISUALS, FRAME]
 
 def test_sandbox_attribute_is_exactly_allow_scripts() -> None:
     texts = {path.name: path.read_text() for path in GUARDED}
-    assert 'setAttribute("sandbox", "allow-scripts")' in texts["visuals.js"]
+    sandboxes = re.findall(r'setAttribute\("sandbox",\s*"([^"]*)"\)', texts["visuals.js"])
+    assert sandboxes == ["allow-scripts", "allow-scripts"]
     for name, text in texts.items():
         assert ".sandbox.add(" not in text, name
         assert ".sandbox =" not in text, name

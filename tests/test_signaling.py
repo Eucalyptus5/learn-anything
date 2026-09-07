@@ -1,12 +1,13 @@
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import AudioStreamTrack
+from yarl import URL
 
 from tutor.signaling import CLIENT_ROOT, CONNECTIONS, HOST, create_app
 from tutor.transport import Connection
@@ -16,8 +17,15 @@ INDEX = "<!doctype html><title>tutor</title>"
 SCRIPT = "export const ready = true;\n"
 FRAME = "<!doctype html><title>frame</title><div id=d></div>"
 VISUALS = "export const visuals = true;\n"
+VISUAL_CHECK = "<!doctype html><title>visual check</title><div id=canvas></div>"
 VENDOR = "globalThis.mermaid = {};\n"
 JSON_HEADERS = {"Content-Type": "application/json"}
+PLAIN_HEADERS = {"Content-Type": "text/plain;charset=UTF-8"}
+FOREIGN_ORIGINS = {
+    "null": lambda host: "null",
+    "foreign-host": lambda host: "http://evil.example",
+    "wrong-port": lambda host: str(host.with_port(host.port + 1)),
+}
 MALFORMED = [
     "not json at all",
     json.dumps(["v=0", "offer"]),
@@ -36,6 +44,7 @@ async def client(tmp_path: Path) -> AsyncIterator[TestClient]:
     (tmp_path / "client.js").write_text(SCRIPT)
     (tmp_path / "frame.html").write_text(FRAME)
     (tmp_path / "visuals.js").write_text(VISUALS)
+    (tmp_path / "visual_check.html").write_text(VISUAL_CHECK)
     (tmp_path / "vendor").mkdir()
     (tmp_path / "vendor" / "mermaid.min.js").write_text(VENDOR)
     test_client = TestClient(TestServer(create_app(tmp_path)))
@@ -48,15 +57,15 @@ def offering_peer() -> RTCPeerConnection:
     return RTCPeerConnection(RTCConfiguration(iceServers=[]))
 
 
-async def offer(client: TestClient, pc: RTCPeerConnection) -> dict[str, object]:
+async def offer_body(pc: RTCPeerConnection) -> str:
     pc.createDataChannel("tutor")
     pc.addTrack(AudioStreamTrack())
     await pc.setLocalDescription(await pc.createOffer())
-    response = await client.post(
-        "/offer",
-        data=json.dumps({"sdp": pc.localDescription.sdp, "type": "offer"}),
-        headers=JSON_HEADERS,
-    )
+    return json.dumps({"sdp": pc.localDescription.sdp, "type": "offer"})
+
+
+async def offer(client: TestClient, pc: RTCPeerConnection) -> dict[str, object]:
+    response = await client.post("/offer", data=await offer_body(pc), headers=JSON_HEADERS)
     assert response.status == 200
     return await response.json()
 
@@ -91,6 +100,13 @@ async def test_the_frame_dispatcher_and_vendor_bundle_are_served(client: TestCli
     assert await visuals.text() == VISUALS
     assert vendor.status == 200
     assert await vendor.text() == VENDOR
+
+
+async def test_the_visual_check_harness_is_served(client: TestClient) -> None:
+    harness = await client.get("/visual_check.html")
+
+    assert harness.status == 200
+    assert await harness.text() == VISUAL_CHECK
 
 
 async def test_a_missing_vendor_bundle_is_a_not_found_rather_than_a_crash(
@@ -144,6 +160,55 @@ async def test_a_malformed_offer_is_rejected_without_a_connection(
 
     assert response.status == 400
     assert client.app[CONNECTIONS] == set()
+
+
+@pytest.mark.parametrize("origin", FOREIGN_ORIGINS.values(), ids=FOREIGN_ORIGINS.keys())
+async def test_an_offer_from_a_foreign_origin_is_rejected(
+    tmp_path: Path, origin: Callable[[URL], str]
+) -> None:
+    (tmp_path / "index.html").write_text(INDEX)
+    handed: list[Connection] = []
+    client = TestClient(TestServer(create_app(tmp_path, on_connection=handed.append)))
+    await client.start_server()
+    pc = offering_peer()
+    try:
+        response = await client.post(
+            "/offer",
+            data=await offer_body(pc),
+            headers={**PLAIN_HEADERS, "Origin": origin(client.make_url("/").origin())},
+        )
+
+        assert response.status == 403
+        assert client.app[CONNECTIONS] == set()
+        assert handed == []
+    finally:
+        await pc.close()
+        await client.close()
+
+
+async def test_a_foreign_origin_is_rejected_before_the_body_is_read(client: TestClient) -> None:
+    response = await client.post(
+        "/offer",
+        data="not json at all",
+        headers={**PLAIN_HEADERS, "Origin": "http://evil.example"},
+    )
+
+    assert response.status == 403
+    assert client.app[CONNECTIONS] == set()
+
+
+async def test_an_offer_from_the_host_origin_is_accepted(client: TestClient) -> None:
+    pc = offering_peer()
+
+    response = await client.post(
+        "/offer",
+        data=await offer_body(pc),
+        headers={**PLAIN_HEADERS, "Origin": str(client.make_url("/").origin())},
+    )
+
+    assert response.status == 200
+    assert (await response.json())["type"] == "answer"
+    await pc.close()
 
 
 async def test_shutdown_closes_the_survivors_of_an_already_closed_connection(

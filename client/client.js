@@ -173,5 +173,6 @@ mount(document.getElementById("canvas"));
 onJson("diagram.push", receive);
 onJson("diagram.clear", receive);
 onJson("source.highlight", receive);
+onJson("app.push", receive);
 onOpen(reset);
 render();

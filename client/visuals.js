@@ -7,8 +7,10 @@ const KEYS = {
 };
 const CAPS = { id: 64, source: 8000, html: 64000, path: 4096 };
 
+let canvas = null;
 let frame = null;
 let highlight = null;
+let app = null;
 let loaded = Promise.resolve();
 let lastSeq = 0;
 
@@ -58,7 +60,8 @@ export function validate(payload) {
   }
 }
 
-export function mount(canvas) {
+export function mount(root) {
+  canvas = root;
   frame = document.createElement("iframe");
   frame.setAttribute("sandbox", "allow-scripts");
   frame.setAttribute("allow", "");
@@ -87,6 +90,15 @@ export function receive(payload) {
     case "source.highlight":
       highlight.textContent =
         payload.path + ":" + payload.start_line + "-" + payload.end_line;
+      break;
+    case "app.push":
+      if (app !== null) app.remove();
+      app = document.createElement("iframe");
+      app.setAttribute("sandbox", "allow-scripts");
+      app.setAttribute("allow", "");
+      app.setAttribute("referrerpolicy", "no-referrer");
+      app.srcdoc = payload.html;
+      canvas.append(app);
       break;
   }
 }

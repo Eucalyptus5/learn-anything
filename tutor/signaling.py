@@ -42,10 +42,17 @@ def create_app(
     async def visuals(request: web.Request) -> web.FileResponse:
         return web.FileResponse(client_root / "visuals.js")
 
+    async def visual_check(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(client_root / "visual_check.html")
+
     async def vendor(request: web.Request) -> web.FileResponse:
         return web.FileResponse(client_root / "vendor" / "mermaid.min.js")
 
     async def offer(request: web.Request) -> web.Response:
+        origin = request.headers.get("Origin")
+        if origin is not None and origin != f"{request.scheme}://{request.host}":
+            logger.warning("offer_rejected reason=origin")
+            return web.json_response({"error": "cross origin offer"}, status=403)
         try:
             payload = json.loads(await request.text())
         except json.JSONDecodeError:
@@ -82,6 +89,7 @@ def create_app(
     app.router.add_get("/client.js", script)
     app.router.add_get("/frame.html", frame)
     app.router.add_get("/visuals.js", visuals)
+    app.router.add_get("/visual_check.html", visual_check)
     app.router.add_get("/vendor/mermaid.min.js", vendor)
     app.router.add_post("/offer", offer)
     app.on_shutdown.append(_close_connections)
