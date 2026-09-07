@@ -6,6 +6,7 @@
   button { font: inherit; padding: .5rem 1rem; margin-right: .5rem; }
   #status { white-space: pre-wrap; background: #f4f4f4; padding: .8rem; }
   #canvas { margin: 1rem 0; }
+  #canvas iframe { width: 100%; height: 24rem; border: 1px solid #ccc; }
 </style>
 
 <h2>Codebase tutor</h2>
@@ -15,7 +16,8 @@ through <code>POST /offer</code>, plays whatever the tutor sends from the
 <code>&lt;audio&gt;</code> element on this page, and carries JSON both ways on a data channel
 named <code>tutor</code>. Audio and transcripts stay on this machine. The tutor peer currently
 sends digital silence, so read the packet counters and the data channel state below instead of
-listening for a voice; speak, and the microphone level should move.</p>
+listening for a voice; speak, and the microphone level should move. The canvas below shows
+the diagrams and source highlights the tutor pushes.</p>
 
 <p><button id="connect">Connect</button></p>
 

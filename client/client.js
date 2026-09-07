@@ -1,8 +1,11 @@
+import { mount, receive, reset } from "/visuals.js";
+
 const connectButton = document.getElementById("connect");
 const statusEl = document.getElementById("status");
 const audioEl = document.getElementById("tutor");
 
 const handlers = new Map();
+const openHandlers = [];
 
 const state = {
   stage: "idle",
@@ -35,6 +38,10 @@ function render() {
 
 export function onJson(type, handler) {
   handlers.set(type, handler);
+}
+
+export function onOpen(handler) {
+  openHandlers.push(handler);
 }
 
 export function sendJson(obj) {
@@ -119,6 +126,7 @@ async function connect() {
   channel = peer.createDataChannel("tutor");
   channel.addEventListener("open", () => {
     state.channel = "open";
+    openHandlers.forEach((handler) => handler());
     render();
   });
   channel.addEventListener("close", () => {
@@ -161,4 +169,9 @@ connectButton.onclick = () => {
   connect().catch((error) => release("failed: " + error));
 };
 
+mount(document.getElementById("canvas"));
+onJson("diagram.push", receive);
+onJson("diagram.clear", receive);
+onJson("source.highlight", receive);
+onOpen(reset);
 render();
