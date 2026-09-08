@@ -1,0 +1,163 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>mermaid bench</title>
+<style>
+  body { font: 14px ui-monospace, Menlo, monospace; margin: 2rem; max-width: 46rem; }
+  #log { white-space: pre-wrap; background: #f4f4f4; padding: .8rem; }
+  #canvas iframe { width: 100%; height: 24rem; border: 1px solid #999; }
+</style>
+
+<h2>Mermaid render benchmark</h2>
+
+<p>Renders a 30-node flowchart and a 30-message sequence diagram into the sandboxed frame,
+timing each round trip from <code>postMessage</code> to the frame's reply. Load this page from
+the tutor server, not from a file URL.</p>
+
+<div id="log">starting</div>
+<div id="canvas"></div>
+
+<script type="module">
+import { mount } from "/visuals.js";
+
+const WARMUPS = 3;
+const N = 30;
+
+const FLOWCHART = [
+  "flowchart TD",
+  "  n1[start] --> n2[parse args]",
+  "  n2 --> n3[load config]",
+  "  n3 --> n4{config ok}",
+  "  n4 -->|yes| n5[open mic]",
+  "  n4 -->|no| n6[report error]",
+  "  n6 --> n30[exit]",
+  "  n5 --> n7[start vad]",
+  "  n7 --> n8[start recognizer]",
+  "  n8 --> n9[start synthesizer]",
+  "  n9 --> n10[join room]",
+  "  n10 --> n11{frame arrives}",
+  "  n11 -->|speech| n12[buffer frame]",
+  "  n11 -->|silence| n13[end of turn]",
+  "  n12 --> n11",
+  "  n13 --> n14[transcribe]",
+  "  n14 --> n15[build prompt]",
+  "  n15 --> n16[call model]",
+  "  n16 --> n17{tool call}",
+  "  n17 -->|search| n18[run ripgrep]",
+  "  n17 -->|read| n19[read file]",
+  "  n17 -->|diagram| n20[push diagram]",
+  "  n17 -->|none| n21[stream text]",
+  "  n18 --> n22[ground result]",
+  "  n19 --> n22",
+  "  n20 --> n22",
+  "  n22 --> n16",
+  "  n21 --> n23[chunk sentences]",
+  "  n23 --> n24[synthesize]",
+  "  n24 --> n25[send audio]",
+  "  n25 --> n26{barge in}",
+  "  n26 -->|yes| n27[flush queue]",
+  "  n26 -->|no| n28[finish turn]",
+  "  n27 --> n29[cancel task]",
+  "  n29 --> n11",
+  "  n28 --> n11",
+].join("\n");
+
+const SEQUENCE = [
+  "sequenceDiagram",
+  "  participant Mic",
+  "  participant Vad",
+  "  participant Stt",
+  "  participant Turn",
+  "  participant Llm",
+  "  participant Tools",
+  "  participant Tts",
+  "  Mic->>Vad: frame 1",
+  "  Vad->>Turn: speech started",
+  "  Mic->>Vad: frame 2",
+  "  Vad->>Stt: speech frames",
+  "  Mic->>Vad: frame 3",
+  "  Vad->>Turn: speech ended",
+  "  Turn->>Stt: finalize",
+  "  Stt-->>Turn: transcript",
+  "  Turn->>Llm: prompt",
+  "  Llm-->>Turn: tool call search",
+  "  Turn->>Tools: search symbol",
+  "  Tools-->>Turn: matches",
+  "  Turn->>Llm: tool result",
+  "  Llm-->>Turn: tool call read",
+  "  Turn->>Tools: read file",
+  "  Tools-->>Turn: lines",
+  "  Turn->>Llm: tool result",
+  "  Llm-->>Turn: tool call diagram",
+  "  Turn->>Tools: push diagram",
+  "  Tools-->>Turn: accepted",
+  "  Turn->>Llm: tool result",
+  "  Llm-->>Turn: text chunk 1",
+  "  Turn->>Tts: sentence 1",
+  "  Tts-->>Mic: audio 1",
+  "  Llm-->>Turn: text chunk 2",
+  "  Turn->>Tts: sentence 2",
+  "  Mic->>Vad: frame 4",
+  "  Vad->>Turn: speech started",
+  "  Turn->>Tts: cancel",
+  "  Turn->>Llm: cancel",
+].join("\n");
+
+const logEl = document.getElementById("log");
+const log = (line) => {
+  logEl.textContent += "\n" + line;
+  console.log(line);
+};
+
+const canvas = document.getElementById("canvas");
+mount(canvas);
+const frame = canvas.querySelector("iframe");
+await new Promise((resolve) => frame.addEventListener("load", resolve, { once: true }));
+
+let seq = 0;
+function timed(kind, source) {
+  seq += 1;
+  const mine = seq;
+  return new Promise((resolve) => {
+    const onReply = (event) => {
+      if (event.source !== frame.contentWindow) return;
+      if (typeof event.data !== "object" || event.data === null || event.data.seq !== mine) return;
+      const elapsed = performance.now() - started;
+      window.removeEventListener("message", onReply);
+      resolve({ seq: mine, ok: event.data.ok === true, ms: elapsed });
+    };
+    window.addEventListener("message", onReply);
+    const started = performance.now();
+    frame.contentWindow.postMessage({ seq: mine, kind, source }, "*");
+  });
+}
+
+async function bench(label, kind, source) {
+  const samples = [];
+  for (let i = 0; i < WARMUPS + N; i += 1) {
+    const reply = await timed(kind, source);
+    if (!reply.ok) {
+      log("FAIL: " + kind + " seq " + reply.seq + " ok=false");
+      return false;
+    }
+    if (i >= WARMUPS) samples.push(Math.round(reply.ms));
+  }
+  samples.sort((a, b) => a - b);
+  const n = samples.length;
+  const p95 = samples[Math.max(0, Math.floor(n * 0.95) - 1)];
+  const median = n % 2 === 1
+    ? samples[(n - 1) / 2]
+    : Math.trunc((samples[n / 2 - 1] + samples[n / 2]) / 2);
+  const pad = (value) => String(value).padStart(5);
+  log(
+    "  " + label.padEnd(32) + " n=" + String(n).padStart(4) +
+    " median=" + pad(median) + "ms p95=" + pad(p95) +
+    "ms min=" + pad(samples[0]) + "ms max=" + pad(samples[n - 1]) + "ms"
+  );
+  return true;
+}
+
+log("mermaid render round trip, warmups discarded=" + WARMUPS);
+const flowchartOk = await bench("flowchart 30 nodes", "flowchart", FLOWCHART);
+const sequenceOk = flowchartOk && await bench("sequence 30 messages", "sequence", SEQUENCE);
+log(flowchartOk && sequenceOk ? "done" : "FAIL");
+</script>

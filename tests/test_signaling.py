@@ -18,6 +18,7 @@ SCRIPT = "export const ready = true;\n"
 FRAME = "<!doctype html><title>frame</title><div id=d></div>"
 VISUALS = "export const visuals = true;\n"
 VISUAL_CHECK = "<!doctype html><title>visual check</title><div id=canvas></div>"
+BENCH_MERMAID = "<!doctype html><title>mermaid bench</title><div id=canvas></div>"
 VENDOR = "globalThis.mermaid = {};\n"
 JSON_HEADERS = {"Content-Type": "application/json"}
 PLAIN_HEADERS = {"Content-Type": "text/plain;charset=UTF-8"}
@@ -45,6 +46,7 @@ async def client(tmp_path: Path) -> AsyncIterator[TestClient]:
     (tmp_path / "frame.html").write_text(FRAME)
     (tmp_path / "visuals.js").write_text(VISUALS)
     (tmp_path / "visual_check.html").write_text(VISUAL_CHECK)
+    (tmp_path / "bench_mermaid.html").write_text(BENCH_MERMAID)
     (tmp_path / "vendor").mkdir()
     (tmp_path / "vendor" / "mermaid.min.js").write_text(VENDOR)
     test_client = TestClient(TestServer(create_app(tmp_path)))
@@ -107,6 +109,13 @@ async def test_the_visual_check_harness_is_served(client: TestClient) -> None:
 
     assert harness.status == 200
     assert await harness.text() == VISUAL_CHECK
+
+
+async def test_the_mermaid_benchmark_is_served(client: TestClient) -> None:
+    harness = await client.get("/bench_mermaid.html")
+
+    assert harness.status == 200
+    assert await harness.text() == BENCH_MERMAID
 
 
 async def test_a_missing_vendor_bundle_is_a_not_found_rather_than_a_crash(
