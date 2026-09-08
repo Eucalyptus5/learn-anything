@@ -23,9 +23,13 @@ VENDOR = "globalThis.mermaid = {};\n"
 JSON_HEADERS = {"Content-Type": "application/json"}
 PLAIN_HEADERS = {"Content-Type": "text/plain;charset=UTF-8"}
 FOREIGN_ORIGINS = {
-    "null": lambda host: "null",
-    "foreign-host": lambda host: "http://evil.example",
-    "wrong-port": lambda host: str(host.with_port(host.port + 1)),
+    "null": lambda host: {"Origin": "null"},
+    "foreign-host": lambda host: {"Origin": "http://evil.example"},
+    "wrong-port": lambda host: {"Origin": str(host.with_port(host.port + 1))},
+    "rebound-host": lambda host: {
+        "Origin": f"http://evil.example:{host.port}",
+        "Host": f"evil.example:{host.port}",
+    },
 }
 MALFORMED = [
     "not json at all",
@@ -173,7 +177,7 @@ async def test_a_malformed_offer_is_rejected_without_a_connection(
 
 @pytest.mark.parametrize("origin", FOREIGN_ORIGINS.values(), ids=FOREIGN_ORIGINS.keys())
 async def test_an_offer_from_a_foreign_origin_is_rejected(
-    tmp_path: Path, origin: Callable[[URL], str]
+    tmp_path: Path, origin: Callable[[URL], dict[str, str]]
 ) -> None:
     (tmp_path / "index.html").write_text(INDEX)
     handed: list[Connection] = []
@@ -184,7 +188,7 @@ async def test_an_offer_from_a_foreign_origin_is_rejected(
         response = await client.post(
             "/offer",
             data=await offer_body(pc),
-            headers={**PLAIN_HEADERS, "Origin": origin(client.make_url("/").origin())},
+            headers={**PLAIN_HEADERS, **origin(client.make_url("/").origin())},
         )
 
         assert response.status == 403
@@ -213,6 +217,20 @@ async def test_an_offer_from_the_host_origin_is_accepted(client: TestClient) -> 
         "/offer",
         data=await offer_body(pc),
         headers={**PLAIN_HEADERS, "Origin": str(client.make_url("/").origin())},
+    )
+
+    assert response.status == 200
+    assert (await response.json())["type"] == "answer"
+    await pc.close()
+
+
+async def test_an_offer_from_localhost_on_the_bound_port_is_accepted(client: TestClient) -> None:
+    pc = offering_peer()
+
+    response = await client.post(
+        "/offer",
+        data=await offer_body(pc),
+        headers={**PLAIN_HEADERS, "Origin": f"http://localhost:{client.port}"},
     )
 
     assert response.status == 200

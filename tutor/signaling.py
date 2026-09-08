@@ -23,6 +23,11 @@ async def _close_connections(app: web.Application) -> None:
     app[CONNECTIONS].clear()
 
 
+def _allowed_origins(request: web.Request) -> set[str]:
+    port = request.transport.get_extra_info("sockname")[1]
+    return {f"http://{HOST}:{port}", f"http://localhost:{port}"}
+
+
 def create_app(
     client_root: Path = CLIENT_ROOT,
     on_connection: Callable[[Connection], None] | None = None,
@@ -53,7 +58,7 @@ def create_app(
 
     async def offer(request: web.Request) -> web.Response:
         origin = request.headers.get("Origin")
-        if origin is not None and origin != f"{request.scheme}://{request.host}":
+        if origin is not None and origin not in _allowed_origins(request):
             logger.warning("offer_rejected reason=origin")
             return web.json_response({"error": "cross origin offer"}, status=403)
         try:
