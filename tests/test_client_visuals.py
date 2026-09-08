@@ -5,7 +5,28 @@ from tutor.signaling import CLIENT_ROOT
 CLIENT = CLIENT_ROOT / "client.js"
 VISUALS = CLIENT_ROOT / "visuals.js"
 FRAME = CLIENT_ROOT / "frame.html"
+INDEX = CLIENT_ROOT / "index.html"
+VISUAL_CHECK = CLIENT_ROOT / "visual_check.html"
 GUARDED = [CLIENT, VISUALS, FRAME]
+HOST_POLICY = {
+    "default-src": ["'none'"],
+    "script-src": ["'self'", "'unsafe-inline'"],
+    "style-src": ["'unsafe-inline'"],
+    "connect-src": ["'self'"],
+    "img-src": ["'self'", "data:"],
+    "frame-src": ["'self'"],
+    "base-uri": ["'none'"],
+    "form-action": ["'none'"],
+}
+POLICY_META = re.compile(r'<meta http-equiv="Content-Security-Policy" content="([^"]*)">')
+
+
+def host_policy(text: str) -> dict[str, list[str]]:
+    metas = POLICY_META.findall(text)
+    assert len(metas) == 1
+    directives = [directive.split() for directive in metas[0].split(";") if directive.strip()]
+    assert len(directives) == len(HOST_POLICY)
+    return {name: sources for name, *sources in directives}
 
 
 def test_sandbox_attribute_is_exactly_allow_scripts() -> None:
@@ -40,3 +61,16 @@ def test_a_second_connect_reopens_the_channel_for_seq_reset() -> None:
     )
     assert open_listener is not None
     assert re.search(r"openHandlers\.forEach\(|for \(const \w+ of openHandlers\)", open_listener[1])
+
+
+def test_the_host_policy_is_exactly_the_pinned_directive_set() -> None:
+    for path in (INDEX, VISUAL_CHECK):
+        assert host_policy(path.read_text()) == HOST_POLICY, path.name
+
+
+def test_the_host_policy_precedes_every_script_and_style() -> None:
+    for path in (INDEX, VISUAL_CHECK):
+        text = path.read_text()
+        at = text.index('http-equiv="Content-Security-Policy"')
+        assert at < text.index("<style"), path.name
+        assert at < text.index("<script"), path.name
