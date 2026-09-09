@@ -9,6 +9,7 @@ import pytest
 from tests.fakes import Spawned, record_spawns
 from tutor.prompt import (
     SEARCH_CODE_TOOL,
+    SYSTEM_PROMPT,
     TOOL_CONTEXT_BYTES,
     Message,
     ToolCall,
@@ -18,6 +19,7 @@ from tutor.prompt import (
 )
 from tutor.tools.models import PATH_EXTENSIONS, SearchBudget, SearchMatch, SearchResult
 from tutor.tools.search import search
+from tutor.visual_tools import VISUAL_TOOLS
 
 FIXTURE_ROOT = Path(__file__).parent / "data" / "fixture_repo"
 
@@ -484,3 +486,10 @@ def test_prompt_without_a_tool_exchange_is_unchanged() -> None:
         {"role": "user", "content": ctx.model_dump_json()},
         {"role": "user", "content": "walk me through it"},
     ]
+
+
+def test_the_system_prompt_names_every_visual_tool_and_stays_ascii() -> None:
+    for tool in VISUAL_TOOLS:
+        assert tool["function"]["name"] in SYSTEM_PROMPT
+
+    assert SYSTEM_PROMPT.isascii()
