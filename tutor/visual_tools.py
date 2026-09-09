@@ -1,4 +1,5 @@
 import json
+import logging
 
 from pydantic import BaseModel, ValidationError
 
@@ -10,6 +11,8 @@ from tutor.visuals import (
     UngroundedVisual,
     VisualChannel,
 )
+
+logger = logging.getLogger(__name__)
 
 _MODELS: dict[str, type[BaseModel]] = {
     "push_diagram": DiagramPush,
@@ -64,6 +67,7 @@ async def dispatch_visual_tool(name: str, arguments: str, channel: VisualChannel
     try:
         body = json.loads(arguments)
     except json.JSONDecodeError:
+        logger.warning("visual.tool_arguments tool=%s chars=%d", name, len(arguments))
         return f"{name}: error: arguments are not valid JSON"
     try:
         payload = model.model_validate(body)

@@ -25,6 +25,8 @@ from tutor.speech import Speaker
 from tutor.tools.models import SearchBudget, SearchResult
 from tutor.tools.provenance import TurnRegistry
 from tutor.transport import Connection
+from tutor.visual_tools import VISUAL_TOOLS, dispatch_visual_tool
+from tutor.visuals import VisualChannel
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,8 @@ SearchCall = Callable[[str, Sequence[str], Path, SearchBudget], Awaitable[Search
 Grounded = tuple[SearchResult, TurnPrompt, asyncio.Queue[str | None]]
 
 SEARCH_CODE = "search_code"
+TURN_TOOLS: list[dict[str, object]] = [SEARCH_CODE_TOOL, *VISUAL_TOOLS]
+VISUAL_TOOL_NAMES = frozenset(tool["function"]["name"] for tool in VISUAL_TOOLS)
 OPENER = "thinking"
 SPOKEN_DEPTH = 32
 BAD_ARGUMENTS = "search_code takes a query string and a non-empty list of glob strings"
@@ -121,6 +125,7 @@ class TurnLoopConfig(BaseModel):
     root: Path
     budget: SearchBudget = Field(default_factory=SearchBudget)
     stage_gap_ms: int = Field(default=2000, gt=0)
+    tool_round_max_tokens: int = Field(default=2000, gt=0)
     speculative_reasoning: bool = False
 
 
@@ -155,6 +160,7 @@ class TurnLoop:
         self._search = search
         self._speaker = speaker
         self._transport = transport
+        self._visuals = VisualChannel(transport)
         self._reasoning = reasoning
         self._registry = registry
         self._clock = clock
@@ -256,7 +262,7 @@ class TurnLoop:
             prompt = self._prompt(result, speculation.text)
             queue: asyncio.Queue[str | None] = asyncio.Queue(SPOKEN_DEPTH)
             speculation.grounded.set_result((result, prompt, queue))
-            return await self._drain(turn_id, prompt, queue)
+            return await self._drain(turn_id, prompt, queue, [SEARCH_CODE_TOOL])
         except asyncio.CancelledError:
             if not speculation.claimed:
                 self._registry.abandon(turn_id)
@@ -302,6 +308,7 @@ class TurnLoop:
     async def _turn(self, turn_id: str, user_text: str) -> None:
         start = self._clock()
         grounded = await self._claim(turn_id, user_text)
+        self._visuals.set_grounding(self._registry, turn_id)
         try:
             await self._speaker.speak_opener(OPENER)
             queue: asyncio.Queue[str | None] | None = None
@@ -371,7 +378,7 @@ class TurnLoop:
         if queue is None:
             queue = asyncio.Queue(SPOKEN_DEPTH)
             self._drains[turn_id] = asyncio.create_task(
-                self._drain(turn_id, prompt, queue), name=f"{turn_id}-drain"
+                self._drain(turn_id, prompt, queue, TURN_TOOLS), name=f"{turn_id}-drain"
             )
         spoken: asyncio.Queue[str | None] = asyncio.Queue(SPOKEN_DEPTH)
         demand = asyncio.Event()
@@ -448,12 +455,19 @@ class TurnLoop:
         return False
 
     async def _drain(
-        self, turn_id: str, prompt: TurnPrompt, queue: asyncio.Queue[str | None]
+        self,
+        turn_id: str,
+        prompt: TurnPrompt,
+        queue: asyncio.Queue[str | None],
+        tools: Sequence[dict[str, object]],
     ) -> TurnOutcome:
         try:
             calls: list[TurnChunk] = []
             splitter = OutcomeSplitter()
-            async for chunk in self._reasoning.start_turn(prompt, tools=[SEARCH_CODE_TOOL]):
+            stream = self._reasoning.start_turn(
+                prompt, tools=list(tools), max_tokens=self._cfg.tool_round_max_tokens
+            )
+            async for chunk in stream:
                 if chunk.kind == "spoken":
                     text = splitter.feed(chunk.text)
                     if text:
@@ -504,6 +518,8 @@ class TurnLoop:
         return outcome
 
     async def _answer(self, turn_id: str, call: TurnChunk) -> str:
+        if call.tool_name in VISUAL_TOOL_NAMES:
+            return await dispatch_visual_tool(call.tool_name, call.text, self._visuals)
         if call.tool_name != SEARCH_CODE:
             logger.info("turn.tool_unrouted turn_id=%s tool=%s", turn_id, call.tool_name)
             return f"{call.tool_name} is not available in this turn"

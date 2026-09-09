@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 
 import pytest
 
@@ -66,6 +67,22 @@ async def test_malformed_json_arguments_return_an_error_string(arguments: str) -
     assert isinstance(result, str)
     assert result.startswith("push_diagram: error:")
     assert "\n" not in result
+    assert connection.sent == []
+
+
+async def test_malformed_json_arguments_are_logged_without_their_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    connection = FakeConnection()
+    arguments = json.dumps({"id": "d1", "kind": "flowchart", "source": "graph TD; A-->B"})[:-6]
+
+    with caplog.at_level(logging.WARNING, logger="tutor.visual_tools"):
+        result = await dispatch_visual_tool("push_diagram", arguments, VisualChannel(connection))
+
+    assert result.startswith("push_diagram: error:")
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == [f"visual.tool_arguments tool=push_diagram chars={len(arguments)}"]
+    assert "graph TD" not in messages[0]
     assert connection.sent == []
 
 

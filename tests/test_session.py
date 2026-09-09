@@ -45,6 +45,7 @@ from tutor.tools.models import (
 )
 from tutor.tools.provenance import TurnRegistry
 from tutor.transport import INBOUND_CAPACITY, Connection
+from tutor.visual_tools import VISUAL_TOOLS
 
 HANG_GUARD_S = 20.0
 TICK_S = 0.25
@@ -106,6 +107,17 @@ BAD_ARGUMENT_BODIES = [
 VISUAL_TOOL = "push_diagram"
 VISUAL_ARGUMENTS = json.dumps({"mermaid": "graph TD; reader-->queue"})
 VISUAL_CALL_ID = "call-visual-1"
+DIAGRAM_SOURCE = "graph TD; reader-->queue"
+DIAGRAM_ARGUMENTS = json.dumps({"id": "reader", "kind": "flowchart", "source": DIAGRAM_SOURCE})
+DIAGRAM_PAYLOAD = {
+    "type": "diagram.push",
+    "id": "reader",
+    "kind": "flowchart",
+    "source": DIAGRAM_SOURCE,
+    "seq": 1,
+}
+GROUNDED_HIGHLIGHT = json.dumps({"path": GROUNDED_PATH, "start_line": 24, "end_line": 24})
+UNGROUNDED_HIGHLIGHT = json.dumps({"path": UNGROUNDED_PATH, "start_line": 30, "end_line": 30})
 RATE_LIMIT_DETAIL = "quota exhausted for project acct-9"
 TURN_TASK = "turn-1"
 DRAIN_TASK = "turn-1-drain"
@@ -382,6 +394,36 @@ class LoggingTransport:
         self._log.append(("flush_playout", None))
 
 
+def visual_call(name: str, arguments: str, call_id: str) -> TurnChunk:
+    return TurnChunk(kind="tool_call", text=arguments, tool_call_id=call_id, tool_name=name)
+
+
+class RecordingTransport(LoggingTransport):
+    async def send_json(self, payload: dict[str, object]) -> None:
+        self._log.append(("send_json", payload))
+
+
+class HeldTransport(LoggingTransport):
+    def __init__(self, log: list[tuple[str, object]]) -> None:
+        super().__init__(log)
+        self.held = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send_json(self, payload: dict[str, object]) -> None:
+        self._log.append(("send_json", payload))
+        self.held.set()
+        await self.release.wait()
+
+
+class ChannelClosed(Exception):
+    pass
+
+
+class ClosedTransport(LoggingTransport):
+    async def send_json(self, payload: dict[str, object]) -> None:
+        raise ChannelClosed()
+
+
 class RateLimited(Exception):
     pass
 
@@ -461,12 +503,19 @@ class FakeReasoning:
         self._turns = deque(turns) if turns is not None else deque()
         self.prompts: list[TurnPrompt] = []
         self.tools: list[list[dict] | None] = []
+        self.max_tokens: list[int | None] = []
         self.streams: list[FakeStream] = []
         self.started = asyncio.Event()
 
-    def start_turn(self, prompt: TurnPrompt, tools: Sequence[dict] | None = None) -> FakeStream:
+    def start_turn(
+        self,
+        prompt: TurnPrompt,
+        tools: Sequence[dict] | None = None,
+        max_tokens: int | None = None,
+    ) -> FakeStream:
         self.prompts.append(prompt)
         self.tools.append(list(tools) if tools is not None else None)
+        self.max_tokens.append(max_tokens)
         self._log.append(("start_turn", prompt.user_text))
         if prompt.user_text == self._fails:
             raise RateLimited(RATE_LIMIT_DETAIL)
@@ -859,7 +908,7 @@ async def test_a_tool_call_chunk_never_reaches_the_speaker(
     assert exchange[0].tool_calls[0].id == VISUAL_CALL_ID
     assert exchange[1].tool_call_id == VISUAL_CALL_ID
     assert VISUAL_TOOL in exchange[1].content
-    assert "not available" in exchange[1].content
+    assert exchange[1].content.startswith("push_diagram: error:")
 
     assert all(VISUAL_ARGUMENTS not in message for message in session_messages(caplog))
     await loop.aclose()
@@ -899,7 +948,7 @@ async def test_a_search_code_call_dispatches_one_search_and_one_follow_up(tmp_pa
         (MODEL_QUERY, MODEL_GLOBS, tmp_path, SearchBudget()),
     ]
     assert len(reasoning.prompts) == 2
-    assert reasoning.tools == [[SEARCH_CODE_TOOL], None]
+    assert reasoning.tools == [[SEARCH_CODE_TOOL, *VISUAL_TOOLS], None]
 
     exchange = reasoning.prompts[1].tool_exchange
     assert exchange[0].tool_calls[0].id == SEARCH_CALL_ID
@@ -1644,7 +1693,10 @@ async def test_a_lone_tool_call_missing_its_id_skips_the_follow_up(
         await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
     assert [prompt.user_text for prompt in reasoning.prompts] == [USER_TEXT, SECOND_TEXT]
-    assert reasoning.tools == [[SEARCH_CODE_TOOL], [SEARCH_CODE_TOOL]]
+    assert reasoning.tools == [
+        [SEARCH_CODE_TOOL, *VISUAL_TOOLS],
+        [SEARCH_CODE_TOOL, *VISUAL_TOOLS],
+    ]
     assert search.calls == [
         (USER_TEXT, GLOBS, tmp_path, SearchBudget()),
         (SECOND_TEXT, GLOBS, tmp_path, SearchBudget()),
@@ -1662,6 +1714,248 @@ async def test_a_lone_tool_call_missing_its_id_skips_the_follow_up(
     ]
     assert [message for message in messages if message.startswith("turn.failed")] == []
     assert [message for message in messages if message.startswith("turn.reasoning_failed")] == []
+    await loop.aclose()
+
+
+async def test_a_visual_tool_call_reaches_the_channel_before_the_sentence_that_follows_it(
+    tmp_path: Path,
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    deltas = [visual_call("push_diagram", DIAGRAM_ARGUMENTS, VISUAL_CALL_ID)]
+    reasoning = FakeReasoning(log, deltas, speaker.received, follow_up=spoken_chunks(SPOKEN_DELTAS))
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        RecordingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert [payload for name, payload in log if name == "send_json"] == [DIAGRAM_PAYLOAD]
+    assert log.index(("send_json", DIAGRAM_PAYLOAD)) < log.index(("speak", SPOKEN_CLAUSES[0]))
+    assert reasoning.prompts[1].tool_exchange[1].content == "push_diagram: sent"
+    assert [tool["function"]["name"] for tool in reasoning.tools[0]] == [
+        "search_code",
+        "push_diagram",
+        "clear_diagram",
+        "highlight_source",
+        "push_app",
+    ]
+    assert reasoning.tools[1] is None
+    assert speaker.utterances == [[lead_in_sentence([result])] + SPOKEN_CLAUSES]
+    await loop.aclose()
+
+
+async def test_a_payload_on_a_cancelled_turn_is_never_sent(tmp_path: Path) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    gate = asyncio.Event()
+    deltas = [
+        visual_call("push_diagram", DIAGRAM_ARGUMENTS, VISUAL_CALL_ID),
+        TurnChunk(kind="spoken", text=SPOKEN_DELTAS[0]),
+    ]
+    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate, holds_at=1)
+    barge = asyncio.Event()
+    resume = asyncio.Event()
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), barge, SpeechStarted(), resume])
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        RecordingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+    turn = turn_task()
+    drain = drain_task()
+
+    await pull_past(source, barge)
+    gate.set()
+    await asyncio.wait_for(asyncio.wait([turn]), HANG_GUARD_S)
+
+    assert turn.cancelled()
+    assert drain.cancelled()
+    assert "send_json" not in [name for name, _ in log]
+    assert len(reasoning.prompts) == 1
+    assert ("abandon", "turn-1") in log
+
+    resume.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await loop.aclose()
+
+
+async def test_a_barge_in_during_a_push_sends_nothing_further(tmp_path: Path) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    deltas = [
+        visual_call("push_diagram", DIAGRAM_ARGUMENTS, VISUAL_CALL_ID),
+        visual_call("push_diagram", DIAGRAM_ARGUMENTS, "call-visual-2"),
+    ]
+    reasoning = FakeReasoning(log, deltas, speaker.received, follow_up=spoken_chunks(SPOKEN_DELTAS))
+    barge = asyncio.Event()
+    resume = asyncio.Event()
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), barge, SpeechStarted(), resume])
+    transport = HeldTransport(log)
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        transport,
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(transport.held.wait(), HANG_GUARD_S)
+    turn = turn_task()
+    drain = drain_task()
+
+    await pull_past(source, barge)
+    await asyncio.wait_for(asyncio.wait([turn]), HANG_GUARD_S)
+
+    assert turn.cancelled()
+    assert drain.cancelled()
+    assert [name for name, _ in log].count("send_json") == 1
+    assert len(reasoning.prompts) == 1
+    assert ("abandon", "turn-1") in log
+    steps = [name for name, _ in log]
+    assert steps.index("flush_playout") < log.index(("abandon", "turn-1"))
+
+    resume.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await loop.aclose()
+
+
+async def test_grounding_reaches_the_channel_before_a_highlight_and_an_ungrounded_one_is_an_error_string(
+    tmp_path: Path,
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    deltas = [
+        visual_call("highlight_source", GROUNDED_HIGHLIGHT, VISUAL_CALL_ID),
+        visual_call("highlight_source", UNGROUNDED_HIGHLIGHT, "call-visual-2"),
+    ]
+    reasoning = FakeReasoning(log, deltas, speaker.received, follow_up=spoken_chunks(SPOKEN_DELTAS))
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        RecordingTransport(log),
+        reasoning,
+        TurnRegistry(),
+        FakeClock(),
+    )
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert [payload for name, payload in log if name == "send_json"] == [
+        {
+            "type": "source.highlight",
+            "path": GROUNDED_PATH,
+            "start_line": 24,
+            "end_line": 24,
+            "seq": 1,
+        }
+    ]
+    exchange = reasoning.prompts[1].tool_exchange
+    assert [message.content for message in exchange[1:]] == [
+        "highlight_source: sent",
+        f"highlight_source: error: ungrounded highlight {UNGROUNDED_PATH!r}:30",
+    ]
+    assert speaker.utterances == [[lead_in_sentence([result])] + SPOKEN_CLAUSES]
+    await loop.aclose()
+
+
+async def test_a_transport_error_in_a_push_ends_the_drain_and_the_next_turn_is_taken(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    deltas = [visual_call("push_diagram", DIAGRAM_ARGUMENTS, VISUAL_CALL_ID)]
+    reasoning = FakeReasoning(log, deltas, speaker.received, follow_up=spoken_chunks(SPOKEN_DELTAS))
+    source = SerialSource([USER_TEXT, SECOND_TEXT])
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        ClosedTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    messages = session_messages(caplog)
+    assert "turn.reasoning_failed turn_id=turn-1 error=ChannelClosed" in messages
+    assert "turn.reasoning_failed turn_id=turn-2 error=ChannelClosed" in messages
+    assert [prompt.user_text for prompt in reasoning.prompts] == [USER_TEXT, SECOND_TEXT]
+    lead_in = lead_in_sentence([result])
+    assert speaker.utterances == [[lead_in], [lead_in]]
+    await loop.aclose()
+
+
+async def test_the_tool_round_carries_its_own_token_cap_and_the_follow_up_the_default(
+    tmp_path: Path,
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    deltas = [
+        TurnChunk(
+            kind="tool_call",
+            text=SEARCH_ARGUMENTS,
+            tool_call_id=SEARCH_CALL_ID,
+            tool_name="search_code",
+        )
+    ]
+    reasoning = FakeReasoning(log, deltas, speaker.received, follow_up=spoken_chunks(SPOKEN_DELTAS))
+    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
+    cfg = config(tmp_path)
+    loop = TurnLoop(
+        cfg,
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert reasoning.max_tokens == [cfg.tool_round_max_tokens, None]
     await loop.aclose()
 
 
@@ -2273,6 +2567,48 @@ async def test_a_partial_issues_the_request_and_a_matching_final_reuses_it(
     assert len(spoken_spans(caplog)) == 1
     messages = session_messages(caplog)
     assert all(PARTIAL_TEXT not in message for message in messages)
+    await loop.aclose()
+
+
+async def test_a_speculative_round_carries_no_visual_tools(tmp_path: Path) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    gate = asyncio.Event()
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received, gate=gate)
+    endpoint = asyncio.Event()
+    source = ScriptedSource(
+        [
+            PartialTranscript(text=""),
+            PartialTranscript(text=PARTIAL_TEXT),
+            endpoint,
+            EndOfTurn(text=USER_TEXT),
+            speaker.finished,
+        ]
+    )
+    loop = TurnLoop(
+        speculative(tmp_path),
+        source,
+        search,
+        speaker,
+        RecordingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+    await pull_past(source, endpoint)
+    await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+    gate.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert reasoning.tools == [[SEARCH_CODE_TOOL]]
+    assert "send_json" not in [name for name, _ in log]
+    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
     await loop.aclose()
 
 
@@ -3025,11 +3361,11 @@ async def test_a_misconception_in_the_follow_up_is_the_turns_outcome(
 
     assert [call[1] for call in search.calls] == [GLOBS, GLOBS, GLOBS, MODEL_GLOBS, SETTLING_PATHS]
     assert reasoning.tools == [
-        [SEARCH_CODE_TOOL],
-        [SEARCH_CODE_TOOL],
-        [SEARCH_CODE_TOOL],
+        [SEARCH_CODE_TOOL, *VISUAL_TOOLS],
+        [SEARCH_CODE_TOOL, *VISUAL_TOOLS],
+        [SEARCH_CODE_TOOL, *VISUAL_TOOLS],
         None,
-        [SEARCH_CODE_TOOL],
+        [SEARCH_CODE_TOOL, *VISUAL_TOOLS],
     ]
     assert outcome_lines(caplog) == [
         "turn.outcome turn_id=turn-1 signal=covered phase=explore",
