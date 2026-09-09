@@ -108,6 +108,21 @@ async def test_the_frame_dispatcher_and_vendor_bundle_are_served(client: TestCli
     assert await vendor.text() == VENDOR
 
 
+async def test_the_render_frame_refuses_foreign_embedding(client: TestClient) -> None:
+    frame = await client.get("/frame.html")
+
+    assert frame.status == 200
+    assert await frame.text() == FRAME
+    assert frame.headers["Content-Security-Policy"] == "frame-ancestors 'self'"
+
+
+async def test_the_host_page_carries_no_frame_ancestors_header(client: TestClient) -> None:
+    index = await client.get("/")
+
+    assert index.status == 200
+    assert "Content-Security-Policy" not in index.headers
+
+
 async def test_the_visual_check_harness_is_served(client: TestClient) -> None:
     harness = await client.get("/visual_check.html")
 

@@ -42,7 +42,10 @@ def create_app(
         return web.FileResponse(client_root / "client.js")
 
     async def frame(request: web.Request) -> web.FileResponse:
-        return web.FileResponse(client_root / "frame.html")
+        return web.FileResponse(
+            client_root / "frame.html",
+            headers={"Content-Security-Policy": "frame-ancestors 'self'"},
+        )
 
     async def visuals(request: web.Request) -> web.FileResponse:
         return web.FileResponse(client_root / "visuals.js")
