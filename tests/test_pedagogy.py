@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from tutor.pedagogy import PedagogyState, Phase, TurnOutcome, parse_outcome
 from tutor.prompt import MAX_GLOBS
@@ -45,58 +46,58 @@ def teaching() -> PedagogyState:
 
 def exploring() -> PedagogyState:
     state = teaching()
-    assert state.advance(TurnOutcome(signal="covered")) is Phase.EXPLORE
+    assert state.advance(TurnOutcome(signal="covered")) is Phase.CONCRETE
     return state
 
 
 def questioning() -> PedagogyState:
     state = exploring()
-    assert state.advance(TurnOutcome(signal="covered")) is Phase.REVERSE_FEYNMAN
+    assert state.advance(TurnOutcome(signal="covered")) is Phase.INTERROGATE
     return state
 
 
-def test_teach_moves_to_explore_once_the_subsystem_is_covered() -> None:
+def test_teach_moves_to_concrete_once_the_mechanism_is_covered() -> None:
     state = teaching()
 
-    assert state.advance(TurnOutcome(signal="covered")) is Phase.EXPLORE
-    assert state.phase is Phase.EXPLORE
+    assert state.advance(TurnOutcome(signal="covered")) is Phase.CONCRETE
+    assert state.phase is Phase.CONCRETE
 
 
-def test_explore_moves_to_reverse_feynman_once_the_files_are_covered() -> None:
+def test_concrete_moves_to_interrogate_once_it_is_covered() -> None:
     state = exploring()
 
-    assert state.advance(TurnOutcome(signal="covered")) is Phase.REVERSE_FEYNMAN
-    assert state.phase is Phase.REVERSE_FEYNMAN
+    assert state.advance(TurnOutcome(signal="covered")) is Phase.INTERROGATE
+    assert state.phase is Phase.INTERROGATE
 
 
-def test_reverse_feynman_returns_to_teach_on_a_correct_explanation() -> None:
+def test_interrogate_returns_to_teach_on_a_correct_explanation() -> None:
     state = questioning()
 
     assert state.advance(TurnOutcome(signal="correct")) is Phase.TEACH
     assert state.phase is Phase.TEACH
 
 
-def test_reverse_feynman_returns_to_explore_on_a_misconception() -> None:
+def test_interrogate_returns_to_concrete_on_a_misconception() -> None:
     state = questioning()
 
-    assert state.advance(TurnOutcome(signal="misconception")) is Phase.EXPLORE
-    assert state.phase is Phase.EXPLORE
+    assert state.advance(TurnOutcome(signal="misconception")) is Phase.CONCRETE
+    assert state.phase is Phase.CONCRETE
 
 
-def test_explore_holds_on_a_follow_up_question() -> None:
+def test_concrete_holds_on_a_follow_up_question() -> None:
     state = exploring()
 
-    assert state.advance(TurnOutcome(signal="follow_up")) is Phase.EXPLORE
-    assert state.advance(TurnOutcome(signal="follow_up")) is Phase.EXPLORE
+    assert state.advance(TurnOutcome(signal="follow_up")) is Phase.CONCRETE
+    assert state.advance(TurnOutcome(signal="follow_up")) is Phase.CONCRETE
 
 
-def test_misconception_carries_the_settling_positions_into_the_next_explore_turn() -> None:
+def test_misconception_carries_the_settling_positions_into_the_next_concrete_turn() -> None:
     state = questioning()
 
     state.advance(TurnOutcome(signal="misconception", settling_positions=SETTLING))
 
     assert state.settling_positions == SETTLING
-    assert state.advance(TurnOutcome(signal="follow_up")) is Phase.EXPLORE
+    assert state.advance(TurnOutcome(signal="follow_up")) is Phase.CONCRETE
     assert state.settling_positions == SETTLING
 
 
@@ -104,7 +105,7 @@ def test_settling_positions_clear_when_the_phase_moves_on() -> None:
     state = questioning()
     state.advance(TurnOutcome(signal="misconception", settling_positions=SETTLING))
 
-    assert state.advance(TurnOutcome(signal="covered")) is Phase.REVERSE_FEYNMAN
+    assert state.advance(TurnOutcome(signal="covered")) is Phase.INTERROGATE
     assert state.settling_positions == []
 
 
@@ -121,7 +122,7 @@ def test_a_parsed_model_outcome_drives_the_transition() -> None:
         '{"signal": "misconception", "settling_positions": [{"path": "src/pool.py", "line": 11}]}'
     )
 
-    assert state.advance(parse_outcome(text)) is Phase.EXPLORE
+    assert state.advance(parse_outcome(text)) is Phase.CONCRETE
     assert state.settling_positions == [Position(path="src/pool.py", line=11)]
 
 
@@ -147,7 +148,7 @@ def test_an_unusable_settling_path_neutralizes_the_whole_outcome(text: str) -> N
     assert outcome.signal is None
     assert outcome.settling_positions == []
     state = questioning()
-    assert state.advance(outcome) is Phase.REVERSE_FEYNMAN
+    assert state.advance(outcome) is Phase.INTERROGATE
     assert state.settling_positions == []
 
 
@@ -155,7 +156,7 @@ def test_the_settling_scope_admits_max_globs_distinct_paths() -> None:
     paths = [f"src/pool_{n}.py" for n in range(MAX_GLOBS)]
     state = questioning()
 
-    assert state.advance(parse_outcome(settling(*paths))) is Phase.EXPLORE
+    assert state.advance(parse_outcome(settling(*paths))) is Phase.CONCRETE
     assert [position.path for position in state.settling_positions] == paths
 
 
@@ -163,7 +164,7 @@ def test_the_settling_cap_counts_distinct_paths_not_positions() -> None:
     paths = ["src/pool.py"] * MAX_GLOBS + ["src/lease.py"]
     state = questioning()
 
-    assert state.advance(parse_outcome(settling(*paths))) is Phase.EXPLORE
+    assert state.advance(parse_outcome(settling(*paths))) is Phase.CONCRETE
     assert [position.path for position in state.settling_positions] == paths
     assert len(state.settling_positions) == MAX_GLOBS + 1
 
@@ -172,7 +173,7 @@ def test_malformed_model_text_leaves_the_settling_scope_in_place() -> None:
     state = questioning()
     state.advance(TurnOutcome(signal="misconception", settling_positions=SETTLING))
 
-    assert state.advance(parse_outcome("nice try")) is Phase.EXPLORE
+    assert state.advance(parse_outcome("nice try")) is Phase.CONCRETE
     assert state.settling_positions == SETTLING
 
 
@@ -181,11 +182,59 @@ def test_prompt_directive_follows_the_phase() -> None:
 
     teach = state.prompt_directive()
     state.advance(TurnOutcome(signal="covered"))
-    explore = state.prompt_directive()
+    concrete = state.prompt_directive()
     state.advance(TurnOutcome(signal="covered"))
-    feynman = state.prompt_directive()
+    interrogate = state.prompt_directive()
 
-    assert len({teach, explore, feynman}) == 3
-    assert all(directive.strip() and directive.isascii() for directive in (teach, explore, feynman))
+    assert len({teach, concrete, interrogate}) == 3
+    assert all(
+        directive.strip() and directive.isascii() for directive in (teach, concrete, interrogate)
+    )
     state.advance(TurnOutcome(signal="correct"))
     assert state.prompt_directive() == teach
+
+
+def test_interrogate_returns_to_teach_when_the_learner_asks_to_be_told() -> None:
+    state = PedagogyState(Phase.INTERROGATE)
+    assert state.advance(TurnOutcome(signal="told")) is Phase.TEACH
+    assert state.settling_positions == []
+    assert state.settling == ""
+
+
+def test_a_misconception_carries_the_settling_note_into_the_next_concrete_turn() -> None:
+    state = PedagogyState(Phase.INTERROGATE)
+    outcome = TurnOutcome(
+        signal="misconception",
+        settling="the ratio at 1.3 with epsilon 0.2 gives a flat objective",
+    )
+    assert state.advance(outcome) is Phase.CONCRETE
+    assert state.settling == outcome.settling
+    assert "flat objective" in state.prompt_directive()
+
+
+def test_the_settling_note_clears_when_the_phase_moves_on() -> None:
+    state = PedagogyState(Phase.INTERROGATE)
+    state.advance(TurnOutcome(signal="misconception", settling="a note"))
+    state.advance(TurnOutcome(signal="covered"))
+    assert state.settling == ""
+    assert "a note" not in state.prompt_directive()
+
+
+def test_the_settling_note_is_capped() -> None:
+    with pytest.raises(ValidationError):
+        TurnOutcome(signal="misconception", settling="x" * 501)
+
+
+def test_settling_positions_appear_in_the_concrete_directive() -> None:
+    state = PedagogyState(Phase.INTERROGATE)
+    state.advance(
+        TurnOutcome(
+            signal="misconception", settling_positions=[Position(path="src/pool.py", line=42)]
+        )
+    )
+    assert "Search src/pool.py line 42 first" in state.prompt_directive()
+
+
+def test_told_outside_interrogate_holds_the_phase() -> None:
+    state = PedagogyState(Phase.TEACH)
+    assert state.advance(TurnOutcome(signal="told")) is Phase.TEACH

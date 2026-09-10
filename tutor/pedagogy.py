@@ -12,13 +12,14 @@ logger = logging.getLogger(__name__)
 
 class Phase(StrEnum):
     TEACH = auto()
-    EXPLORE = auto()
-    REVERSE_FEYNMAN = auto()
+    CONCRETE = auto()
+    INTERROGATE = auto()
 
 
 class TurnOutcome(BaseModel):
-    signal: Literal["covered", "follow_up", "correct", "misconception"] | None = None
+    signal: Literal["covered", "follow_up", "correct", "misconception", "told"] | None = None
     settling_positions: list[Position] = Field(default_factory=list)
+    settling: str = Field(default="", max_length=500)
 
     @field_validator("settling_positions", mode="after")
     @classmethod
@@ -34,24 +35,29 @@ class TurnOutcome(BaseModel):
 
 
 TRANSITIONS: dict[tuple[Phase, str | None], Phase] = {
-    (Phase.TEACH, "covered"): Phase.EXPLORE,
-    (Phase.EXPLORE, "covered"): Phase.REVERSE_FEYNMAN,
-    (Phase.REVERSE_FEYNMAN, "correct"): Phase.TEACH,
-    (Phase.REVERSE_FEYNMAN, "misconception"): Phase.EXPLORE,
+    (Phase.TEACH, "covered"): Phase.CONCRETE,
+    (Phase.CONCRETE, "covered"): Phase.INTERROGATE,
+    (Phase.INTERROGATE, "correct"): Phase.TEACH,
+    (Phase.INTERROGATE, "told"): Phase.TEACH,
+    (Phase.INTERROGATE, "misconception"): Phase.CONCRETE,
 }
 
 DIRECTIVES: dict[Phase, str] = {
     Phase.TEACH: (
-        "Introduce one subsystem: the design patterns behind it and the control flow through it, "
-        "with a visual update in the same breath. Stay on the mechanism, not on syntax."
+        "Teach: introduce one mechanism, why it exists and how it works, one idea this turn, and "
+        "end with a question the learner can answer from what you just said. Never ask about a "
+        "term you have not introduced. Stay on the mechanism, not on notation."
     ),
-    Phase.EXPLORE: (
-        "Walk the engineer into the files themselves: entry points, invariants, failure paths. "
-        "Name exact positions from this turn's tool results and never read syntax aloud."
+    Phase.CONCRETE: (
+        "Concrete: make the mechanism tangible. A worked example with numbers, one step of the "
+        "derivation, a plot, a trace of one iteration; with a folder attached, the exact lines "
+        "from this turn's search results. Never read syntax aloud; say what it does."
     ),
-    Phase.REVERSE_FEYNMAN: (
-        "Stop lecturing and test. Put a realistic edge case, race or failure mode to the engineer "
-        "and have them explain the mechanism back. On a misconception, interrupt and correct."
+    Phase.INTERROGATE: (
+        "Interrogate: stop lecturing and test. Pose an edge case, a failure mode or a limit and "
+        "have the learner explain the mechanism back. At most two probes per gap, then explain. "
+        "If they ask to be told, tell them. On a misconception, cut in, correct it in one "
+        "sentence, and signal misconception with what settles it."
     ),
 }
 
@@ -68,15 +74,24 @@ class PedagogyState:
     def __init__(self, phase: Phase = Phase.TEACH) -> None:
         self.phase = phase
         self.settling_positions: list[Position] = []
+        self.settling = ""
 
     def advance(self, outcome: TurnOutcome) -> Phase:
         moved = TRANSITIONS.get((self.phase, outcome.signal), self.phase)
         if moved is not self.phase:
-            self.settling_positions = (
-                list(outcome.settling_positions) if outcome.signal == "misconception" else []
-            )
+            settling = outcome.signal == "misconception"
+            self.settling_positions = list(outcome.settling_positions) if settling else []
+            self.settling = outcome.settling if settling else ""
         self.phase = moved
         return self.phase
 
     def prompt_directive(self) -> str:
-        return DIRECTIVES[self.phase]
+        directive = DIRECTIVES[self.phase]
+        if self.settling:
+            directive += f" Settle the misconception here: {self.settling}"
+        if self.settling_positions:
+            scope = ", ".join(
+                f"{p.path} line {p.line}" if p.line else p.path for p in self.settling_positions
+            )
+            directive += f" Search {scope} first and settle it from what you find."
+        return directive

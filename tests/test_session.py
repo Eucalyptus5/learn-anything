@@ -138,8 +138,8 @@ FILLER_DELTA = "and "
 # One delta reaches the chunker, SPOKEN_DEPTH sit in the queue, and the next put blocks.
 QUEUE_FULL_DELTAS = SPOKEN_DEPTH + 2
 TEACH_DIRECTIVE = PedagogyState(Phase.TEACH).prompt_directive()
-EXPLORE_DIRECTIVE = PedagogyState(Phase.EXPLORE).prompt_directive()
-REVERSE_FEYNMAN_DIRECTIVE = PedagogyState(Phase.REVERSE_FEYNMAN).prompt_directive()
+CONCRETE_DIRECTIVE = PedagogyState(Phase.CONCRETE).prompt_directive()
+INTERROGATE_DIRECTIVE = PedagogyState(Phase.INTERROGATE).prompt_directive()
 SETTLING_PATHS = [GROUNDED_PATH, SECOND_PATH]
 COVERED_OUTCOME = OUTCOME_MARKER + json.dumps({"signal": "covered", "settling_positions": []})
 MISCONCEPTION_OUTCOME = OUTCOME_MARKER + json.dumps(
@@ -2997,13 +2997,13 @@ async def test_the_prompt_carries_the_directive_for_the_current_phase(tmp_path: 
     assert SUBJECT in system
     assert TEACH_DIRECTIVE in system
     assert OUTCOME_MARKER in system
-    assert EXPLORE_DIRECTIVE not in system
-    assert REVERSE_FEYNMAN_DIRECTIVE not in system
+    assert CONCRETE_DIRECTIVE not in system
+    assert INTERROGATE_DIRECTIVE not in system
     assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
     await loop.aclose()
 
 
-async def test_a_misconception_in_reverse_feynman_scopes_the_next_turn_to_where_it_settles(
+async def test_a_misconception_in_interrogate_scopes_the_next_turn_to_where_it_settles(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
@@ -3035,17 +3035,17 @@ async def test_a_misconception_in_reverse_feynman_scopes_the_next_turn_to_where_
     systems = [prompt.system for prompt in reasoning.prompts]
     assert len(systems) == 4
     assert TEACH_DIRECTIVE in systems[0]
-    assert EXPLORE_DIRECTIVE in systems[1]
-    assert REVERSE_FEYNMAN_DIRECTIVE in systems[2]
-    assert EXPLORE_DIRECTIVE in systems[3]
-    assert REVERSE_FEYNMAN_DIRECTIVE not in systems[3]
-    assert all(SECOND_PATH not in system for system in systems)
+    assert CONCRETE_DIRECTIVE in systems[1]
+    assert INTERROGATE_DIRECTIVE in systems[2]
+    assert CONCRETE_DIRECTIVE in systems[3]
+    assert INTERROGATE_DIRECTIVE not in systems[3]
+    assert all(SECOND_PATH not in system for system in systems[:3])
     assert [call[1] for call in search.calls] == [GLOBS, GLOBS, GLOBS, SETTLING_PATHS]
     assert outcome_lines(caplog) == [
-        "turn.outcome turn_id=turn-1 signal=covered phase=explore",
-        "turn.outcome turn_id=turn-2 signal=covered phase=reverse_feynman",
-        "turn.outcome turn_id=turn-3 signal=misconception phase=explore",
-        "turn.outcome turn_id=turn-4 signal=None phase=explore",
+        "turn.outcome turn_id=turn-1 signal=covered phase=concrete",
+        "turn.outcome turn_id=turn-2 signal=covered phase=interrogate",
+        "turn.outcome turn_id=turn-3 signal=misconception phase=concrete",
+        "turn.outcome turn_id=turn-4 signal=None phase=concrete",
     ]
     lead_in = lead_in_sentence([result])
     assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]] * 4
@@ -3093,12 +3093,12 @@ async def test_an_unusable_settling_path_never_reaches_the_search(
 
     assert [call[1] for call in search.calls] == [GLOBS] * 4
     assert outcome_lines(caplog) == [
-        "turn.outcome turn_id=turn-1 signal=covered phase=explore",
-        "turn.outcome turn_id=turn-2 signal=covered phase=reverse_feynman",
-        "turn.outcome turn_id=turn-3 signal=None phase=reverse_feynman",
-        "turn.outcome turn_id=turn-4 signal=None phase=reverse_feynman",
+        "turn.outcome turn_id=turn-1 signal=covered phase=concrete",
+        "turn.outcome turn_id=turn-2 signal=covered phase=interrogate",
+        "turn.outcome turn_id=turn-3 signal=None phase=interrogate",
+        "turn.outcome turn_id=turn-4 signal=None phase=interrogate",
     ]
-    assert REVERSE_FEYNMAN_DIRECTIVE in reasoning.prompts[3].system
+    assert INTERROGATE_DIRECTIVE in reasoning.prompts[3].system
     lead_in = lead_in_sentence([result])
     assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]] * 4
     await loop.aclose()
@@ -3129,7 +3129,7 @@ async def test_a_marker_split_across_deltas_is_still_stripped(
         await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
     assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
-    assert outcome_lines(caplog) == ["turn.outcome turn_id=turn-1 signal=covered phase=explore"]
+    assert outcome_lines(caplog) == ["turn.outcome turn_id=turn-1 signal=covered phase=concrete"]
     verified = [text for _, text, _ in registry.verified]
     assert verified
     assert all("<" not in text and "{" not in text and "signal" not in text for text in verified)
@@ -3252,7 +3252,7 @@ async def test_a_barge_in_leaves_the_phase_where_it_was(
         resume.set()
         await asyncio.wait_for(running, HANG_GUARD_S)
 
-    assert outcome_lines(caplog) == ["turn.outcome turn_id=turn-2 signal=covered phase=explore"]
+    assert outcome_lines(caplog) == ["turn.outcome turn_id=turn-2 signal=covered phase=concrete"]
     assert [TEACH_DIRECTIVE in prompt.system for prompt in reasoning.prompts] == [True, True]
     assert speaker.utterances == [[lead_in, SPOKEN_CLAUSES[0]], [lead_in, *SPOKEN_CLAUSES]]
     await loop.aclose()
@@ -3368,12 +3368,12 @@ async def test_a_misconception_in_the_follow_up_is_the_turns_outcome(
         [SEARCH_CODE_TOOL, *VISUAL_TOOLS],
     ]
     assert outcome_lines(caplog) == [
-        "turn.outcome turn_id=turn-1 signal=covered phase=explore",
-        "turn.outcome turn_id=turn-2 signal=covered phase=reverse_feynman",
-        "turn.outcome turn_id=turn-3 signal=misconception phase=explore",
-        "turn.outcome turn_id=turn-4 signal=None phase=explore",
+        "turn.outcome turn_id=turn-1 signal=covered phase=concrete",
+        "turn.outcome turn_id=turn-2 signal=covered phase=interrogate",
+        "turn.outcome turn_id=turn-3 signal=misconception phase=concrete",
+        "turn.outcome turn_id=turn-4 signal=None phase=concrete",
     ]
-    assert EXPLORE_DIRECTIVE in reasoning.prompts[4].system
+    assert CONCRETE_DIRECTIVE in reasoning.prompts[4].system
     lead_in = lead_in_sentence([result])
     assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]] * 4
     spoken = [str(text) for name, text in log if name == "speak"]
