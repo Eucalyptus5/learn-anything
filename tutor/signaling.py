@@ -1,11 +1,13 @@
 import asyncio
 import json
 import logging
+import os
 from collections.abc import Callable
 from pathlib import Path
 
 from aiohttp import web
 from aiortc import RTCSessionDescription
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from tutor.transport import Connection, negotiate
 
@@ -14,6 +16,38 @@ HOST = "127.0.0.1"
 CONNECTIONS = web.AppKey("connections", set[Connection])
 
 logger = logging.getLogger(__name__)
+
+
+class SessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    subject: str = Field(min_length=1, max_length=200)
+    folder: Path | None = None
+    starting_from: str = Field(default="", max_length=1000)
+
+    @field_validator("subject", "starting_from", mode="before")
+    @classmethod
+    def _strip(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("folder", mode="before")
+    @classmethod
+    def _blank_is_none(cls, value: object) -> object:
+        return None if value in ("", None) else value
+
+    @field_validator("folder", mode="after")
+    @classmethod
+    def _readable_directory(cls, path: Path | None) -> Path | None:
+        if path is None:
+            return None
+        try:
+            resolved = path.expanduser().resolve()
+            readable = resolved.is_dir() and os.access(resolved, os.R_OK)
+        except (OSError, RuntimeError):
+            readable = False
+        if not readable:
+            raise ValueError("folder is not a readable directory")
+        return resolved
 
 
 async def _close_connections(app: web.Application) -> None:
@@ -30,7 +64,7 @@ def _allowed_origins(request: web.Request) -> set[str]:
 
 def create_app(
     client_root: Path = CLIENT_ROOT,
-    on_connection: Callable[[Connection], None] | None = None,
+    on_connection: Callable[[Connection, SessionRequest], None] | None = None,
 ) -> web.Application:
     app = web.Application()
     app[CONNECTIONS] = set()
@@ -76,6 +110,11 @@ def create_app(
         ):
             logger.warning("offer_rejected reason=malformed")
             return web.json_response({"error": "expected a json offer"}, status=400)
+        try:
+            session = SessionRequest.model_validate(payload.get("session"))
+        except ValidationError:
+            logger.warning("offer_rejected reason=session")
+            return web.json_response({"error": "expected a session"}, status=400)
 
         try:
             connection, answer = await negotiate(
@@ -92,7 +131,7 @@ def create_app(
 
         connection.on_close(forget)
         if on_connection is not None:
-            on_connection(connection)
+            on_connection(connection, session)
         logger.info("offer_answered live=%d", len(request.app[CONNECTIONS]))
         return web.json_response({"sdp": answer.sdp, "type": answer.type})
 

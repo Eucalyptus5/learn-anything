@@ -34,6 +34,7 @@ from tutor.cost import UsageLedger
 from tutor.input_path import EndOfTurn, InputEvent
 from tutor.reasoning import ReasoningClient, TurnChunk, TurnStream
 from tutor.session import OutcomeSplitter, TurnLoop
+from tutor.signaling import SessionRequest
 from tutor.transport import Connection
 from tutor.tts import KokoroSynthesizer
 
@@ -440,7 +441,7 @@ class Bench:
 
     @classmethod
     async def boot(cls, cfg: Settings, root: Path, subject: str) -> "Bench":
-        cfg = cfg.model_copy(update={"subject": subject, "repo_root": root})
+        request = SessionRequest(subject=subject, folder=root)
         loaded = await asyncio.to_thread(load_models)
         synth = TaggedSynth(loaded.synth)
         models = Models(
@@ -449,7 +450,7 @@ class Bench:
         reasoning = MeteredReasoning(ReasoningClient(cfg))
         transport = BenchTransport(synth, models.openers)
         source = ScriptedSource()
-        loop = build_loop(cfg, models, reasoning, source, transport)
+        loop = build_loop(cfg, models, reasoning, source, transport, request)
         watch = OutcomeWatch()
         logging.getLogger("tutor.session").addFilter(watch)
         loop_task = asyncio.create_task(loop.run(), name="bench-loop")

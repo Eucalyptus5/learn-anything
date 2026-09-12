@@ -20,12 +20,14 @@ from tutor.input_path import EndOfTurn, InputEvent, InputPath
 from tutor.openers import OPENER_PHRASES, synthesize_openers
 from tutor.prompt import SYSTEM_PROMPT
 from tutor.session import OPENER, TurnLoop
+from tutor.signaling import SessionRequest
 
 HANG_GUARD_S = 20.0
 FAKE_BASE = "https://reasoning.invalid/v1"
 FAKE_KEY = "sk-test-not-a-real-key"
 FIXTURE_REPO = Path(__file__).resolve().parent / "data" / "fixture_repo"
 SUBJECT = "a small http client with a bounded connection pool"
+REQUEST = SessionRequest(subject=SUBJECT, folder=FIXTURE_REPO)
 USER_TEXT = "walk me through src/pool.py"
 READY_PREFIX = "tutor_ready "
 READY_LINE = re.compile(r"^tutor_ready host=127\.0\.0\.1 port=\d+$")
@@ -211,13 +213,13 @@ def test_main_boots_from_injected_settings_and_shuts_down_on_sigint(
 
 
 async def test_build_loop_speaks_the_thinking_opener_on_end_of_turn(tmp_path: Path) -> None:
-    cfg = settings_for(tmp_path, REPO_ROOT=str(FIXTURE_REPO), SUBJECT=SUBJECT)
+    cfg = settings_for(tmp_path)
     log: list[tuple[str, object]] = []
     transport = FakeTransport()
     reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), asyncio.Event())
 
     models = fake_models()
-    loop = build_loop(cfg, models, reasoning, EndOfTurnSource([USER_TEXT]), transport)
+    loop = build_loop(cfg, models, reasoning, EndOfTurnSource([USER_TEXT]), transport, REQUEST)
     assert models.synth.calls == []
     assert transport.played == []
     await asyncio.wait_for(loop.run(), HANG_GUARD_S)
@@ -233,14 +235,14 @@ async def test_build_loop_speaks_the_thinking_opener_on_end_of_turn(tmp_path: Pa
 async def test_session_ends_on_its_own_when_the_frames_end(
     tmp_path: Path, closes: list[str], vads: list[RecordingVad]
 ) -> None:
-    cfg = settings_for(tmp_path, REPO_ROOT=str(FIXTURE_REPO))
+    cfg = settings_for(tmp_path)
     log: list[tuple[str, object]] = []
     connection = FakeConnection(scripted_frames(len(CANONICAL)))
     models = fake_models()
     reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), asyncio.Event())
     sessions = Sessions(cfg, models, reasoning)
 
-    task = sessions.start(connection)
+    task = sessions.start(connection, REQUEST)
     await asyncio.wait_for(task, HANG_GUARD_S)
 
     assert task.result() is None
@@ -256,7 +258,7 @@ async def test_session_ends_on_its_own_when_the_frames_end(
 async def test_concurrent_sessions_each_get_their_own_vad(
     tmp_path: Path, vads: list[RecordingVad]
 ) -> None:
-    cfg = settings_for(tmp_path, REPO_ROOT=str(FIXTURE_REPO))
+    cfg = settings_for(tmp_path)
     log: list[tuple[str, object]] = []
     positive = scripted_frames(len(CANONICAL))
     negative = [-frame for frame in positive]
@@ -264,8 +266,8 @@ async def test_concurrent_sessions_each_get_their_own_vad(
     reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), asyncio.Event())
     sessions = Sessions(cfg, models, reasoning)
 
-    first = sessions.start(FakeConnection(positive))
-    second = sessions.start(FakeConnection(negative))
+    first = sessions.start(FakeConnection(positive), REQUEST)
+    second = sessions.start(FakeConnection(negative), REQUEST)
     assert sessions.live == 2
     await asyncio.wait_for(asyncio.gather(first, second, return_exceptions=True), HANG_GUARD_S)
 
@@ -283,7 +285,7 @@ async def test_concurrent_sessions_each_get_their_own_vad(
 async def test_shutdown_cancels_a_live_session_and_closes_its_collaborators(
     tmp_path: Path, closes: list[str], vads: list[RecordingVad]
 ) -> None:
-    cfg = settings_for(tmp_path, REPO_ROOT=str(FIXTURE_REPO))
+    cfg = settings_for(tmp_path)
     log: list[tuple[str, object]] = []
     connection = FakeConnection(scripted_frames(len(CANONICAL)), hold=asyncio.Event())
     models = fake_models()
@@ -292,7 +294,7 @@ async def test_shutdown_cancels_a_live_session_and_closes_its_collaborators(
     )
     sessions = Sessions(cfg, models, reasoning)
 
-    task = sessions.start(connection)
+    task = sessions.start(connection, REQUEST)
     await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
     await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
     assert sessions.live == 1
@@ -311,7 +313,7 @@ async def test_a_failing_session_is_logged_by_type_only(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, vads: list[RecordingVad]
 ) -> None:
     caplog.set_level(logging.DEBUG)
-    cfg = settings_for(tmp_path, REPO_ROOT=str(FIXTURE_REPO))
+    cfg = settings_for(tmp_path)
     connection = FakeConnection(scripted_frames(len(CANONICAL)))
     models = fake_models()
 
@@ -322,7 +324,7 @@ async def test_a_failing_session_is_logged_by_type_only(
     models.final = Exploding()
     sessions = Sessions(cfg, models, FakeReasoningClient(cfg))
 
-    task = sessions.start(connection)
+    task = sessions.start(connection, REQUEST)
     await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), HANG_GUARD_S)
 
     assert isinstance(task.exception(), RuntimeError)

@@ -41,6 +41,7 @@ from tutor.input_path import EndOfTurn
 from tutor.prompt import TurnPrompt
 from tutor.reasoning import TurnChunk
 from tutor.session import TurnLoop
+from tutor.signaling import SessionRequest
 
 UTTERANCE = "walk me through how the http client gets a connection"
 FLOWCHART = """flowchart TD
@@ -173,7 +174,8 @@ class Bench:
         self._dispatched = 0
 
     @classmethod
-    async def boot(cls, cfg: Settings) -> "Bench":
+    async def boot(cls, cfg: Settings, root: Path) -> "Bench":
+        request = SessionRequest(subject=SUBJECT, folder=root)
         loaded = await asyncio.to_thread(load_models)
         synth = TaggedSynth(loaded.synth)
         models = Models(
@@ -181,7 +183,7 @@ class Bench:
         )
         transport = LeadTransport(synth, models.openers)
         source = ScriptedSource()
-        loop = build_loop(cfg, models, ScriptedReasoning(), source, transport)
+        loop = build_loop(cfg, models, ScriptedReasoning(), source, transport, request)
         watch = OutcomeWatch()
         logging.getLogger("tutor.session").addFilter(watch)
         loop_task = asyncio.create_task(loop.run(), name="bench-loop")
@@ -273,10 +275,8 @@ async def main() -> int:
     logging.basicConfig(level=logging.INFO)
     args = build_parser().parse_args()
     root = args.root.resolve()
-    cfg = Settings(
-        reasoning_api_base="scripted", reasoning_api_key="scripted", repo_root=root, subject=SUBJECT
-    )
-    bench = await Bench.boot(cfg)
+    cfg = Settings(reasoning_api_base="scripted", reasoning_api_key="scripted")
+    bench = await Bench.boot(cfg, root)
     samples: list[LeadSample] = []
     try:
         for n in range(WARMUP + args.samples):

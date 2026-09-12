@@ -41,6 +41,7 @@ from tutor.config import Settings, settings
 from tutor.input_path import EndOfTurn, SpeechStarted
 from tutor.reasoning import ReasoningClient
 from tutor.session import TurnLoop
+from tutor.signaling import SessionRequest
 from tutor.tts import KokoroSynthesizer
 
 Interval = tuple[float, float, str]
@@ -152,7 +153,7 @@ class Bench:
 
     @classmethod
     async def boot(cls, cfg: Settings, root: Path, subject: str) -> "Bench":
-        cfg = cfg.model_copy(update={"subject": subject, "repo_root": root})
+        request = SessionRequest(subject=subject, folder=root)
         loaded = await asyncio.to_thread(load_models)
         synth = BusySynth(loaded.synth)
         models = Models(
@@ -161,7 +162,7 @@ class Bench:
         reasoning = MeteredReasoning(ReasoningClient(cfg))
         transport = FlushTransport(synth, models.openers)
         source = ScriptedSource()
-        loop = build_loop(cfg, models, reasoning, source, transport)
+        loop = build_loop(cfg, models, reasoning, source, transport, request)
         watch = FailureWatch()
         logging.getLogger("tutor.session").addFilter(watch)
         loop_task = asyncio.create_task(loop.run(), name="bench-loop")

@@ -9,7 +9,7 @@ from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import AudioStreamTrack
 from yarl import URL
 
-from tutor.signaling import CLIENT_ROOT, CONNECTIONS, HOST, create_app
+from tutor.signaling import CLIENT_ROOT, CONNECTIONS, HOST, SessionRequest, create_app
 from tutor.transport import Connection
 
 LOOPBACK_TIMEOUT_S = 20.0
@@ -22,6 +22,7 @@ BENCH_MERMAID = "<!doctype html><title>mermaid bench</title><div id=canvas></div
 VENDOR = "globalThis.mermaid = {};\n"
 JSON_HEADERS = {"Content-Type": "application/json"}
 PLAIN_HEADERS = {"Content-Type": "text/plain;charset=UTF-8"}
+SESSION = {"subject": "PPO", "folder": "", "starting_from": "I know policy gradients"}
 FOREIGN_ORIGINS = {
     "null": lambda host: {"Origin": "null"},
     "foreign-host": lambda host: {"Origin": "http://evil.example"},
@@ -40,6 +41,12 @@ MALFORMED = [
     json.dumps({"sdp": 17, "type": "offer"}),
     json.dumps({"sdp": "v=0\r\nnonsense\r\n", "type": "offer"}),
     json.dumps({"sdp": "v=0\r\nm=audio\r\n", "type": "offer"}),
+    json.dumps({"sdp": "v=0", "type": "offer"}),
+    json.dumps({"sdp": "v=0", "type": "offer", "session": {"subject": ""}}),
+    json.dumps({"sdp": "v=0", "type": "offer", "session": {"subject": "x", "extra": 1}}),
+    json.dumps(
+        {"sdp": "v=0", "type": "offer", "session": {"subject": "x", "folder": "/nonexistent/dir"}}
+    ),
 ]
 
 
@@ -63,11 +70,13 @@ def offering_peer() -> RTCPeerConnection:
     return RTCPeerConnection(RTCConfiguration(iceServers=[]))
 
 
-async def offer_body(pc: RTCPeerConnection) -> str:
+async def offer_body(pc: RTCPeerConnection, session: dict[str, object] | None = None) -> str:
     pc.createDataChannel("tutor")
     pc.addTrack(AudioStreamTrack())
     await pc.setLocalDescription(await pc.createOffer())
-    return json.dumps({"sdp": pc.localDescription.sdp, "type": "offer"})
+    body: dict[str, object] = {"sdp": pc.localDescription.sdp, "type": "offer"}
+    body["session"] = SESSION if session is None else session
+    return json.dumps(body)
 
 
 async def offer(client: TestClient, pc: RTCPeerConnection) -> dict[str, object]:
@@ -167,7 +176,9 @@ async def test_a_negotiated_connection_is_handed_to_the_callback(tmp_path: Path)
     (tmp_path / "index.html").write_text(INDEX)
     (tmp_path / "client.js").write_text(SCRIPT)
     handed: list[Connection] = []
-    client = TestClient(TestServer(create_app(tmp_path, on_connection=handed.append)))
+    client = TestClient(
+        TestServer(create_app(tmp_path, on_connection=lambda c, r: handed.append(c)))
+    )
     await client.start_server()
     pc = offering_peer()
     try:
@@ -178,6 +189,77 @@ async def test_a_negotiated_connection_is_handed_to_the_callback(tmp_path: Path)
     finally:
         await pc.close()
         await client.close()
+
+
+async def test_the_session_request_reaches_the_callback(tmp_path: Path) -> None:
+    (tmp_path / "index.html").write_text(INDEX)
+    (tmp_path / "client.js").write_text(SCRIPT)
+    seen: list[tuple[Connection, SessionRequest]] = []
+    client = TestClient(
+        TestServer(create_app(tmp_path, on_connection=lambda c, r: seen.append((c, r))))
+    )
+    await client.start_server()
+    pc = offering_peer()
+    try:
+        session = {
+            "subject": "PPO",
+            "folder": str(tmp_path),
+            "starting_from": "  I know policy gradients  ",
+        }
+        response = await client.post(
+            "/offer", data=await offer_body(pc, session), headers=PLAIN_HEADERS
+        )
+        assert response.status == 200
+        ((_, request),) = seen
+        assert request.subject == "PPO"
+        assert request.folder == tmp_path.resolve()
+        assert request.starting_from == "I know policy gradients"
+    finally:
+        await pc.close()
+        await client.close()
+
+
+async def test_a_blank_folder_means_no_folder(tmp_path: Path) -> None:
+    (tmp_path / "index.html").write_text(INDEX)
+    (tmp_path / "client.js").write_text(SCRIPT)
+    seen: list[SessionRequest] = []
+    client = TestClient(TestServer(create_app(tmp_path, on_connection=lambda c, r: seen.append(r))))
+    await client.start_server()
+    pc = offering_peer()
+    try:
+        response = await client.post("/offer", data=await offer_body(pc), headers=PLAIN_HEADERS)
+        assert response.status == 200
+        assert seen[0].folder is None
+    finally:
+        await pc.close()
+        await client.close()
+
+
+async def test_a_folder_that_is_a_file_is_rejected(client: TestClient, tmp_path: Path) -> None:
+    (tmp_path / "paper.md").write_text("PPO")
+    pc = offering_peer()
+    session = {"subject": "PPO", "folder": str(tmp_path / "paper.md")}
+    response = await client.post(
+        "/offer", data=await offer_body(pc, session), headers=PLAIN_HEADERS
+    )
+    assert response.status == 400
+    assert client.app[CONNECTIONS] == set()
+    await pc.close()
+
+
+async def test_a_folder_that_cannot_be_resolved_is_rejected(
+    client: TestClient, tmp_path: Path
+) -> None:
+    (tmp_path / "a").symlink_to(tmp_path / "b")
+    (tmp_path / "b").symlink_to(tmp_path / "a")
+    pc = offering_peer()
+    session = {"subject": "PPO", "folder": str(tmp_path / "a")}
+    response = await client.post(
+        "/offer", data=await offer_body(pc, session), headers=PLAIN_HEADERS
+    )
+    assert response.status == 400
+    assert client.app[CONNECTIONS] == set()
+    await pc.close()
 
 
 @pytest.mark.parametrize("body", MALFORMED)
@@ -196,7 +278,9 @@ async def test_an_offer_from_a_foreign_origin_is_rejected(
 ) -> None:
     (tmp_path / "index.html").write_text(INDEX)
     handed: list[Connection] = []
-    client = TestClient(TestServer(create_app(tmp_path, on_connection=handed.append)))
+    client = TestClient(
+        TestServer(create_app(tmp_path, on_connection=lambda c, r: handed.append(c)))
+    )
     await client.start_server()
     pc = offering_peer()
     try:

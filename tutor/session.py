@@ -122,10 +122,14 @@ class OutcomeSplitter:
 class TurnLoopConfig(BaseModel):
     system: str
     subject: str
-    root: Path
+    starting_from: str = ""
+    root: Path | None = None
     budget: SearchBudget = Field(default_factory=SearchBudget)
     stage_gap_ms: int = Field(default=2000, gt=0)
     tool_round_max_tokens: int = Field(default=2000, gt=0)
+    history_turns: int = Field(default=10, ge=0)
+    visual_timeout_s: float = Field(default=90.0, gt=0)
+    visual_max_tokens: int = Field(default=3000, gt=0)
     speculative_reasoning: bool = False
 
 

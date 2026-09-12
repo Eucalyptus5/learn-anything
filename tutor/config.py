@@ -1,5 +1,4 @@
 from functools import lru_cache
-from pathlib import Path
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -14,8 +13,9 @@ class Settings(BaseSettings):
     reasoning_model: str = "glm-5.3-flash"
     reasoning_effort: str = "low"
     reasoning_max_tokens: int = 400
-    repo_root: Path = Path(".")
-    subject: str = "this repository"
+    history_turns: int = Field(default=10, ge=0)
+    visual_timeout_s: float = Field(default=90.0, gt=0)
+    visual_max_tokens: int = Field(default=3000, gt=0)
     signaling_port: int = 8080
 
 

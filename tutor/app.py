@@ -14,6 +14,7 @@ from tutor.openers import synthesize_openers
 from tutor.prompt import SYSTEM_PROMPT
 from tutor.reasoning import ReasoningClient
 from tutor.session import TurnLoop, TurnLoopConfig
+from tutor.signaling import SessionRequest
 from tutor.speech import Speaker
 from tutor.stt import FINAL_CPU_THREADS, PARTIAL_CPU_THREADS, Transcriber, load_whisper
 from tutor.tools.provenance import TurnRegistry
@@ -56,10 +57,17 @@ def build_loop(
     reasoning: ReasoningClient,
     source: InputPath,
     transport: Connection,
+    request: SessionRequest,
 ) -> TurnLoop:
     speaker = Speaker(models.synth, transport, models.openers)
     loop_cfg = TurnLoopConfig(
-        system=SYSTEM_PROMPT, subject=cfg.subject, root=cfg.repo_root.resolve()
+        system=SYSTEM_PROMPT,
+        subject=request.subject,
+        starting_from=request.starting_from,
+        root=request.folder,
+        history_turns=cfg.history_turns,
+        visual_timeout_s=cfg.visual_timeout_s,
+        visual_max_tokens=cfg.visual_max_tokens,
     )
     return TurnLoop(loop_cfg, source, search, speaker, transport, reasoning, TurnRegistry())
 
@@ -76,10 +84,10 @@ class Sessions:
     def live(self) -> int:
         return len(self._tasks)
 
-    def start(self, connection: Connection) -> asyncio.Task[None]:
+    def start(self, connection: Connection, request: SessionRequest) -> asyncio.Task[None]:
         self._started += 1
         name = f"session-{self._started}"
-        task = asyncio.create_task(self._session(connection), name=name)
+        task = asyncio.create_task(self._session(connection, request), name=name)
         self._tasks.add(task)
         task.add_done_callback(self._done)
         logger.info("session.started name=%s live=%d", name, len(self._tasks))
@@ -94,11 +102,11 @@ class Sessions:
         if error is not None:
             logger.error("session.failed error=%s", type(error).__name__)
 
-    async def _session(self, connection: Connection) -> None:
+    async def _session(self, connection: Connection, request: SessionRequest) -> None:
         vad = await asyncio.to_thread(SileroVad, VAD_MODEL)
         source = InputPath(connection, vad, self._models.partial, self._models.final)
         try:
-            loop = build_loop(self._cfg, self._models, self._reasoning, source, connection)
+            loop = build_loop(self._cfg, self._models, self._reasoning, source, connection, request)
             try:
                 await loop.run()
             finally:
