@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from tests.fakes import Spawned, record_spawns
+from tutor.brief import BRIEF_END, BRIEF_MARKER
 from tutor.prompt import (
     SEARCH_CODE_TOOL,
     SYSTEM_PROMPT,
@@ -19,7 +20,6 @@ from tutor.prompt import (
 )
 from tutor.tools.models import PATH_EXTENSIONS, SearchBudget, SearchMatch, SearchResult
 from tutor.tools.search import search
-from tutor.visual_tools import VISUAL_TOOLS
 
 FIXTURE_ROOT = Path(__file__).parent / "data" / "fixture_repo"
 
@@ -488,8 +488,16 @@ def test_prompt_without_a_tool_exchange_is_unchanged() -> None:
     ]
 
 
-def test_the_system_prompt_names_every_visual_tool_and_stays_ascii() -> None:
-    for tool in VISUAL_TOOLS:
-        assert tool["function"]["name"] in SYSTEM_PROMPT
-
+def test_the_system_prompt_names_the_brief_markers_and_stays_ascii() -> None:
+    assert BRIEF_MARKER in SYSTEM_PROMPT
+    assert BRIEF_END in SYSTEM_PROMPT
     assert SYSTEM_PROMPT.isascii()
+    assert "push_diagram" not in SYSTEM_PROMPT
+
+
+def test_the_system_prompt_names_the_three_phases() -> None:
+    assert "Teach:" in SYSTEM_PROMPT
+    assert "Concrete:" in SYSTEM_PROMPT
+    assert "Interrogate:" in SYSTEM_PROMPT
+    assert "Explore" not in SYSTEM_PROMPT
+    assert "Reverse Feynman" not in SYSTEM_PROMPT

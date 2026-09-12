@@ -380,6 +380,9 @@ class BenchTransport(Connection):
         self.ledger.append(Enqueued(at, None if opener else self._synth.last, len(pcm)))
         await super().play(floored(pcm))
 
+    async def send_json(self, payload: dict[str, object]) -> None:
+        return None
+
     async def drain(self) -> None:
         while True:
             frame = await self._track.recv()

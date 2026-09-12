@@ -2,8 +2,9 @@ import asyncio
 import json
 import logging
 import re
+import typing
 from collections import deque
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from pathlib import Path
 
 import av
@@ -12,6 +13,7 @@ import pytest
 from aiortc.mediastreams import MediaStreamError, MediaStreamTrack
 
 from tests.fakes import local_peer, numbered_frames
+from tests.test_transport import FakeChannel
 from tutor.chunker import split_clauses
 from tutor.constants import FRAME_SAMPLES, SAMPLE_RATE
 from tutor.endpointer import SILENCE_WINDOW_MS
@@ -25,11 +27,13 @@ from tutor.input_path import (
 )
 from tutor.lead_in import lead_in_sentence, lead_in_stages, opener_key
 from tutor.pedagogy import PedagogyState, Phase, TurnOutcome
-from tutor.prompt import SEARCH_CODE_TOOL, TurnPrompt
+from tutor.prompt import SEARCH_CODE_TOOL, Message, TurnPrompt
 from tutor.reasoning import TurnChunk
 from tutor.session import (
     BAD_ARGUMENTS,
+    CONCEPT_OUTCOME_INSTRUCTION,
     OPENER,
+    OUTCOME_INSTRUCTION,
     OUTCOME_MARKER,
     SPOKEN_DEPTH,
     OutcomeSplitter,
@@ -117,7 +121,6 @@ DIAGRAM_PAYLOAD = {
     "kind": "flowchart",
     "source": DIAGRAM_SOURCE,
     "title": "reader",
-    "seq": 1,
 }
 GROUNDED_HIGHLIGHT = json.dumps({"path": GROUNDED_PATH, "start_line": 24, "end_line": 24})
 UNGROUNDED_HIGHLIGHT = json.dumps({"path": UNGROUNDED_PATH, "start_line": 30, "end_line": 30})
@@ -161,6 +164,19 @@ SPLIT_OUTCOME_DELTAS = [
     'tcome>{"signal": ',
     '"covered", "settling_positions": []}',
 ]
+CONCEPT_TEXT = "teach me ppo"
+STARTING_FROM = "I know policy gradients"
+CONCEPT_DELTAS = ["We run 10 epochs ", "on 2048 samples. ", "Look in setup.py ", "for the flags."]
+CONCEPT_CLAUSES = ["We run 10 epochs on 2048 samples.", "Look in setup.py for the flags."]
+TOLD_OUTCOME = OUTCOME_MARKER + json.dumps({"signal": "told", "settling_positions": []})
+SETTLING_TEXT = "past epsilon the objective is flat"
+SETTLED_OUTCOME = OUTCOME_MARKER + json.dumps(
+    {
+        "signal": "misconception",
+        "settling": SETTLING_TEXT,
+        "settling_positions": [{"path": "ppo.py", "line": 12}],
+    }
+)
 GROUNDING_SPAN = re.compile(r"^turn\.grounding turn_id=\S+ ms=250$")
 SPOKEN_SPAN = re.compile(r"^turn\.spoken turn_id=\S+ ms=500$")
 
@@ -207,6 +223,10 @@ def found_many() -> SearchResult:
 
 def config(root: Path) -> TurnLoopConfig:
     return TurnLoopConfig(system=SYSTEM, subject=SUBJECT, root=root)
+
+
+def concept_cfg() -> TurnLoopConfig:
+    return TurnLoopConfig(system=SYSTEM, subject="PPO", starting_from=STARTING_FROM, root=None)
 
 
 class FakeClock:
@@ -389,21 +409,34 @@ class FakeSpeaker:
         self.finished.set()
 
 
+VISUAL_PAYLOAD_TYPES = frozenset({"diagram.push", "diagram.clear", "source.highlight", "app.push"})
+
+
+def sent(log: list[tuple[str, object]], kind: str) -> list[dict[str, object]]:
+    return [p for name, p in log if name == "send_json" and p["type"] == kind]
+
+
+def without_seq(payload: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in payload.items() if key != "seq"}
+
+
 class LoggingTransport:
     def __init__(self, log: list[tuple[str, object]]) -> None:
         self._log = log
+        self.handlers: list[Callable[[dict[str, object]], None]] = []
 
     def flush_playout(self) -> None:
         self._log.append(("flush_playout", None))
 
+    async def send_json(self, payload: dict[str, object]) -> None:
+        self._log.append(("send_json", payload))
+
+    def on_json(self, handler: Callable[[dict[str, object]], None]) -> None:
+        self.handlers.append(handler)
+
 
 def visual_call(name: str, arguments: str, call_id: str) -> TurnChunk:
     return TurnChunk(kind="tool_call", text=arguments, tool_call_id=call_id, tool_name=name)
-
-
-class RecordingTransport(LoggingTransport):
-    async def send_json(self, payload: dict[str, object]) -> None:
-        self._log.append(("send_json", payload))
 
 
 class HeldTransport(LoggingTransport):
@@ -414,6 +447,8 @@ class HeldTransport(LoggingTransport):
 
     async def send_json(self, payload: dict[str, object]) -> None:
         self._log.append(("send_json", payload))
+        if payload["type"] not in VISUAL_PAYLOAD_TYPES:
+            return
         self.held.set()
         await self.release.wait()
 
@@ -425,6 +460,20 @@ class ChannelClosed(Exception):
 class ClosedTransport(LoggingTransport):
     async def send_json(self, payload: dict[str, object]) -> None:
         raise ChannelClosed()
+
+
+class ClosedListeningTransport(LoggingTransport):
+    async def send_json(self, payload: dict[str, object]) -> None:
+        if payload["type"] == "state" and payload["state"] == "listening":
+            raise ChannelClosed()
+        self._log.append(("send_json", payload))
+
+
+class ClosedCanvasTransport(LoggingTransport):
+    async def send_json(self, payload: dict[str, object]) -> None:
+        if payload["type"] in VISUAL_PAYLOAD_TYPES:
+            raise ChannelClosed()
+        self._log.append(("send_json", payload))
 
 
 class RateLimited(Exception):
@@ -723,6 +772,7 @@ async def test_frames_keep_arriving_while_a_turn_is_in_flight(tmp_path: Path) ->
         FakeClock(),
     )
     running = asyncio.create_task(loop.run())
+    pc.emit("datachannel", FakeChannel())
     pc.emit("track", PacedTrack(numbered_frames(len(PACED_PROBABILITIES)), pace, emitted))
 
     for _ in range(LEAD_FRAMES):
@@ -1735,7 +1785,7 @@ async def test_a_visual_tool_call_reaches_the_channel_before_the_sentence_that_f
         source,
         search,
         speaker,
-        RecordingTransport(log),
+        LoggingTransport(log),
         reasoning,
         FakeRegistry(log),
         FakeClock(),
@@ -1743,8 +1793,9 @@ async def test_a_visual_tool_call_reaches_the_channel_before_the_sentence_that_f
 
     await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    assert [payload for name, payload in log if name == "send_json"] == [DIAGRAM_PAYLOAD]
-    assert log.index(("send_json", DIAGRAM_PAYLOAD)) < log.index(("speak", SPOKEN_CLAUSES[0]))
+    pushes = sent(log, "diagram.push")
+    assert [without_seq(payload) for payload in pushes] == [DIAGRAM_PAYLOAD]
+    assert log.index(("send_json", pushes[0])) < log.index(("speak", SPOKEN_CLAUSES[0]))
     assert reasoning.prompts[1].tool_exchange[1].content == "push_diagram: sent"
     assert [tool["function"]["name"] for tool in reasoning.tools[0]] == [
         "search_code",
@@ -1777,7 +1828,7 @@ async def test_a_payload_on_a_cancelled_turn_is_never_sent(tmp_path: Path) -> No
         source,
         search,
         speaker,
-        RecordingTransport(log),
+        LoggingTransport(log),
         reasoning,
         FakeRegistry(log),
         FakeClock(),
@@ -1795,7 +1846,7 @@ async def test_a_payload_on_a_cancelled_turn_is_never_sent(tmp_path: Path) -> No
 
     assert turn.cancelled()
     assert drain.cancelled()
-    assert "send_json" not in [name for name, _ in log]
+    assert sent(log, "diagram.push") == []
     assert len(reasoning.prompts) == 1
     assert ("abandon", "turn-1") in log
 
@@ -1839,7 +1890,7 @@ async def test_a_barge_in_during_a_push_sends_nothing_further(tmp_path: Path) ->
 
     assert turn.cancelled()
     assert drain.cancelled()
-    assert [name for name, _ in log].count("send_json") == 1
+    assert len(sent(log, "diagram.push")) == 1
     assert len(reasoning.prompts) == 1
     assert ("abandon", "turn-1") in log
     steps = [name for name, _ in log]
@@ -1868,7 +1919,7 @@ async def test_grounding_reaches_the_channel_before_a_highlight_and_an_ungrounde
         source,
         search,
         speaker,
-        RecordingTransport(log),
+        LoggingTransport(log),
         reasoning,
         TurnRegistry(),
         FakeClock(),
@@ -1876,14 +1927,8 @@ async def test_grounding_reaches_the_channel_before_a_highlight_and_an_ungrounde
 
     await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    assert [payload for name, payload in log if name == "send_json"] == [
-        {
-            "type": "source.highlight",
-            "path": GROUNDED_PATH,
-            "start_line": 24,
-            "end_line": 24,
-            "seq": 1,
-        }
+    assert [without_seq(payload) for payload in sent(log, "source.highlight")] == [
+        {"type": "source.highlight", "path": GROUNDED_PATH, "start_line": 24, "end_line": 24}
     ]
     exchange = reasoning.prompts[1].tool_exchange
     assert [message.content for message in exchange[1:]] == [
@@ -1909,7 +1954,7 @@ async def test_a_transport_error_in_a_push_ends_the_drain_and_the_next_turn_is_t
         source,
         search,
         speaker,
-        ClosedTransport(log),
+        ClosedCanvasTransport(log),
         reasoning,
         FakeRegistry(log),
         FakeClock(),
@@ -2595,7 +2640,7 @@ async def test_a_speculative_round_carries_no_visual_tools(tmp_path: Path) -> No
         source,
         search,
         speaker,
-        RecordingTransport(log),
+        LoggingTransport(log),
         reasoning,
         FakeRegistry(log),
         FakeClock(),
@@ -2610,7 +2655,8 @@ async def test_a_speculative_round_carries_no_visual_tools(tmp_path: Path) -> No
     await asyncio.wait_for(running, HANG_GUARD_S)
 
     assert reasoning.tools == [[SEARCH_CODE_TOOL]]
-    assert "send_json" not in [name for name, _ in log]
+    pushed = [payload for name, payload in log if name == "send_json"]
+    assert [payload for payload in pushed if payload["type"] in VISUAL_PAYLOAD_TYPES] == []
     assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
     await loop.aclose()
 
@@ -3381,6 +3427,559 @@ async def test_a_misconception_in_the_follow_up_is_the_turns_outcome(
     assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]] * 4
     spoken = [str(text) for name, text in log if name == "speak"]
     assert all(OUTCOME_MARKER not in text and "{" not in text for text in spoken)
+    await loop.aclose()
+
+
+def states(log: list[tuple[str, object]]) -> list[str]:
+    return [str(payload["state"]) for payload in sent(log, "state")]
+
+
+def outcome_signals() -> list[str]:
+    annotation = TurnOutcome.model_fields["signal"].annotation
+    literal = next(member for member in typing.get_args(annotation) if member is not type(None))
+    names = list(typing.get_args(literal))
+    assert names
+    return names
+
+
+async def test_a_concept_turn_makes_one_call_with_no_tools_and_no_search() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, found())
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    source = SerialSource([CONCEPT_TEXT])
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+    )
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert search.calls == []
+    assert speaker.openers == []
+    assert reasoning.tools == [None]
+    prompt = reasoning.prompts[0]
+    assert prompt.tool_context == []
+    assert prompt.user_text == CONCEPT_TEXT
+    assert "Subject: PPO" in prompt.system
+    assert f"Starting from: {STARTING_FROM}" in prompt.system
+    assert speaker.utterances == [SPOKEN_CLAUSES]
+    assert ("open_turn", "turn-1") in log
+    await loop.aclose()
+
+
+async def test_a_concept_turn_sends_thinking_then_speaking_then_listening() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, found())
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    source = SerialSource([CONCEPT_TEXT])
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+    )
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert [(p["state"], p["phase"]) for p in sent(log, "state")] == [
+        ("thinking", "teach"),
+        ("speaking", "teach"),
+        ("listening", "teach"),
+    ]
+    speaking = next(
+        i for i, (n, p) in enumerate(log) if n == "send_json" and p.get("state") == "speaking"
+    )
+    assert speaking < log.index(("speak", SPOKEN_CLAUSES[0]))
+    await loop.aclose()
+
+
+async def test_the_state_carries_the_phase_after_it_moves() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, found())
+    turns = [spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME]), spoken_chunks(SPOKEN_DELTAS)]
+    reasoning = FakeReasoning(log, [], speaker.received, turns=turns)
+    source = SerialSource([CONCEPT_TEXT, "why clip"])
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+    )
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    phases = [p["phase"] for p in sent(log, "state")]
+    assert phases == ["teach", "teach", "concrete", "concrete", "concrete", "concrete"]
+    await loop.aclose()
+
+
+async def test_every_spoken_clause_is_captioned_before_it_is_spoken() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, found())
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    source = SerialSource([CONCEPT_TEXT])
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+    )
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    captions = sent(log, "caption")
+    assert [p["text"] for p in captions] == SPOKEN_CLAUSES
+    for caption in captions:
+        assert caption["turn_id"] == "turn-1"
+        assert log.index(("send_json", caption)) < log.index(("speak", caption["text"]))
+    await loop.aclose()
+
+
+async def test_the_learner_text_reaches_the_channel_before_the_call() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, found())
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    source = SerialSource([CONCEPT_TEXT])
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+    )
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    transcript = {"type": "transcript", "turn_id": "turn-1", "text": CONCEPT_TEXT, "seq": 1}
+    assert sent(log, "transcript") == [transcript]
+    assert log.index(("send_json", transcript)) < log.index(("start_turn", CONCEPT_TEXT))
+    await loop.aclose()
+
+
+async def test_the_second_turn_carries_the_first_in_its_history() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, found())
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    source = SerialSource([CONCEPT_TEXT, "why clip"])
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+    )
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert reasoning.prompts[0].history == []
+    assert reasoning.prompts[1].history == [
+        Message(role="user", content=CONCEPT_TEXT),
+        Message(role="assistant", content=" ".join(SPOKEN_CLAUSES)),
+    ]
+    await loop.aclose()
+
+
+async def test_history_is_bounded_by_the_config() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, found())
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    source = SerialSource([CONCEPT_TEXT, "two", "three"])
+    loop = TurnLoop(
+        concept_cfg().model_copy(update={"history_turns": 1}),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+    )
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert reasoning.prompts[2].history == [
+        Message(role="user", content="two"),
+        Message(role="assistant", content=" ".join(SPOKEN_CLAUSES)),
+    ]
+    await loop.aclose()
+
+
+async def test_a_cancelled_concept_turn_keeps_what_was_spoken_and_ends_listening() -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold)
+    search = FakeSearch(log, found())
+    gate = asyncio.Event()
+    deltas = spoken_chunks(SPOKEN_DELTAS)
+    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate, holds_at=3)
+    barge = asyncio.Event()
+    resume = asyncio.Event()
+    source = ScriptedSource(
+        [EndOfTurn(text=CONCEPT_TEXT), barge, SpeechStarted(), resume, EndOfTurn(text="two")]
+    )
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+    drain = drain_task()
+    assert speaker.utterances == [[SPOKEN_CLAUSES[0]]]
+    turn = turn_task()
+
+    log.append(("barge", None))
+    await pull_past(source, barge)
+    gate.set()
+    hold.set()
+    await asyncio.wait_for(asyncio.wait([turn]), HANG_GUARD_S)
+
+    assert turn.cancelled()
+    assert drain.cancelled()
+    steps = [name for name, _ in log]
+    assert (
+        steps.index("barge")
+        < steps.index("flush_playout")
+        < steps.index("stream_closed")
+        < steps.index("speak_cancelled")
+        < log.index(("abandon", "turn-1"))
+    )
+    assert states(log) == ["thinking", "speaking", "listening"]
+    assert ("open_turn", "turn-2") not in log
+
+    resume.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert reasoning.prompts[1].history[1].content == SPOKEN_CLAUSES[0]
+    assert speaker.utterances == [[SPOKEN_CLAUSES[0]], SPOKEN_CLAUSES]
+    assert states(log) == ["thinking", "speaking", "listening"] * 2
+    await loop.aclose()
+
+
+async def test_a_failed_listening_push_on_a_cancelled_turn_keeps_the_cancellation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold)
+    search = FakeSearch(log, found())
+    gate = asyncio.Event()
+    deltas = spoken_chunks(SPOKEN_DELTAS)
+    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate, holds_at=3)
+    barge = asyncio.Event()
+    resume = asyncio.Event()
+    source = ScriptedSource(
+        [EndOfTurn(text=CONCEPT_TEXT), barge, SpeechStarted(), resume, EndOfTurn(text="two")]
+    )
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        search,
+        speaker,
+        ClosedListeningTransport(log),
+        reasoning,
+        FakeRegistry(log),
+    )
+    with caplog.at_level(logging.WARNING, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+
+        await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+        await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+        await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+        drain = drain_task()
+        turn = turn_task()
+
+        await pull_past(source, barge)
+        gate.set()
+        hold.set()
+        await asyncio.wait_for(asyncio.wait([turn]), HANG_GUARD_S)
+
+        assert turn.cancelled()
+        assert drain.cancelled()
+        messages = session_messages(caplog)
+        assert "turn.state_push_failed turn_id=turn-1 error=ChannelClosed" in messages
+        assert not [message for message in messages if message.startswith("turn.failed")]
+        assert ("abandon", "turn-1") in log
+
+        resume.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+    await loop.aclose()
+
+
+async def test_a_turn_without_a_folder_speaks_bare_numbers_and_withholds_paths(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, found())
+    reasoning = FakeReasoning(log, spoken_chunks(CONCEPT_DELTAS), speaker.received)
+    source = SerialSource([CONCEPT_TEXT])
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        TurnRegistry(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert speaker.utterances == [[CONCEPT_CLAUSES[0]]]
+    withheld = [m for m in session_messages(caplog) if m.startswith("turn.chunk_withheld")]
+    assert withheld == ["turn.chunk_withheld turn_id=turn-1 source=model ungrounded=1"]
+    await loop.aclose()
+
+
+async def test_a_turn_with_a_folder_still_withholds_a_bare_number(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    result = found()
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, result)
+    reasoning = FakeReasoning(log, spoken_chunks(CONCEPT_DELTAS), speaker.received)
+    source = SerialSource([CONCEPT_TEXT])
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        TurnRegistry(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert speaker.utterances == [[lead_in_sentence([result])]]
+    withheld = [m for m in session_messages(caplog) if m.startswith("turn.chunk_withheld")]
+    assert withheld == [
+        "turn.chunk_withheld turn_id=turn-1 source=model ungrounded=2",
+        "turn.chunk_withheld turn_id=turn-1 source=model ungrounded=1",
+    ]
+    await loop.aclose()
+
+
+def test_the_outcome_instruction_names_every_signal_the_outcome_accepts() -> None:
+    for name in outcome_signals():
+        assert name in OUTCOME_INSTRUCTION
+
+
+def test_the_concept_instruction_names_every_signal_and_no_position() -> None:
+    for name in outcome_signals():
+        assert name in CONCEPT_OUTCOME_INSTRUCTION
+    assert "settling_positions" not in CONCEPT_OUTCOME_INSTRUCTION
+
+
+async def test_a_concept_turn_drops_a_settling_position_before_the_next_directive() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, found())
+    turns = [
+        spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME]),
+        spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME]),
+        spoken_chunks([*SPOKEN_DELTAS, SETTLED_OUTCOME]),
+        spoken_chunks(SPOKEN_DELTAS),
+    ]
+    reasoning = FakeReasoning(log, [], speaker.received, turns=turns)
+    source = SerialSource(
+        [CONCEPT_TEXT, "why clip", "quiz me", "the clip makes the gradient larger"]
+    )
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+    )
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    systems = [prompt.system for prompt in reasoning.prompts]
+    assert CONCEPT_OUTCOME_INSTRUCTION in systems[0]
+    assert "settling_positions" not in systems[0]
+    assert INTERROGATE_DIRECTIVE in systems[2]
+    assert f"Settle the misconception here: {SETTLING_TEXT}" in systems[3]
+    assert "ppo.py" not in systems[3]
+    assert search.calls == []
+    await loop.aclose()
+
+
+async def test_a_told_signal_in_interrogate_returns_the_next_turn_to_teach(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, found())
+    turns = [
+        spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME]),
+        spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME]),
+        spoken_chunks([*SPOKEN_DELTAS, TOLD_OUTCOME]),
+        spoken_chunks(SPOKEN_DELTAS),
+    ]
+    reasoning = FakeReasoning(log, [], speaker.received, turns=turns)
+    source = SerialSource([CONCEPT_TEXT, "quiz me", "just tell me", "go on"])
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert "turn.outcome turn_id=turn-3 signal=told phase=teach" in outcome_lines(caplog)
+    assert TEACH_DIRECTIVE in reasoning.prompts[3].system
+    await loop.aclose()
+
+
+async def test_a_cancelled_turns_listening_push_yields_to_the_next_turn() -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold)
+    search = FakeSearch(log, found())
+    gate = asyncio.Event()
+    close_gate = asyncio.Event()
+    deltas = spoken_chunks(SPOKEN_DELTAS)
+    reasoning = FakeReasoning(
+        log, deltas, speaker.received, gate=gate, holds_at=3, close_gate=close_gate
+    )
+    barge = asyncio.Event()
+    resume = asyncio.Event()
+    source = ScriptedSource(
+        [EndOfTurn(text=CONCEPT_TEXT), barge, SpeechStarted(), resume, EndOfTurn(text="two")]
+    )
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+    turn = turn_task()
+
+    await pull_past(source, barge)
+    await asyncio.wait_for(reasoning.streams[0].closing.wait(), HANG_GUARD_S)
+    assert not turn.done()
+    assert states(log) == ["thinking", "speaking"]
+
+    speaker.received.clear()
+    resume.set()
+    await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+    assert len(reasoning.streams) == 2
+    assert ("open_turn", "turn-2") in log
+    assert not turn.done()
+
+    close_gate.set()
+    await asyncio.wait_for(asyncio.wait([turn]), HANG_GUARD_S)
+    assert turn.cancelled()
+    gate.set()
+    hold.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert states(log) == ["thinking", "speaking", "thinking", "speaking", "listening"]
+    await loop.aclose()
+
+
+async def test_a_transport_error_on_a_state_push_ends_the_turn_and_the_next_is_taken(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, found())
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    source = SerialSource([CONCEPT_TEXT, "two"])
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        search,
+        speaker,
+        ClosedTransport(log),
+        reasoning,
+        FakeRegistry(log),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    messages = session_messages(caplog)
+    assert "turn.failed turn_id=turn-1 error=ChannelClosed" in messages
+    assert "turn.failed turn_id=turn-2 error=ChannelClosed" in messages
+    await loop.aclose()
+
+
+async def test_a_partial_with_no_folder_starts_no_speculation() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, found())
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    source = ScriptedSource([PartialTranscript(text=PARTIAL_TEXT)])
+    loop = TurnLoop(
+        concept_cfg().model_copy(update={"speculative_reasoning": True}),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+    )
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert [
+        task.get_name() for task in asyncio.all_tasks() if task.get_name() == SPECULATION_TASK
+    ] == []
+    assert search.calls == []
+    assert reasoning.prompts == []
+    assert log == []
     await loop.aclose()
 
 

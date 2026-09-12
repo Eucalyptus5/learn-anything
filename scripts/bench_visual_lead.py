@@ -122,13 +122,18 @@ class ScriptedReasoning:
         )
 
 
+VISUAL_KINDS = frozenset({"diagram.push", "diagram.clear", "source.highlight", "app.push"})
+
+
 class LeadTransport(BenchTransport):
     def __init__(self, synth: TaggedSynth, openers: dict[str, np.ndarray]) -> None:
         super().__init__(synth, openers)
         self.pushes: list[tuple[float, str]] = []
 
     async def send_json(self, payload: dict[str, object]) -> None:
-        self.pushes.append((time.perf_counter(), str(payload["type"])))
+        kind = str(payload["type"])
+        if kind in VISUAL_KINDS:
+            self.pushes.append((time.perf_counter(), kind))
 
 
 def explanation_index(played: Sequence[Enqueued], explanation: str) -> int | None:

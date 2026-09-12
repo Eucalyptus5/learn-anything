@@ -12,7 +12,7 @@ import pytest
 
 from tests.fakes import FakeSynthesizer, FakeTransport
 from tests.test_input_path import CANONICAL, FakeVad, scripted_frames
-from tests.test_session import SPOKEN_DELTAS, FakeReasoning, spoken_chunks
+from tests.test_session import SPOKEN_DELTAS, STARTING_FROM, FakeReasoning, spoken_chunks
 from tutor import app
 from tutor.app import Models, Sessions, build_loop
 from tutor.config import Settings
@@ -212,24 +212,33 @@ def test_main_boots_from_injected_settings_and_shuts_down_on_sigint(
     assert not ready_line.endswith("port=0")
 
 
-async def test_build_loop_speaks_the_thinking_opener_on_end_of_turn(tmp_path: Path) -> None:
+async def test_build_loop_runs_a_concept_turn_from_the_session_request(tmp_path: Path) -> None:
     cfg = settings_for(tmp_path)
     log: list[tuple[str, object]] = []
     transport = FakeTransport()
     reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), asyncio.Event())
+    request = SessionRequest(subject="PPO", starting_from=STARTING_FROM)
 
     models = fake_models()
-    loop = build_loop(cfg, models, reasoning, EndOfTurnSource([USER_TEXT]), transport, REQUEST)
+    loop = build_loop(cfg, models, reasoning, EndOfTurnSource([USER_TEXT]), transport, request)
     assert models.synth.calls == []
     assert transport.played == []
     await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    assert transport.played[0] is models.openers[OPENER]
-    assert len(transport.played) > 1
     (prompt,) = reasoning.prompts
     assert prompt.system.startswith(SYSTEM_PROMPT)
-    assert f"Subject: {SUBJECT}" in prompt.system
+    assert "Subject: PPO" in prompt.system
+    assert prompt.tool_context == []
     assert prompt.user_text == USER_TEXT
+    assert len(transport.played) == len(models.synth.calls) > 0
+    openers = list(models.openers.values())
+    assert all(pcm is not opener for pcm in transport.played for opener in openers)
+    assert transport.sent[0] == {
+        "type": "transcript",
+        "turn_id": "turn-1",
+        "text": USER_TEXT,
+        "seq": 1,
+    }
 
 
 async def test_session_ends_on_its_own_when_the_frames_end(

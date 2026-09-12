@@ -81,6 +81,7 @@ class FakeSynthesizer:
 class FakeTransport:
     def __init__(self) -> None:
         self.played: list[np.ndarray] = []
+        self.sent: list[dict[str, object]] = []
         self.flushes = 0
 
     async def play(self, pcm: np.ndarray) -> None:
@@ -88,6 +89,9 @@ class FakeTransport:
 
     def flush_playout(self) -> None:
         self.flushes += 1
+
+    async def send_json(self, payload: dict[str, object]) -> None:
+        self.sent.append(payload)
 
 
 def numbered_frame(value: int, pts: int) -> av.AudioFrame:

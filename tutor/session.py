@@ -4,7 +4,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -24,9 +24,10 @@ from tutor.reasoning import ReasoningClient, TurnChunk
 from tutor.speech import Speaker
 from tutor.tools.models import SearchBudget, SearchResult
 from tutor.tools.provenance import TurnRegistry
+from tutor.transcript import Transcript
 from tutor.transport import Connection
 from tutor.visual_tools import VISUAL_TOOLS, dispatch_visual_tool
-from tutor.visuals import VisualChannel
+from tutor.visuals import Caption, LearnerText, TurnState, VisualChannel
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +43,16 @@ BAD_ARGUMENTS = "search_code takes a query string and a non-empty list of glob s
 OUTCOME_MARKER = "<outcome>"
 OUTCOME_INSTRUCTION = (
     f"End every reply with a line holding exactly {OUTCOME_MARKER} followed by one JSON object "
-    'with "signal" (one of covered, follow_up, correct, misconception, or null) and '
-    '"settling_positions" (a list of objects with "path" and "line") naming where a '
+    'with "signal" (one of covered, follow_up, correct, misconception, told, or null), '
+    '"settling" (one sentence naming the counterexample or case that settles a misconception) '
+    'and "settling_positions" (a list of objects with "path" and "line") naming where a '
     "misconception is settled. Nothing after the marker is spoken."
+)
+CONCEPT_OUTCOME_INSTRUCTION = (
+    f"End every reply with a line holding exactly {OUTCOME_MARKER} followed by one JSON object "
+    'with "signal" (one of covered, follow_up, correct, misconception, told, or null) and '
+    '"settling" (one sentence naming the counterexample or case that settles a misconception). '
+    "Nothing after the marker is spoken."
 )
 
 
@@ -170,6 +178,7 @@ class TurnLoop:
         self._clock = clock
         self._pace = pace
         self._pedagogy = PedagogyState()
+        self._transcript = Transcript(cfg.history_turns)
         self._turns: set[asyncio.Task[None]] = set()
         self._drains: dict[str, asyncio.Task[TurnOutcome]] = {}
         self._pumps: dict[str, asyncio.Task[None]] = {}
@@ -182,7 +191,7 @@ class TurnLoop:
             if isinstance(event, SpeechStarted):
                 self._interrupt()
             elif isinstance(event, PartialTranscript):
-                if self._cfg.speculative_reasoning and event.text:
+                if self._cfg.speculative_reasoning and self._cfg.root is not None and event.text:
                     self._prime(event.text)
             elif isinstance(event, EndOfTurn):
                 self._dispatched += 1
@@ -263,7 +272,7 @@ class TurnLoop:
             logger.info(
                 "turn.speculation turn_id=%s ms=%d", turn_id, _elapsed_ms(start, self._clock())
             )
-            prompt = self._prompt(result, speculation.text)
+            prompt = self._prompt([result], speculation.text, turn_id)
             queue: asyncio.Queue[str | None] = asyncio.Queue(SPOKEN_DEPTH)
             speculation.grounded.set_result((result, prompt, queue))
             return await self._drain(turn_id, prompt, queue, [SEARCH_CODE_TOOL])
@@ -302,45 +311,79 @@ class TurnLoop:
             return settled
         return await derive_globs(user_text, self._cfg.root)
 
-    def _prompt(self, result: SearchResult, user_text: str) -> TurnPrompt:
-        system = (
-            f"{self._cfg.system}\n\nSubject: {self._cfg.subject}\n\n"
-            f"{self._pedagogy.prompt_directive()}\n\n{OUTCOME_INSTRUCTION}"
+    def _prompt(self, results: list[SearchResult], user_text: str, turn_id: str) -> TurnPrompt:
+        starting = (
+            f"Starting from: {self._cfg.starting_from}\n\n" if self._cfg.starting_from else ""
         )
-        return TurnPrompt(system=system, tool_context=[result], user_text=user_text)
+        instruction = CONCEPT_OUTCOME_INSTRUCTION if self._cfg.root is None else OUTCOME_INSTRUCTION
+        system = (
+            f"{self._cfg.system}\n\nSubject: {self._cfg.subject}\n\n{starting}"
+            f"{self._pedagogy.prompt_directive()}\n\n{instruction}"
+        )
+        return TurnPrompt(
+            system=system,
+            history=self._transcript.history(before=turn_id),
+            tool_context=results,
+            user_text=user_text,
+        )
+
+    def _state(self, state: Literal["listening", "thinking", "speaking"]) -> TurnState:
+        return TurnState(state=state, phase=str(self._pedagogy.phase))
 
     async def _turn(self, turn_id: str, user_text: str) -> None:
         start = self._clock()
+        self._transcript.learner(turn_id, user_text)
+        await self._visuals.push(LearnerText(turn_id=turn_id, text=user_text))
         grounded = await self._claim(turn_id, user_text)
         self._visuals.set_grounding(self._registry, turn_id)
+        await self._visuals.push(self._state("thinking"))
         try:
-            await self._speaker.speak_opener(OPENER)
             queue: asyncio.Queue[str | None] | None = None
-            if grounded is None:
-                globs = await self._globs(user_text)
-                result = await self._search(user_text, globs, self._cfg.root, self._cfg.budget)
-                self._registry.record(turn_id, result)
-                logger.info(
-                    "turn.grounding turn_id=%s ms=%d", turn_id, _elapsed_ms(start, self._clock())
-                )
-                prompt = self._prompt(result, user_text)
+            if grounded is None and self._cfg.root is None:
+                prompt = self._prompt([], user_text, turn_id)
+                await self._speaker.speak(self._utterance(turn_id, None, prompt, None))
             else:
-                # A cancelled turn must not cancel the future the speculation is about to
-                # resolve, or set_result() raises inside the speculation.
-                result, prompt, queue = await asyncio.shield(grounded)
-            await self._speaker.speak_opener(opener_key([result]))
-            await self._speaker.speak(self._utterance(turn_id, result, prompt, queue))
+                await self._speaker.speak_opener(OPENER)
+                if grounded is None:
+                    globs = await self._globs(user_text)
+                    result = await self._search(user_text, globs, self._cfg.root, self._cfg.budget)
+                    self._registry.record(turn_id, result)
+                    logger.info(
+                        "turn.grounding turn_id=%s ms=%d",
+                        turn_id,
+                        _elapsed_ms(start, self._clock()),
+                    )
+                    prompt = self._prompt([result], user_text, turn_id)
+                else:
+                    # A cancelled turn must not cancel the future the speculation is about to
+                    # resolve, or set_result() raises inside the speculation.
+                    result, prompt, queue = await asyncio.shield(grounded)
+                await self._speaker.speak_opener(opener_key([result]))
+                await self._speaker.speak(self._utterance(turn_id, result, prompt, queue))
             outcome = await self._report_drain(turn_id)
         except asyncio.CancelledError:
             # The drain has to stop before the id is cleared, or a late record() finds no turn.
             await self._stop_turn(turn_id)
             self._registry.abandon(turn_id)
+            if turn_id == f"turn-{self._dispatched}":
+                try:
+                    await self._visuals.push(self._state("listening"))
+                except Exception as error:
+                    logger.warning(
+                        "turn.state_push_failed turn_id=%s error=%s",
+                        turn_id,
+                        type(error).__name__,
+                        exc_info=True,
+                    )
             raise
         finally:
             await self._stop_turn(turn_id)
         logger.info("turn.spoken turn_id=%s ms=%d", turn_id, _elapsed_ms(start, self._clock()))
+        if self._cfg.root is None:
+            outcome = outcome.model_copy(update={"settling_positions": []})
         phase = self._pedagogy.advance(outcome)
         logger.info("turn.outcome turn_id=%s signal=%s phase=%s", turn_id, outcome.signal, phase)
+        await self._visuals.push(self._state("listening"))
 
     async def _report_drain(self, turn_id: str) -> TurnOutcome:
         drain = self._drains.get(turn_id)
@@ -371,32 +414,41 @@ class TurnLoop:
     async def _utterance(
         self,
         turn_id: str,
-        result: SearchResult,
+        result: SearchResult | None,
         prompt: TurnPrompt,
         queue: asyncio.Queue[str | None] | None,
     ) -> AsyncIterator[str]:
-        lead_in = lead_in_sentence([result])
-        if self._admits(turn_id, lead_in, "lead_in"):
-            yield lead_in
-        stages = [sentence for sentence in lead_in_stages(result) if sentence != lead_in]
+        if result is not None:
+            lead_in = lead_in_sentence([result])
+            if self._admits(turn_id, lead_in, "lead_in"):
+                yield lead_in
+        tools = TURN_TOOLS if self._cfg.root is not None else []
         if queue is None:
             queue = asyncio.Queue(SPOKEN_DEPTH)
             self._drains[turn_id] = asyncio.create_task(
-                self._drain(turn_id, prompt, queue, TURN_TOOLS), name=f"{turn_id}-drain"
+                self._drain(turn_id, prompt, queue, tools), name=f"{turn_id}-drain"
             )
         spoken: asyncio.Queue[str | None] = asyncio.Queue(SPOKEN_DEPTH)
         demand = asyncio.Event()
-        self._stagers[turn_id] = asyncio.create_task(
-            self._stage(turn_id, stages, spoken, demand), name=f"{turn_id}-stager"
-        )
+        if result is not None:
+            stages = [sentence for sentence in lead_in_stages(result) if sentence != lead_in]
+            self._stagers[turn_id] = asyncio.create_task(
+                self._stage(turn_id, stages, spoken, demand), name=f"{turn_id}-stager"
+            )
         self._pumps[turn_id] = asyncio.create_task(
             self._pump(turn_id, queue, spoken, demand), name=f"{turn_id}-pump"
         )
+        first = True
         while True:
             demand.set()
             text = await spoken.get()
             if text is None:
                 return
+            if first:
+                await self._visuals.push(self._state("speaking"))
+                first = False
+            self._transcript.tutor(turn_id, text)
+            await self._visuals.push(Caption(turn_id=turn_id, text=text))
             yield text
 
     async def _stage(
@@ -448,13 +500,16 @@ class TurnLoop:
 
     def _admits(self, turn_id: str, text: str, source: str) -> bool:
         verdict = self._registry.verify_chunk(turn_id, text, source=source)
-        if verdict.ok:
+        ungrounded = verdict.ungrounded
+        if self._cfg.root is None:
+            ungrounded = [position for position in ungrounded if position.path]
+        if not ungrounded:
             return True
         logger.warning(
             "turn.chunk_withheld turn_id=%s source=%s ungrounded=%d",
             turn_id,
             source,
-            len(verdict.ungrounded),
+            len(ungrounded),
         )
         return False
 
@@ -469,7 +524,7 @@ class TurnLoop:
             calls: list[TurnChunk] = []
             splitter = OutcomeSplitter()
             stream = self._reasoning.start_turn(
-                prompt, tools=list(tools), max_tokens=self._cfg.tool_round_max_tokens
+                prompt, tools=list(tools) or None, max_tokens=self._cfg.tool_round_max_tokens
             )
             async for chunk in stream:
                 if chunk.kind == "spoken":
