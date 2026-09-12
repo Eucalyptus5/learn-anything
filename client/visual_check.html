@@ -24,23 +24,34 @@ const logEl = document.getElementById("log");
 const log = (line) => { logEl.textContent += "\n" + line; };
 
 const good = [
-  ["diagram.push flowchart", { type: "diagram.push", seq: 1, id: "a", kind: "flowchart", source: "graph TD; a-->b" }],
+  ["diagram.push flowchart", { type: "diagram.push", seq: 1, id: "a", kind: "flowchart", source: "graph TD; a-->b", title: "a to b" }],
   ["diagram.clear", { type: "diagram.clear", seq: 2 }],
   ["source.highlight", { type: "source.highlight", seq: 3, path: "tutor/app.py", start_line: 1, end_line: 2 }],
-  ["app.push", { type: "app.push", seq: 4, id: "b", html: "<p>hi</p>" }],
+  ["app.push", { type: "app.push", seq: 4, id: "b", html: "<p>hi</p>", title: "hi" }],
+  ["state", { type: "state", seq: 5, state: "thinking", phase: "teach" }],
+  ["caption", { type: "caption", seq: 6, turn_id: "turn-1", text: "PPO clips." }],
+  ["transcript", { type: "transcript", seq: 7, turn_id: "turn-1", text: "teach me ppo" }],
 ];
 
 const hostile = [
-  ["id of 65", { type: "app.push", seq: 5, id: "x".repeat(65), html: "" }],
-  ["source of 8001", { type: "diagram.push", seq: 5, id: "a", kind: "flowchart", source: "x".repeat(8001) }],
-  ["html of 64001", { type: "app.push", seq: 5, id: "a", html: "x".repeat(64001) }],
+  ["id of 65", { type: "app.push", seq: 5, id: "x".repeat(65), html: "", title: "t" }],
+  ["source of 8001", { type: "diagram.push", seq: 5, id: "a", kind: "flowchart", source: "x".repeat(8001), title: "t" }],
+  ["html of 64001", { type: "app.push", seq: 5, id: "a", html: "x".repeat(64001), title: "t" }],
+  ["title of 81", { type: "app.push", seq: 5, id: "a", html: "", title: "t".repeat(81) }],
+  ["app.push missing title", { type: "app.push", seq: 5, id: "a", html: "" }],
+  ["diagram.push missing title", { type: "diagram.push", seq: 5, id: "a", kind: "flowchart", source: "graph TD; a" }],
+  ["text of 2001", { type: "caption", seq: 5, turn_id: "turn-1", text: "x".repeat(2001) }],
+  ["text of 4001", { type: "transcript", seq: 5, turn_id: "turn-1", text: "x".repeat(4001) }],
+  ["turn_id of 33", { type: "caption", seq: 5, turn_id: "t".repeat(33), text: "x" }],
+  ["state idle", { type: "state", seq: 5, state: "idle", phase: "teach" }],
+  ["phase review", { type: "state", seq: 5, state: "thinking", phase: "review" }],
   ["path of 4097", { type: "source.highlight", seq: 5, path: "x".repeat(4097), start_line: 1, end_line: 1 }],
-  ["kind pie", { type: "diagram.push", seq: 5, id: "a", kind: "pie", source: "pie" }],
+  ["kind pie", { type: "diagram.push", seq: 5, id: "a", kind: "pie", source: "pie", title: "t" }],
   ["start_line 0", { type: "source.highlight", seq: 5, path: "a", start_line: 0, end_line: 1 }],
   ["end_line before start_line", { type: "source.highlight", seq: 5, path: "a", start_line: 5, end_line: 4 }],
   ["start_line 1.5", { type: "source.highlight", seq: 5, path: "a", start_line: 1.5, end_line: 2 }],
   ["type __proto__", { type: "__proto__", seq: 5 }],
-  ["type app.pull", { type: "app.pull", seq: 5, id: "a", html: "" }],
+  ["type app.pull", { type: "app.pull", seq: 5, id: "a", html: "", title: "t" }],
   ["extra key", { type: "diagram.clear", seq: 5, extra: true }],
   ["missing seq", { type: "diagram.clear" }],
   ["seq 0", { type: "diagram.clear", seq: 0 }],
@@ -107,7 +118,7 @@ document.addEventListener("securitypolicyviolation", (event) => {
 
 const canvas = document.getElementById("canvas");
 mount(canvas);
-receive({ type: "app.push", seq: 100, id: "probe", html: probeHtml });
+receive({ type: "app.push", seq: 100, id: "probe", html: probeHtml, title: "probe" });
 const frames = canvas.querySelectorAll("iframe");
 let appFrame = frames[frames.length - 1];
 log(
@@ -128,7 +139,7 @@ window.addEventListener("message", (event) => {
   log(blocked === PROBES && event.data.length === PROBES
     ? "probe: " + PROBES + " of " + PROBES + " blocked"
     : "probe: " + blocked + " of " + PROBES + " blocked, FAIL");
-  receive({ type: "app.push", seq: 101, id: "egress", html: egressHtml });
+  receive({ type: "app.push", seq: 101, id: "egress", html: egressHtml, title: "egress" });
   const pushed = canvas.querySelectorAll("iframe");
   appFrame = pushed[pushed.length - 1];
 });
@@ -149,7 +160,7 @@ window.addEventListener("message", (event) => {
     if (hostFrameSrcViolations === 0) log("egress: navigation ESCAPED");
     const blocked = connect + img + (hostFrameSrcViolations > 0 ? 1 : 0);
     log("egress: " + blocked + " of " + EGRESS + " blocked" + (blocked === EGRESS ? "" : ", FAIL"));
-    receive({ type: "diagram.push", seq: 102, id: "check", kind: "flowchart", source: "graph TD; a-->b" });
+    receive({ type: "diagram.push", seq: 102, id: "check", kind: "flowchart", source: "graph TD; a-->b", title: "a to b" });
   }, 500);
 });
 

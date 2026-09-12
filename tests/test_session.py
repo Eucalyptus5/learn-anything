@@ -108,12 +108,15 @@ VISUAL_TOOL = "push_diagram"
 VISUAL_ARGUMENTS = json.dumps({"mermaid": "graph TD; reader-->queue"})
 VISUAL_CALL_ID = "call-visual-1"
 DIAGRAM_SOURCE = "graph TD; reader-->queue"
-DIAGRAM_ARGUMENTS = json.dumps({"id": "reader", "kind": "flowchart", "source": DIAGRAM_SOURCE})
+DIAGRAM_ARGUMENTS = json.dumps(
+    {"id": "reader", "kind": "flowchart", "source": DIAGRAM_SOURCE, "title": "reader"}
+)
 DIAGRAM_PAYLOAD = {
     "type": "diagram.push",
     "id": "reader",
     "kind": "flowchart",
     "source": DIAGRAM_SOURCE,
+    "title": "reader",
     "seq": 1,
 }
 GROUNDED_HIGHLIGHT = json.dumps({"path": GROUNDED_PATH, "start_line": 24, "end_line": 24})

@@ -1,11 +1,18 @@
 const KINDS = new Set(["flowchart", "sequence"]);
+const STATES = new Set(["listening", "thinking", "speaking"]);
+const PHASES = new Set(["teach", "concrete", "interrogate"]);
 const KEYS = {
-  "diagram.push": ["type", "seq", "id", "kind", "source"],
+  "diagram.push": ["type", "seq", "id", "kind", "source", "title"],
   "diagram.clear": ["type", "seq"],
   "source.highlight": ["type", "seq", "path", "start_line", "end_line"],
-  "app.push": ["type", "seq", "id", "html"],
+  "app.push": ["type", "seq", "id", "html", "title"],
+  "state": ["type", "seq", "state", "phase"],
+  "caption": ["type", "seq", "turn_id", "text"],
+  "transcript": ["type", "seq", "turn_id", "text"],
 };
-const CAPS = { id: 64, source: 8000, html: 64000, path: 4096 };
+const CAPS = { id: 64, source: 8000, html: 64000, path: 4096, title: 80, turn_id: 32 };
+const TEXT_CAPS = { caption: 2000, transcript: 4000 };
+const listeners = new Map();
 
 let canvas = null;
 let frame = null;
@@ -19,9 +26,9 @@ function reject(reason) {
   return false;
 }
 
-function cappedString(payload, key) {
+function cappedString(payload, key, cap = CAPS[key]) {
   const value = payload[key];
-  return typeof value === "string" && [...value].length <= CAPS[key];
+  return typeof value === "string" && [...value].length <= cap;
 }
 
 function positiveInteger(value) {
@@ -44,6 +51,7 @@ export function validate(payload) {
       if (!cappedString(payload, "id")) return reject("bad id");
       if (!KINDS.has(payload.kind)) return reject("unknown kind");
       if (!cappedString(payload, "source")) return reject("bad source");
+      if (!cappedString(payload, "title")) return reject("bad title");
       return true;
     case "diagram.clear":
       return true;
@@ -56,8 +64,22 @@ export function validate(payload) {
     case "app.push":
       if (!cappedString(payload, "id")) return reject("bad id");
       if (!cappedString(payload, "html")) return reject("bad html");
+      if (!cappedString(payload, "title")) return reject("bad title");
+      return true;
+    case "state":
+      if (!STATES.has(payload.state)) return reject("unknown state");
+      if (!PHASES.has(payload.phase)) return reject("unknown phase");
+      return true;
+    case "caption":
+    case "transcript":
+      if (!cappedString(payload, "turn_id")) return reject("bad turn_id");
+      if (!cappedString(payload, "text", TEXT_CAPS[payload.type])) return reject("bad text");
       return true;
   }
+}
+
+export function onPayload(type, handler) {
+  listeners.set(type, handler);
 }
 
 export function mount(root) {
@@ -99,6 +121,11 @@ export function receive(payload) {
       app.setAttribute("referrerpolicy", "no-referrer");
       app.srcdoc = payload.html;
       canvas.append(app);
+      break;
+    case "state":
+    case "caption":
+    case "transcript":
+      listeners.get(payload.type)?.(payload);
       break;
   }
 }

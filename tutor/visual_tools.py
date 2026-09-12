@@ -24,7 +24,7 @@ _MODELS: dict[str, type[BaseModel]] = {
 _DESCRIPTIONS = {
     "push_diagram": (
         "Render a mermaid flowchart or sequence diagram on the learner's canvas, replacing "
-        "the diagram currently shown."
+        "the diagram currently shown; title is the brief's title, under eighty characters."
     ),
     "clear_diagram": "Remove every diagram from the learner's canvas.",
     "highlight_source": (
@@ -33,7 +33,7 @@ _DESCRIPTIONS = {
     ),
     "push_app": (
         "Render a self-contained HTML page inside a sandboxed frame on the learner's canvas, "
-        "replacing the page currently shown."
+        "replacing the page currently shown; title is the brief's title, under eighty characters."
     ),
 }
 

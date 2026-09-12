@@ -80,7 +80,9 @@ FLOWCHART = """flowchart TD
   n27 --> n29[cancel task]
   n29 --> n11
   n28 --> n11"""
-PUSH_ARGUMENTS = json.dumps({"id": "lead", "kind": "flowchart", "source": FLOWCHART})
+PUSH_ARGUMENTS = json.dumps(
+    {"id": "lead", "kind": "flowchart", "source": FLOWCHART, "title": "lead"}
+)
 BUDGET_MS = 100
 FOLLOW_UP_DELTAS = [
     "The reader pulls frames off the track, ",

@@ -74,3 +74,30 @@ def test_the_host_policy_precedes_every_script_and_style() -> None:
         at = text.index('http-equiv="Content-Security-Policy"')
         assert at < text.index("<style"), path.name
         assert at < text.index("<script"), path.name
+
+
+def test_the_validator_names_every_channel_payload_type() -> None:
+    text = VISUALS.read_text()
+    keys = re.search(r"const KEYS = \{(.*?)\n\};", text, re.DOTALL)
+    assert keys is not None
+    for kind in ("diagram.push", "diagram.clear", "source.highlight", "app.push"):
+        assert re.search(rf'"{re.escape(kind)}": \[', keys[1]), kind
+    for kind in ("state", "caption", "transcript"):
+        assert re.search(rf'"{kind}": \["type", "seq", ', keys[1]), kind
+    assert '"diagram.push": ["type", "seq", "id", "kind", "source", "title"]' in keys[1]
+    assert '"app.push": ["type", "seq", "id", "html", "title"]' in keys[1]
+
+
+def test_every_push_on_the_check_page_carries_a_title() -> None:
+    text = VISUAL_CHECK.read_text()
+    good = re.search(r"const good = \[(.*?)\n\];", text, re.DOTALL)
+    hostile = re.search(r"const hostile = \[(.*?)\n\];", text, re.DOTALL)
+    assert good is not None and hostile is not None
+    pushes = re.findall(r'\{ type: "(?:diagram|app)\.push"[^}]*\}', good[1])
+    receives = re.findall(r'receive\(\{ type: "(?:diagram|app)\.push"[^}]*\}\)', text)
+    assert len(pushes) == 2
+    assert len(receives) == 3
+    for literal in pushes + receives:
+        assert "title:" in literal, literal
+    for name in ('"title of 81"', '"app.push missing title"', '"diagram.push missing title"'):
+        assert name in hostile[1], name

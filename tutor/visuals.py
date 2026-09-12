@@ -14,6 +14,7 @@ class DiagramPush(BaseModel):
     id: str = Field(max_length=64)
     kind: Literal["flowchart", "sequence"]
     source: str = Field(max_length=8000)
+    title: str = Field(max_length=80)
 
 
 class DiagramClear(BaseModel):
@@ -43,10 +44,41 @@ class AppPush(BaseModel):
     type: Literal["app.push"] = "app.push"
     id: str = Field(max_length=64)
     html: str = Field(max_length=64000)
+    title: str = Field(max_length=80)
 
 
 VisualPayload = Annotated[
     DiagramPush | DiagramClear | SourceHighlight | AppPush, Field(discriminator="type")
+]
+
+
+class TurnState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["state"] = "state"
+    state: Literal["listening", "thinking", "speaking"]
+    phase: Literal["teach", "concrete", "interrogate"]
+
+
+class Caption(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["caption"] = "caption"
+    turn_id: str = Field(max_length=32)
+    text: str = Field(max_length=2000)
+
+
+class LearnerText(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["transcript"] = "transcript"
+    turn_id: str = Field(max_length=32)
+    text: str = Field(max_length=4000)
+
+
+ChannelPayload = Annotated[
+    DiagramPush | DiagramClear | SourceHighlight | AppPush | TurnState | Caption | LearnerText,
+    Field(discriminator="type"),
 ]
 
 
@@ -65,7 +97,7 @@ class VisualChannel:
         self._registry = registry
         self._turn_id = turn_id
 
-    async def push(self, payload: VisualPayload) -> None:
+    async def push(self, payload: ChannelPayload) -> None:
         if isinstance(payload, SourceHighlight):
             path = payload.path.removeprefix("./")
             for line in range(payload.start_line, payload.end_line + 1):

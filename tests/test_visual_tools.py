@@ -44,9 +44,9 @@ def test_tool_schema_matches_the_payload_models() -> None:
         assert parameters.get("required", []) == expected_required
 
     by_name = {t["function"]["name"]: t["function"]["parameters"] for t in VISUAL_TOOLS}
-    assert by_name["push_diagram"]["required"] == ["id", "kind", "source"]
+    assert by_name["push_diagram"]["required"] == ["id", "kind", "source", "title"]
     assert by_name["highlight_source"]["required"] == ["path", "start_line", "end_line"]
-    assert by_name["push_app"]["required"] == ["id", "html"]
+    assert by_name["push_app"]["required"] == ["id", "html", "title"]
     assert by_name["push_diagram"]["properties"]["id"]["maxLength"] == 64
     assert by_name["push_diagram"]["properties"]["source"]["maxLength"] == 8000
     assert by_name["push_diagram"]["properties"]["kind"]["enum"] == ["flowchart", "sequence"]
@@ -56,6 +56,18 @@ def test_tool_schema_matches_the_payload_models() -> None:
     assert by_name["push_app"]["properties"]["id"]["maxLength"] == 64
     assert by_name["push_app"]["properties"]["html"]["maxLength"] == 64000
     assert "search_code" in VISUAL_TOOLS[2]["function"]["description"]
+
+
+def test_the_tool_schema_carries_title_for_both_pushes() -> None:
+    by_name = {t["function"]["name"]: t["function"] for t in VISUAL_TOOLS}
+
+    for name in ("push_diagram", "push_app"):
+        parameters = by_name[name]["parameters"]
+        assert "title" in parameters["required"]
+        assert parameters["properties"]["title"] == {"type": "string", "maxLength": 80}
+        assert "under eighty characters" in by_name[name]["description"]
+    assert "title" not in by_name["clear_diagram"]["parameters"]["properties"]
+    assert "title" not in by_name["highlight_source"]["parameters"]["properties"]
 
 
 @pytest.mark.parametrize("arguments", ["{", "", "not json", "{'id': 1}"])
@@ -74,7 +86,9 @@ async def test_malformed_json_arguments_are_logged_without_their_text(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     connection = FakeConnection()
-    arguments = json.dumps({"id": "d1", "kind": "flowchart", "source": "graph TD; A-->B"})[:-6]
+    arguments = json.dumps(
+        {"id": "d1", "kind": "flowchart", "source": "graph TD; A-->B", "title": "reader"}
+    )[:-6]
 
     with caplog.at_level(logging.WARNING, logger="tutor.visual_tools"):
         result = await dispatch_visual_tool("push_diagram", arguments, VisualChannel(connection))
@@ -101,20 +115,32 @@ async def test_non_object_json_returns_an_error_string(arguments: str) -> None:
 @pytest.mark.parametrize(
     ("name", "body"),
     [
-        ("push_diagram", {"id": "d1", "kind": "flowchart", "source": "g", "extra": 1}),
-        ("push_diagram", {"id": "d1", "kind": "gantt", "source": "g"}),
-        ("push_diagram", {"id": "d1", "kind": "flowchart"}),
-        ("push_diagram", {"id": "d1", "kind": "flowchart", "source": "x" * 8001}),
+        (
+            "push_diagram",
+            {"id": "d1", "kind": "flowchart", "source": "g", "title": "r", "extra": 1},
+        ),
+        ("push_diagram", {"id": "d1", "kind": "gantt", "source": "g", "title": "r"}),
+        ("push_diagram", {"id": "d1", "kind": "flowchart", "title": "r"}),
+        ("push_diagram", {"id": "d1", "kind": "flowchart", "source": "x" * 8001, "title": "r"}),
+        ("push_diagram", {"id": "d1", "kind": "flowchart", "source": "g"}),
+        ("push_diagram", {"id": "d1", "kind": "flowchart", "source": "g", "title": "t" * 81}),
+        ("push_app", {"id": "a1", "html": "<p>hi</p>"}),
         ("highlight_source", {"path": "src/pool.py", "start_line": 9, "end_line": 3}),
         ("highlight_source", {"path": "src/pool.py", "start_line": 0, "end_line": 3}),
         ("highlight_source", {"path": "src/pool.py", "start_line": "three", "end_line": 3}),
-        ("push_diagram", {"type": "app.push", "id": "d1", "kind": "flowchart", "source": "g"}),
+        (
+            "push_diagram",
+            {"type": "app.push", "id": "d1", "kind": "flowchart", "source": "g", "title": "r"},
+        ),
     ],
     ids=[
         "extra-field",
         "bad-kind",
         "missing-field",
         "oversized-source",
+        "missing-diagram-title",
+        "oversized-title",
+        "missing-app-title",
         "reversed-range",
         "zero-line",
         "non-numeric-line",
@@ -137,7 +163,7 @@ async def test_invalid_fields_return_an_error_string(name: str, body: dict[str, 
 @pytest.mark.parametrize("name", ["search_code", "push_diagrams", ""])
 async def test_unknown_tool_name_returns_an_error_string(name: str) -> None:
     connection = FakeConnection()
-    arguments = json.dumps({"id": "d1", "kind": "flowchart", "source": "g"})
+    arguments = json.dumps({"id": "d1", "kind": "flowchart", "source": "g", "title": "r"})
 
     result = await dispatch_visual_tool(name, arguments, VisualChannel(connection))
 
@@ -187,10 +213,13 @@ async def test_each_tool_pushes_its_model() -> None:
     connection = FakeConnection()
     channel = _grounded_channel(connection)
     calls = [
-        ("push_diagram", {"id": "d1", "kind": "flowchart", "source": "graph TD; A-->B"}),
+        (
+            "push_diagram",
+            {"id": "d1", "kind": "flowchart", "source": "graph TD; A-->B", "title": "reader"},
+        ),
         ("clear_diagram", {}),
         ("highlight_source", {"path": "src/pool.py", "start_line": 3, "end_line": 9}),
-        ("push_app", {"id": "a1", "html": "<p>hi</p>"}),
+        ("push_app", {"id": "a1", "html": "<p>hi</p>", "title": "reader"}),
     ]
 
     results = [await dispatch_visual_tool(name, json.dumps(body), channel) for name, body in calls]
@@ -207,13 +236,15 @@ async def test_each_tool_pushes_its_model() -> None:
 
 async def test_html_with_a_script_tag_still_only_reaches_push() -> None:
     connection = FakeConnection()
-    arguments = json.dumps({"id": "a1", "html": _HOSTILE_HTML})
+    arguments = json.dumps({"id": "a1", "html": _HOSTILE_HTML, "title": "reader"})
 
     result = await dispatch_visual_tool("push_app", arguments, VisualChannel(connection))
 
     assert result == "push_app: sent"
     assert "<script" not in result
-    assert connection.sent == [{"type": "app.push", "id": "a1", "html": _HOSTILE_HTML, "seq": 1}]
+    assert connection.sent == [
+        {"type": "app.push", "id": "a1", "html": _HOSTILE_HTML, "title": "reader", "seq": 1}
+    ]
 
 
 async def test_cancelled_push_propagates_through_dispatch() -> None:
