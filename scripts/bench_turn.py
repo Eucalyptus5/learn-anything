@@ -364,20 +364,18 @@ class TaggedSynth:
 
 
 class BenchTransport(Connection):
-    def __init__(self, synth: TaggedSynth, openers: dict[str, np.ndarray]) -> None:
+    def __init__(self, synth: TaggedSynth) -> None:
         pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         super().__init__(pc)
         self._track = pc.getSenders()[0].track
         self._synth = synth
-        self._openers = list(openers.values())
         self.ledger: list[Enqueued] = []
         self.frames: list[tuple[float, bool]] = []
         self.emitted = asyncio.Event()
 
     async def play(self, pcm: np.ndarray) -> None:
         at = time.perf_counter()
-        opener = any(pcm is cached for cached in self._openers)
-        self.ledger.append(Enqueued(at, None if opener else self._synth.last, len(pcm)))
+        self.ledger.append(Enqueued(at, self._synth.last, len(pcm)))
         await super().play(floored(pcm))
 
     async def send_json(self, payload: dict[str, object]) -> None:
@@ -447,11 +445,9 @@ class Bench:
         request = SessionRequest(subject=subject, folder=root)
         loaded = await asyncio.to_thread(load_models)
         synth = TaggedSynth(loaded.synth)
-        models = Models(
-            partial=loaded.partial, final=loaded.final, synth=synth, openers=loaded.openers
-        )
+        models = Models(partial=loaded.partial, final=loaded.final, synth=synth)
         reasoning = MeteredReasoning(ReasoningClient(cfg))
-        transport = BenchTransport(synth, models.openers)
+        transport = BenchTransport(synth)
         source = ScriptedSource()
         loop = build_loop(cfg, models, reasoning, source, transport, request)
         watch = OutcomeWatch()
@@ -527,12 +523,13 @@ def report(
     cfg: Settings, args: argparse.Namespace, samples: list[Sample], ledger: UsageLedger
 ) -> None:
     print(
-        "time to first sound: first 48 kHz frame with real audio leaving the playout track after "
-        "the scripted EndOfTurn is injected; excludes endpointing, recognition and the browser."
+        "time to first sound: first 48 kHz frame carrying the first synthesized clause leaving "
+        "the playout track after the scripted EndOfTurn is injected; excludes endpointing, "
+        "recognition and the browser."
     )
     print(
         "time to substance: frame carrying the first sample synthesized from a model-authored "
-        "clause; openers, the lead-in and stage sentences do not count. Frame granularity 20 ms."
+        "clause; the lead-in and stage sentences do not count. Frame granularity 20 ms."
     )
     print(
         "a one-LSB floor is applied to every buffer before playout so an all-zero frame is exactly "

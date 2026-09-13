@@ -24,7 +24,7 @@ from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.config import Settings, settings
 from tutor.cost import UsageLedger
 from tutor.lead_in import lead_in_sentence
-from tutor.prompt import SEARCH_CODE_TOOL, SYSTEM_PROMPT, Message, TurnPrompt, derive_globs
+from tutor.prompt import SEARCH_CODE_TOOL, SYSTEM_PROMPT, Message, TurnPrompt
 from tutor.reasoning import ReasoningClient, TurnChunk
 from tutor.session import BAD_ARGUMENTS, SEARCH_CODE, _assistant_calls, _search_arguments
 from tutor.tools.models import SearchBudget, SearchResult
@@ -32,6 +32,7 @@ from tutor.tools.provenance import TurnRegistry, extract_positions
 from tutor.tools.search import search
 
 POLICIES = ("current", "digits", "pathshape")
+GLOBS = ["**/*.py"]
 SOURCES = ("lead_in", "model")
 SUBJECT = "a small http client with a bounded connection pool"
 RETRY_BACKOFF_S = 20
@@ -164,8 +165,7 @@ async def deterministic_sentences(root: Path) -> list[tuple[str, SearchResult]]:
     budget = SearchBudget()
     sentences: list[tuple[str, SearchResult]] = []
     for text in UTTERANCES:
-        globs = await derive_globs(text, root)
-        result = await search(text, globs, root, budget)
+        result = await search(text, GLOBS, root, budget)
         sentences.append((lead_in_sentence([result]), result))
     return sentences
 
@@ -297,8 +297,7 @@ async def capture_turn(
     budget = SearchBudget()
     for attempt in range(MAX_ATTEMPTS):
         registry.open_turn(turn_id)
-        globs = await derive_globs(user_text, root)
-        result = await search(user_text, globs, root, budget)
+        result = await search(user_text, GLOBS, root, budget)
         registry.record(turn_id, result)
         results = [result]
         prompt = TurnPrompt(system=system, tool_context=[result], user_text=user_text)

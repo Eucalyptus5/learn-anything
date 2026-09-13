@@ -48,17 +48,16 @@ async def test_the_follow_up_round_is_speech_and_an_outcome() -> None:
     assert spoken + tail == bench_visual_lead.EXPLANATION
 
 
-def test_the_explanation_index_skips_openers_and_the_lead_in() -> None:
+def test_the_explanation_index_skips_the_lead_in() -> None:
     explanation = bench_visual_lead.EXPLANATION
     played = [
-        Enqueued(1.0, None, 4800),
         Enqueued(2.0, "The match is in src/pool.py line 12.", 9600),
         Enqueued(3.0, "The reader pulls frames off the track,", 7200),
         Enqueued(4.0, "hands each one to the queue,", 7200),
     ]
 
-    assert bench_visual_lead.explanation_index(played, explanation) == 2
-    assert bench_visual_lead.explanation_index(played[:2], explanation) is None
+    assert bench_visual_lead.explanation_index(played, explanation) == 1
+    assert bench_visual_lead.explanation_index(played[:1], explanation) is None
     assert bench_visual_lead.explanation_index([], explanation) is None
 
 

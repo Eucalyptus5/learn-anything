@@ -25,14 +25,13 @@ from tutor.input_path import (
     PartialTranscript,
     SpeechStarted,
 )
-from tutor.lead_in import lead_in_sentence, lead_in_stages, opener_key
+from tutor.lead_in import lead_in_sentence, lead_in_stages
 from tutor.pedagogy import PedagogyState, Phase, TurnOutcome
 from tutor.prompt import SEARCH_CODE_TOOL, Message, TurnPrompt
 from tutor.reasoning import TurnChunk
 from tutor.session import (
     BAD_ARGUMENTS,
     CONCEPT_OUTCOME_INSTRUCTION,
-    OPENER,
     OUTCOME_INSTRUCTION,
     OUTCOME_MARKER,
     SPOKEN_DEPTH,
@@ -62,7 +61,6 @@ PARTIAL_TEXT = "walk me through"
 GROUNDED_PATH = "tutor/transport.py"
 UNGROUNDED_PATH = "tutor/playout.py"
 UNPARSEABLE_PATH = "tutor/my transport.py"
-GLOBS = ["tutor/**/*.py"]
 SPOKEN_DELTAS = ["It lives in ", "the reader, ", "which drains ", "the track."]
 SPOKEN_CLAUSES = ["It lives in the reader,", "which drains the track."]
 FOLLOW_DELTAS = [" Both call sites ", "drain it."]
@@ -101,6 +99,9 @@ MODEL_QUERY = "class Connection"
 MODEL_GLOBS = ["tutor/transport.py"]
 SEARCH_ARGUMENTS = json.dumps({"query": MODEL_QUERY, "globs": MODEL_GLOBS})
 SEARCH_CALL_ID = "call-search-1"
+SEARCH_CALL = TurnChunk(
+    kind="tool_call", text=SEARCH_ARGUMENTS, tool_call_id=SEARCH_CALL_ID, tool_name="search_code"
+)
 TRUNCATED_ARGUMENTS = json.dumps({"query": "def recv", "globs": MODEL_GLOBS})
 BAD_ARGUMENT_BODIES = [
     pytest.param(json.dumps({"query": MODEL_QUERY, "globs": []}), id="empty-globs"),
@@ -146,7 +147,6 @@ QUEUE_FULL_DELTAS = SPOKEN_DEPTH + 2
 TEACH_DIRECTIVE = PedagogyState(Phase.TEACH).prompt_directive()
 CONCRETE_DIRECTIVE = PedagogyState(Phase.CONCRETE).prompt_directive()
 INTERROGATE_DIRECTIVE = PedagogyState(Phase.INTERROGATE).prompt_directive()
-SETTLING_PATHS = [GROUNDED_PATH, SECOND_PATH]
 COVERED_OUTCOME = OUTCOME_MARKER + json.dumps({"signal": "covered", "settling_positions": []})
 MISCONCEPTION_OUTCOME = OUTCOME_MARKER + json.dumps(
     {
@@ -165,6 +165,7 @@ SPLIT_OUTCOME_DELTAS = [
     '"covered", "settling_positions": []}',
 ]
 CONCEPT_TEXT = "teach me ppo"
+CONCEPT_PARTIAL = "teach me"
 STARTING_FROM = "I know policy gradients"
 CONCEPT_DELTAS = ["We run 10 epochs ", "on 2048 samples. ", "Look in setup.py ", "for the flags."]
 CONCEPT_CLAUSES = ["We run 10 epochs on 2048 samples.", "Look in setup.py for the flags."]
@@ -177,8 +178,8 @@ SETTLED_OUTCOME = OUTCOME_MARKER + json.dumps(
         "settling_positions": [{"path": "ppo.py", "line": 12}],
     }
 )
-GROUNDING_SPAN = re.compile(r"^turn\.grounding turn_id=\S+ ms=250$")
-SPOKEN_SPAN = re.compile(r"^turn\.spoken turn_id=\S+ ms=500$")
+SEARCH_SPAN = re.compile(r"^turn\.search turn_id=turn-1 ms=250$")
+SPOKEN_SPAN = re.compile(r"^turn\.spoken turn_id=\S+ ms=250$")
 
 SILENCE_WINDOW_FRAMES = -(-SILENCE_WINDOW_MS * SAMPLE_RATE // (1000 * FRAME_SAMPLES))
 SPEECH_FRAMES = 4 * START_FRAMES
@@ -196,8 +197,8 @@ PACED_PROBABILITIES = (
 def found(path: str = GROUNDED_PATH) -> SearchResult:
     return SearchResult(
         tool="search",
-        query=USER_TEXT,
-        globs=GLOBS,
+        query=MODEL_QUERY,
+        globs=MODEL_GLOBS,
         matches=[SearchMatch(path=path, line=24, text="        self._inbound = queue")],
         truncated=False,
         oversized=False,
@@ -208,8 +209,8 @@ def found(path: str = GROUNDED_PATH) -> SearchResult:
 def found_many() -> SearchResult:
     return SearchResult(
         tool="search",
-        query=USER_TEXT,
-        globs=GLOBS,
+        query=MODEL_QUERY,
+        globs=MODEL_GLOBS,
         matches=[
             SearchMatch(path=GROUNDED_PATH, line=24, text="        self._inbound = queue"),
             SearchMatch(path=UNGROUNDED_PATH, line=30, text="        frame = await self.recv()"),
@@ -334,6 +335,11 @@ class FakeSearch:
         if query == self._fails:
             raise SearchFailed
         self._log.append(("search_done", query))
+        # rg answers on a later tick; a result landing inside the caller's own step would let
+        # the pump race a stager that does not exist yet.
+        settled = asyncio.get_running_loop().create_future()
+        settled.get_loop().call_soon(settled.set_result, None)
+        await settled
         if self._later is not None and len(self.calls) > 1:
             return self._later
         return self._result
@@ -379,9 +385,12 @@ class TrippingRegistry(FakeRegistry):
 
 
 class FakeSpeaker:
-    def __init__(self, log: list[tuple[str, object]], gate: asyncio.Event | None = None) -> None:
+    def __init__(
+        self, log: list[tuple[str, object]], gate: asyncio.Event | None = None, hold_at: int = 2
+    ) -> None:
         self._log = log
         self._gate = gate
+        self._hold_at = hold_at
         self.utterances: list[list[str]] = []
         self.openers: list[str] = []
         self.received = asyncio.Event()
@@ -400,7 +409,7 @@ class FakeSpeaker:
                 spoken.append(chunk)
                 self._log.append(("speak", chunk))
                 self.received.set()
-                if self._gate is not None and len(spoken) > 1:
+                if self._gate is not None and len(spoken) >= self._hold_at:
                     self.held.set()
                     await self._gate.wait()
         except asyncio.CancelledError:
@@ -543,6 +552,7 @@ class FakeReasoning:
         holds_at: int = 0,
         close_gate: asyncio.Event | None = None,
         turns: list[list[TurnChunk]] | None = None,
+        follow_up_gate: asyncio.Event | None = None,
     ) -> None:
         self._log = log
         self._chunks = chunks
@@ -553,6 +563,7 @@ class FakeReasoning:
         self._holds_at = holds_at
         self._close_gate = close_gate
         self._turns = deque(turns) if turns is not None else deque()
+        self._follow_up_gate = follow_up_gate
         self.prompts: list[TurnPrompt] = []
         self.tools: list[list[dict] | None] = []
         self.max_tokens: list[int | None] = []
@@ -582,7 +593,7 @@ class FakeReasoning:
             chunks,
             self._log,
             self._received,
-            None if answering else self._gate,
+            self._follow_up_gate if answering else self._gate,
             self._holds_at,
             None if self.streams else self._close_gate,
         )
@@ -653,62 +664,13 @@ def spoken_chunks(deltas: list[str]) -> list[TurnChunk]:
     return [TurnChunk(kind="spoken", text=delta) for delta in deltas]
 
 
-async def test_grounding_lands_before_the_reasoning_call(
+async def test_the_reasoning_call_starts_with_no_search_ahead_of_it(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
-    deltas = [TurnChunk(kind="reasoning", text=REASONING_TEXT)]
-    deltas += [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received)
-    source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
-    clock = FakeClock()
-    loop = TurnLoop(
-        config(tmp_path),
-        source,
-        search,
-        speaker,
-        LoggingTransport(log),
-        reasoning,
-        FakeRegistry(log),
-        clock,
-    )
-
-    with caplog.at_level(logging.INFO, logger="tutor.session"):
-        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
-
-    assert search.calls == [(USER_TEXT, GLOBS, tmp_path, SearchBudget())]
-
-    steps = [name for name, _ in log]
-    assert steps.index("open_turn") < steps.index("search_done")
-    assert steps.index("search_done") < steps.index("record") < steps.index("start_turn")
-    assert steps.index("speak") < steps.index("stream_open")
-    assert ("stream_open", True) in log
-
-    prompt = reasoning.prompts[0]
-    assert prompt.tool_context == [result]
-    assert prompt.user_text == USER_TEXT
-    assert SYSTEM in prompt.system
-    assert SUBJECT in prompt.system
-
-    assert speaker.utterances == [[lead_in_sentence([result])] + SPOKEN_CLAUSES]
-
-    messages = session_messages(caplog)
-    assert any(GROUNDING_SPAN.match(message) for message in messages)
-    assert any(SPOKEN_SPAN.match(message) for message in messages)
-    assert all(USER_TEXT not in message for message in messages)
-    await loop.aclose()
-
-
-async def test_the_cached_opener_is_enqueued_before_the_search_returns(tmp_path: Path) -> None:
-    log: list[tuple[str, object]] = []
-    result = found()
-    speaker = FakeSpeaker(log)
-    gate = asyncio.Event()
-    search = FakeSearch(log, result, gate=gate)
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
+    search = FakeSearch(log, found())
+    deltas = [TurnChunk(kind="reasoning", text=REASONING_TEXT), *spoken_chunks(SPOKEN_DELTAS)]
     reasoning = FakeReasoning(log, deltas, speaker.received)
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
     loop = TurnLoop(
@@ -721,27 +683,35 @@ async def test_the_cached_opener_is_enqueued_before_the_search_returns(tmp_path:
         FakeRegistry(log),
         FakeClock(),
     )
-    running = asyncio.create_task(loop.run())
 
-    await asyncio.wait_for(search.held.wait(), HANG_GUARD_S)
-    assert ("speak_opener", "thinking") in log
-    assert ("search_done", USER_TEXT) not in log
-    assert not [entry for entry in log if entry[0] == "speak"]
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    gate.set()
-    await asyncio.wait_for(running, HANG_GUARD_S)
-
+    assert search.calls == []
+    assert speaker.openers == []
     steps = [name for name, _ in log]
-    assert steps.index("speak_opener") < steps.index("search_done") < steps.index("start_turn")
-    assert ("stream_open", True) in log
-    spoken = [entry for entry in log if entry[0] in ("speak_opener", "speak")]
-    assert spoken[:3] == [
-        ("speak_opener", "thinking"),
-        ("speak_opener", opener_key([result])),
-        ("speak", lead_in_sentence([result])),
+    assert "search_done" not in steps
+    assert steps.index("open_turn") < steps.index("start_turn")
+    assert ("start_turn", USER_TEXT) in log
+    assert ("stream_open", False) in log
+    assert [tool["function"]["name"] for tool in reasoning.tools[0]] == [
+        "search_code",
+        "push_diagram",
+        "clear_diagram",
+        "highlight_source",
+        "push_app",
     ]
-    assert speaker.openers == ["thinking", opener_key([result])]
-    assert speaker.utterances == [[lead_in_sentence([result])] + SPOKEN_CLAUSES]
+
+    prompt = reasoning.prompts[0]
+    assert prompt.tool_context == []
+    assert prompt.user_text == USER_TEXT
+    assert SYSTEM in prompt.system
+    assert SUBJECT in prompt.system
+    assert speaker.utterances == [SPOKEN_CLAUSES]
+
+    messages = session_messages(caplog)
+    assert any(SPOKEN_SPAN.match(message) for message in messages)
+    assert all(USER_TEXT not in message for message in messages)
     await loop.aclose()
 
 
@@ -760,7 +730,7 @@ async def test_frames_keep_arriving_while_a_turn_is_in_flight(tmp_path: Path) ->
     speaker = FakeSpeaker(log)
     gate = asyncio.Event()
     search = FakeSearch(log, found(), gate=gate)
-    reasoning = FakeReasoning(log, [], speaker.received)
+    reasoning = FakeReasoning(log, [SEARCH_CALL], speaker.received)
     loop = TurnLoop(
         config(tmp_path),
         source,
@@ -791,7 +761,7 @@ async def test_frames_keep_arriving_while_a_turn_is_in_flight(tmp_path: Path) ->
 
     assert connection.dropped_frames == 0
     assert len(search.calls) == 1
-    assert speaker.utterances == []
+    assert [name for name, _ in log if name == "speak"] == []
     endpoints = [event for event in source.seen if not isinstance(event, PartialTranscript)]
     assert endpoints == [SpeechStarted(), EndOfTurn(text=USER_TEXT), SpeechStarted()]
 
@@ -810,7 +780,7 @@ async def test_aclose_cancels_a_turn_still_in_flight(tmp_path: Path) -> None:
     speaker = FakeSpeaker(log)
     gate = asyncio.Event()
     search = FakeSearch(log, found(), gate=gate)
-    reasoning = FakeReasoning(log, [], speaker.received)
+    reasoning = FakeReasoning(log, [SEARCH_CALL], speaker.received)
     release = asyncio.Event()
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), release])
     loop = TurnLoop(
@@ -833,21 +803,20 @@ async def test_aclose_cancels_a_turn_still_in_flight(tmp_path: Path) -> None:
     assert steps.index("search_cancelled") < steps.index("abandon")
     turn_ids = [turn_id for name, turn_id in log if name == "open_turn"]
     assert [turn_id for name, turn_id in log if name == "abandon"] == turn_ids
-    assert speaker.utterances == []
-    assert reasoning.prompts == []
+    assert "speak" not in steps
+    assert len(reasoning.prompts) == 1
 
     release.set()
     await asyncio.wait_for(running, HANG_GUARD_S)
 
-    assert speaker.utterances == []
-    assert reasoning.prompts == []
+    assert "speak" not in [name for name, _ in log]
+    assert len(reasoning.prompts) == 1
 
 
 async def test_a_turn_with_no_spoken_chunk_accepts_the_next_turn(tmp_path: Path) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     reasoning = FakeReasoning(
         log, [TurnChunk(kind="reasoning", text=REASONING_TEXT)], speaker.received
     )
@@ -867,24 +836,25 @@ async def test_a_turn_with_no_spoken_chunk_accepts_the_next_turn(tmp_path: Path)
 
     await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    lead_in = lead_in_sentence([result])
-    assert speaker.utterances == [[lead_in], [lead_in]]
+    assert speaker.utterances == [[], []]
     assert [prompt.user_text for prompt in reasoning.prompts] == [USER_TEXT, SECOND_TEXT]
     turn_ids = [turn_id for name, turn_id in log if name == "open_turn"]
     assert len(set(turn_ids)) == 2
-    assert [turn_id for name, turn_id in log if name == "record"] == turn_ids
+    assert "abandon" not in [name for name, _ in log]
+    assert search.calls == []
     await loop.aclose()
 
 
-async def test_a_failing_turn_is_reported_and_the_loop_keeps_running(
+async def test_a_failing_search_in_the_model_round_is_reported_and_the_loop_keeps_running(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result, fails=USER_TEXT)
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received)
+    search = FakeSearch(log, found(), fails=MODEL_QUERY)
+    turns = [[SEARCH_CALL], spoken_chunks(SPOKEN_DELTAS)]
+    reasoning = FakeReasoning(
+        log, [], speaker.received, follow_up=spoken_chunks(SPOKEN_DELTAS), turns=turns
+    )
     source = ScriptedSource(
         [EndOfTurn(text=USER_TEXT), EndOfTurn(text=SECOND_TEXT), speaker.finished]
     )
@@ -903,11 +873,14 @@ async def test_a_failing_turn_is_reported_and_the_loop_keeps_running(
         await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
     messages = session_messages(caplog)
-    assert [message for message in messages if message.startswith("turn.failed")] == [
-        "turn.failed turn_id=turn-1 error=SearchFailed"
+    assert [message for message in messages if message.startswith("turn.reasoning_failed")] == [
+        "turn.reasoning_failed turn_id=turn-1 error=SearchFailed"
     ]
-    assert speaker.utterances == [[lead_in_sentence([result])] + SPOKEN_CLAUSES]
-    assert [prompt.user_text for prompt in reasoning.prompts] == [SECOND_TEXT]
+    assert [message for message in messages if message.startswith("turn.failed")] == []
+    assert search.calls == [(MODEL_QUERY, MODEL_GLOBS, tmp_path, SearchBudget())]
+    assert "record" not in [name for name, _ in log]
+    assert speaker.utterances == [[], SPOKEN_CLAUSES]
+    assert [prompt.user_text for prompt in reasoning.prompts] == [USER_TEXT, SECOND_TEXT]
     captured = [record.getMessage() for record in caplog.records]
     assert all(USER_TEXT not in message and SECOND_TEXT not in message for message in captured)
     await loop.aclose()
@@ -917,9 +890,8 @@ async def test_a_tool_call_chunk_never_reaches_the_speaker(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     deltas = [
         TurnChunk(kind="reasoning", text=REASONING_TEXT),
         TurnChunk(
@@ -946,14 +918,14 @@ async def test_a_tool_call_chunk_never_reaches_the_speaker(
     with caplog.at_level(logging.INFO, logger="tutor.session"):
         await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    assert speaker.utterances == [[lead_in_sentence([result])] + SPOKEN_CLAUSES]
+    assert speaker.utterances == [SPOKEN_CLAUSES]
     spoken = [text for name, text in log if name == "speak"]
     assert all(VISUAL_ARGUMENTS not in str(text) for text in spoken)
     assert all(REASONING_TEXT not in str(text) for text in spoken)
 
     recorded = [payload for name, payload in log if name in ("open_turn", "record", "abandon")]
-    assert recorded == ["turn-1", "turn-1"]
-    assert len(search.calls) == 1
+    assert recorded == ["turn-1"]
+    assert search.calls == []
 
     assert len(reasoning.prompts) == 2
     exchange = reasoning.prompts[1].tool_exchange
@@ -967,21 +939,16 @@ async def test_a_tool_call_chunk_never_reaches_the_speaker(
     await loop.aclose()
 
 
-async def test_a_search_code_call_dispatches_one_search_and_one_follow_up(tmp_path: Path) -> None:
+async def test_a_search_code_call_dispatches_one_search_and_one_follow_up(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     log: list[tuple[str, object]] = []
     result = found()
+    registry = RecordingRegistry(log)
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, result)
-    deltas = [
-        TurnChunk(
-            kind="tool_call",
-            text=SEARCH_ARGUMENTS,
-            tool_call_id=SEARCH_CALL_ID,
-            tool_name="search_code",
-        )
-    ]
-    follow_up = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received, follow_up=follow_up)
+    follow_up = spoken_chunks(SPOKEN_DELTAS)
+    reasoning = FakeReasoning(log, [SEARCH_CALL], speaker.received, follow_up=follow_up)
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
     loop = TurnLoop(
         config(tmp_path),
@@ -990,18 +957,17 @@ async def test_a_search_code_call_dispatches_one_search_and_one_follow_up(tmp_pa
         speaker,
         LoggingTransport(log),
         reasoning,
-        FakeRegistry(log),
+        registry,
         FakeClock(),
     )
 
-    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    assert search.calls == [
-        (USER_TEXT, GLOBS, tmp_path, SearchBudget()),
-        (MODEL_QUERY, MODEL_GLOBS, tmp_path, SearchBudget()),
-    ]
+    assert search.calls == [(MODEL_QUERY, MODEL_GLOBS, tmp_path, SearchBudget())]
     assert len(reasoning.prompts) == 2
     assert reasoning.tools == [[SEARCH_CODE_TOOL, *VISUAL_TOOLS], None]
+    assert reasoning.prompts[0].tool_context == []
 
     exchange = reasoning.prompts[1].tool_exchange
     assert exchange[0].tool_calls[0].id == SEARCH_CALL_ID
@@ -1010,8 +976,17 @@ async def test_a_search_code_call_dispatches_one_search_and_one_follow_up(tmp_pa
     assert exchange[1].tool_call_id == SEARCH_CALL_ID
     assert exchange[1].content == result.model_dump_json()
 
-    assert [turn_id for name, turn_id in log if name == "record"] == ["turn-1", "turn-1"]
-    assert speaker.utterances == [[lead_in_sentence([result])] + SPOKEN_CLAUSES]
+    steps = [name for name, _ in log]
+    assert steps.index("start_turn") < steps.index("search_done") < steps.index("record")
+    assert [turn_id for name, turn_id in log if name == "record"] == ["turn-1"]
+    lead_in = lead_in_sentence([result])
+    assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]]
+    assert ("turn-1", lead_in, "lead_in") in registry.verified
+    assert log.index(("record", "turn-1")) < log.index(("speak", lead_in))
+
+    messages = session_messages(caplog)
+    assert any(SEARCH_SPAN.match(message) for message in messages)
+    assert all(MODEL_QUERY not in message for message in messages)
     await loop.aclose()
 
 
@@ -1030,7 +1005,10 @@ async def test_a_tool_round_does_not_glue_the_sentences_around_it(tmp_path: Path
         ),
     ]
     follow_up = [TurnChunk(kind="spoken", text="Diagram incoming for the pool.")]
-    reasoning = FakeReasoning(log, deltas, speaker.received, follow_up=follow_up)
+    gate = asyncio.Event()
+    reasoning = FakeReasoning(
+        log, deltas, speaker.received, follow_up=follow_up, follow_up_gate=gate
+    )
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
     loop = TurnLoop(
         config(tmp_path),
@@ -1042,11 +1020,17 @@ async def test_a_tool_round_does_not_glue_the_sentences_around_it(tmp_path: Path
         FakeRegistry(log),
         FakeClock(),
     )
+    running = asyncio.create_task(loop.run())
 
-    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+    speaker.received.clear()
+    await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+    assert speaker.utterances == [["It lives there.", lead_in_sentence([result])]]
+    gate.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
 
     assert speaker.utterances == [
-        [lead_in_sentence([result]), "It lives there.", "Diagram incoming for the pool."]
+        ["It lives there.", lead_in_sentence([result]), "Diagram incoming for the pool."]
     ]
     await loop.aclose()
 
@@ -1055,9 +1039,8 @@ async def test_a_payload_in_the_stream_never_reaches_the_speaker(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     deltas = [
         TurnChunk(kind="spoken", text="The pool is a free list. "),
         TurnChunk(kind="spoken", text='```json\n{"type":"diagram"}\n```'),
@@ -1081,7 +1064,6 @@ async def test_a_payload_in_the_stream_never_reaches_the_speaker(
 
     assert speaker.utterances == [
         [
-            lead_in_sentence([result]),
             "The pool is a free list.",
             "The acquire path takes a slot from it.",
         ]
@@ -1095,9 +1077,8 @@ async def test_a_rate_limit_ends_the_turn_and_keeps_the_loop_running(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
     reasoning = FakeReasoning(log, deltas, speaker.received, fails=USER_TEXT)
     source = ScriptedSource(
@@ -1117,8 +1098,8 @@ async def test_a_rate_limit_ends_the_turn_and_keeps_the_loop_running(
     with caplog.at_level(logging.INFO, logger="tutor.session"):
         await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    lead_in = lead_in_sentence([result])
-    assert speaker.utterances == [[lead_in], [lead_in] + SPOKEN_CLAUSES]
+    assert speaker.utterances == [[], SPOKEN_CLAUSES]
+    assert search.calls == []
 
     messages = session_messages(caplog)
     assert [message for message in messages if message.startswith("turn.reasoning_failed")] == [
@@ -1138,17 +1119,13 @@ async def test_each_reasoning_stream_is_iterated_once(tmp_path: Path) -> None:
     result = found()
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, result)
-    deltas = [
-        TurnChunk(
-            kind="tool_call",
-            text=SEARCH_ARGUMENTS,
-            tool_call_id=SEARCH_CALL_ID,
-            tool_name="search_code",
-        )
-    ]
+    deltas = [SEARCH_CALL]
     deltas += [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
     follow_up = [TurnChunk(kind="spoken", text=delta) for delta in FOLLOW_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received, follow_up=follow_up)
+    gate = asyncio.Event()
+    reasoning = FakeReasoning(
+        log, deltas, speaker.received, follow_up=follow_up, follow_up_gate=gate
+    )
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
     loop = TurnLoop(
         config(tmp_path),
@@ -1160,12 +1137,20 @@ async def test_each_reasoning_stream_is_iterated_once(tmp_path: Path) -> None:
         FakeRegistry(log),
         FakeClock(),
     )
+    running = asyncio.create_task(loop.run())
 
-    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+    speaker.received.clear()
+    await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+    assert speaker.utterances == [[CHAINED_CLAUSES[0], lead_in_sentence([result])]]
+    gate.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
 
     assert [stream.iterations for stream in reasoning.streams] == [1, 1]
     assert len([name for name, _ in log if name == "start_turn"]) == 2
-    assert speaker.utterances == [[lead_in_sentence([result])] + CHAINED_CLAUSES]
+    assert speaker.utterances == [
+        [CHAINED_CLAUSES[0], lead_in_sentence([result]), CHAINED_CLAUSES[1]]
+    ]
     await loop.aclose()
 
 
@@ -1189,9 +1174,8 @@ async def pull_past(source: ScriptedSource, gate: asyncio.Event) -> None:
 
 async def test_a_barge_in_before_the_first_chunk_cancels_the_drain(tmp_path: Path) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     gate = asyncio.Event()
     deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
     reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
@@ -1217,7 +1201,7 @@ async def test_a_barge_in_before_the_first_chunk_cancels_the_drain(tmp_path: Pat
 
     assert drain.cancelled()
     assert reasoning.streams[0].cancels == 0
-    assert speaker.utterances == [[lead_in_sentence([result])]]
+    assert speaker.utterances == [[]]
     assert ("abandon", "turn-1") in log
 
     release.set()
@@ -1226,10 +1210,9 @@ async def test_a_barge_in_before_the_first_chunk_cancels_the_drain(tmp_path: Pat
 
 async def test_a_barge_in_on_a_full_spoken_queue_cancels_the_drain(tmp_path: Path) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     hold = asyncio.Event()
-    speaker = FakeSpeaker(log, gate=hold)
-    search = FakeSearch(log, result)
+    speaker = FakeSpeaker(log, gate=hold, hold_at=1)
+    search = FakeSearch(log, found())
     deltas = [TurnChunk(kind="spoken", text=FIRST_CLAUSE_DELTA)]
     deltas += [TurnChunk(kind="spoken", text=FILLER_DELTA) for _ in range(2 * QUEUE_FULL_DELTAS)]
     reasoning = FakeReasoning(log, deltas, speaker.received)
@@ -1255,7 +1238,7 @@ async def test_a_barge_in_on_a_full_spoken_queue_cancels_the_drain(tmp_path: Pat
 
     assert drain.cancelled()
     assert reasoning.streams[0].yielded == QUEUE_FULL_DELTAS
-    assert speaker.utterances == [[lead_in_sentence([result]), SPOKEN_CLAUSES[0]]]
+    assert speaker.utterances == [[SPOKEN_CLAUSES[0]]]
     assert ("abandon", "turn-1") in log
 
     release.set()
@@ -1266,10 +1249,9 @@ async def test_speech_start_mid_synthesis_cancels_flushes_and_takes_the_next_tur
     tmp_path: Path,
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     hold = asyncio.Event()
-    speaker = FakeSpeaker(log, gate=hold)
-    search = FakeSearch(log, result)
+    speaker = FakeSpeaker(log, gate=hold, hold_at=1)
+    search = FakeSearch(log, found())
     gate = asyncio.Event()
     deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
     reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate, holds_at=3)
@@ -1289,13 +1271,12 @@ async def test_speech_start_mid_synthesis_cancels_flushes_and_takes_the_next_tur
         FakeClock(),
     )
     running = asyncio.create_task(loop.run())
-    lead_in = lead_in_sentence([result])
 
     await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
     await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
     await asyncio.wait_for(speaker.held.wait(), HANG_GUARD_S)
     drain = drain_task()
-    assert speaker.utterances == [[lead_in, SPOKEN_CLAUSES[0]]]
+    assert speaker.utterances == [[SPOKEN_CLAUSES[0]]]
     turn = turn_task()
 
     log.append(("barge", None))
@@ -1316,31 +1297,26 @@ async def test_speech_start_mid_synthesis_cancels_flushes_and_takes_the_next_tur
         < log.index(("abandon", "turn-1"))
     )
     assert ("stream_closed", 3) in log
-    assert speaker.utterances == [[lead_in, SPOKEN_CLAUSES[0]]]
+    assert speaker.utterances == [[SPOKEN_CLAUSES[0]]]
     assert ("open_turn", "turn-2") not in log
 
     resume.set()
     await asyncio.wait_for(running, HANG_GUARD_S)
 
     assert log.index(("abandon", "turn-1")) < log.index(("open_turn", "turn-2"))
-    assert speaker.utterances == [[lead_in, SPOKEN_CLAUSES[0]], [lead_in, *SPOKEN_CLAUSES]]
-    assert [entry for entry in log if entry[0] == "speak_cancelled"] == [("speak_cancelled", 2)]
+    assert speaker.utterances == [[SPOKEN_CLAUSES[0]], SPOKEN_CLAUSES]
+    assert [entry for entry in log if entry[0] == "speak_cancelled"] == [("speak_cancelled", 1)]
     await loop.aclose()
 
 
-async def test_speech_start_during_the_opener_drops_the_queued_playout(tmp_path: Path) -> None:
+async def test_speech_start_with_no_utterance_in_flight_still_flushes_playout(
+    tmp_path: Path,
+) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    gate = asyncio.Event()
-    search = FakeSearch(log, result, gate=gate)
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received)
-    barge = asyncio.Event()
-    resume = asyncio.Event()
-    source = ScriptedSource(
-        [EndOfTurn(text=USER_TEXT), barge, SpeechStarted(), resume, EndOfTurn(text=SECOND_TEXT)]
-    )
+    search = FakeSearch(log, found())
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    source = ScriptedSource([SpeechStarted(), EndOfTurn(text=USER_TEXT), speaker.finished])
     loop = TurnLoop(
         config(tmp_path),
         source,
@@ -1351,36 +1327,15 @@ async def test_speech_start_during_the_opener_drops_the_queued_playout(tmp_path:
         FakeRegistry(log),
         FakeClock(),
     )
-    running = asyncio.create_task(loop.run())
 
-    await asyncio.wait_for(search.held.wait(), HANG_GUARD_S)
-    assert speaker.openers == ["thinking"]
-    assert speaker.utterances == []
-    turn = turn_task()
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    await pull_past(source, barge)
-    gate.set()
-    await asyncio.wait_for(asyncio.wait([turn]), HANG_GUARD_S)
-
-    assert turn.cancelled()
     steps = [name for name, _ in log]
-    assert (
-        steps.index("speak_opener")
-        < steps.index("flush_playout")
-        < steps.index("search_cancelled")
-        < log.index(("abandon", "turn-1"))
-    )
-    assert "speak" not in steps
+    assert steps.index("flush_playout") < steps.index("open_turn") < steps.index("speak")
+    assert "abandon" not in steps
     assert "speak_cancelled" not in steps
-    assert reasoning.prompts == []
-
-    resume.set()
-    await asyncio.wait_for(running, HANG_GUARD_S)
-
-    assert len(search.calls) == 2
-    steps = [name for name, _ in log]
-    assert steps.index("flush_playout") < steps.index("speak")
-    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
+    assert search.calls == []
+    assert speaker.utterances == [SPOKEN_CLAUSES]
     await loop.aclose()
 
 
@@ -1389,8 +1344,8 @@ async def test_a_clause_past_the_chunker_at_speech_start_is_never_spoken(tmp_pat
     result = found_many()
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, result)
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received)
+    follow_up = spoken_chunks(SPOKEN_DELTAS)
+    reasoning = FakeReasoning(log, [SEARCH_CALL], speaker.received, follow_up=follow_up)
     trip = asyncio.Event()
     registry = TrippingRegistry(log, trip, SPOKEN_CLAUSES[0])
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), trip, SpeechStarted()])
@@ -1419,10 +1374,9 @@ async def test_a_second_speech_start_during_cancellation_is_idempotent(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     hold = asyncio.Event()
-    speaker = FakeSpeaker(log, gate=hold)
-    search = FakeSearch(log, result)
+    speaker = FakeSpeaker(log, gate=hold, hold_at=1)
+    search = FakeSearch(log, found())
     gate = asyncio.Event()
     close_gate = asyncio.Event()
     deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
@@ -1455,7 +1409,6 @@ async def test_a_second_speech_start_during_cancellation_is_idempotent(
     )
     with caplog.at_level(logging.INFO, logger="tutor.session"):
         running = asyncio.create_task(loop.run())
-        lead_in = lead_in_sentence([result])
 
         await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
         await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
@@ -1490,7 +1443,7 @@ async def test_a_second_speech_start_during_cancellation_is_idempotent(
     assert steps.count("speak_cancelled") == 1
     assert steps.count("abandon") == 1
     assert log.index(("abandon", "turn-1")) < log.index(("open_turn", "turn-2"))
-    assert speaker.utterances == [[lead_in, SPOKEN_CLAUSES[0]], [lead_in, *SPOKEN_CLAUSES]]
+    assert speaker.utterances == [[SPOKEN_CLAUSES[0]], SPOKEN_CLAUSES]
     messages = session_messages(caplog)
     assert [message for message in messages if message.startswith("turn.failed")] == []
     await loop.aclose()
@@ -1500,10 +1453,9 @@ async def test_aclose_during_cancellation_lets_the_turn_finish_its_cleanup(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     hold = asyncio.Event()
-    speaker = FakeSpeaker(log, gate=hold)
-    search = FakeSearch(log, result)
+    speaker = FakeSpeaker(log, gate=hold, hold_at=1)
+    search = FakeSearch(log, found())
     gate = asyncio.Event()
     close_gate = asyncio.Event()
     deltas = spoken_chunks(SPOKEN_DELTAS)
@@ -1560,8 +1512,8 @@ async def test_a_cancelled_turns_tool_results_do_not_ground_the_next_turn(
     hold = asyncio.Event()
     speaker = FakeSpeaker(log, gate=hold)
     search = FakeSearch(log, first, later=second)
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in PATH_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received)
+    follow_up = spoken_chunks(PATH_DELTAS)
+    reasoning = FakeReasoning(log, [SEARCH_CALL], speaker.received, follow_up=follow_up)
     barge = asyncio.Event()
     resume = asyncio.Event()
     source = ScriptedSource(
@@ -1609,9 +1561,8 @@ async def test_unusable_search_code_arguments_answer_the_call_without_searching(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, arguments: str
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     deltas = [
         TurnChunk(
             kind="tool_call",
@@ -1639,11 +1590,8 @@ async def test_unusable_search_code_arguments_answer_the_call_without_searching(
     with caplog.at_level(logging.INFO, logger="tutor.session"):
         await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    assert search.calls == [
-        (USER_TEXT, GLOBS, tmp_path, SearchBudget()),
-        (SECOND_TEXT, GLOBS, tmp_path, SearchBudget()),
-    ]
-    assert [turn_id for name, turn_id in log if name == "record"] == ["turn-1", "turn-2"]
+    assert search.calls == []
+    assert "record" not in [name for name, _ in log]
 
     assert len(reasoning.prompts) == 4
     exchange = reasoning.prompts[1].tool_exchange
@@ -1651,8 +1599,7 @@ async def test_unusable_search_code_arguments_answer_the_call_without_searching(
     assert exchange[1].tool_call_id == SEARCH_CALL_ID
     assert exchange[1].content == BAD_ARGUMENTS
 
-    lead_in = lead_in_sentence([result])
-    assert speaker.utterances == [[lead_in] + SPOKEN_CLAUSES, [lead_in] + SPOKEN_CLAUSES]
+    assert speaker.utterances == [SPOKEN_CLAUSES, SPOKEN_CLAUSES]
     spoken = [text for name, text in log if name == "speak"]
     assert all(arguments not in str(text) for text in spoken)
 
@@ -1696,10 +1643,7 @@ async def test_a_tool_call_missing_its_id_is_dropped_from_the_exchange(
     with caplog.at_level(logging.INFO, logger="tutor.session"):
         await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    assert search.calls == [
-        (USER_TEXT, GLOBS, tmp_path, SearchBudget()),
-        (MODEL_QUERY, MODEL_GLOBS, tmp_path, SearchBudget()),
-    ]
+    assert search.calls == [(MODEL_QUERY, MODEL_GLOBS, tmp_path, SearchBudget())]
 
     assert len(reasoning.prompts) == 2
     exchange = reasoning.prompts[1].tool_exchange
@@ -1722,9 +1666,8 @@ async def test_a_lone_tool_call_missing_its_id_skips_the_follow_up(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     deltas = [TurnChunk(kind="tool_call", text=TRUNCATED_ARGUMENTS, tool_name="search_code")]
     deltas += [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
     reasoning = FakeReasoning(log, deltas, speaker.received)
@@ -1750,13 +1693,9 @@ async def test_a_lone_tool_call_missing_its_id_skips_the_follow_up(
         [SEARCH_CODE_TOOL, *VISUAL_TOOLS],
         [SEARCH_CODE_TOOL, *VISUAL_TOOLS],
     ]
-    assert search.calls == [
-        (USER_TEXT, GLOBS, tmp_path, SearchBudget()),
-        (SECOND_TEXT, GLOBS, tmp_path, SearchBudget()),
-    ]
+    assert search.calls == []
 
-    lead_in = lead_in_sentence([result])
-    assert speaker.utterances == [[lead_in] + SPOKEN_CLAUSES, [lead_in] + SPOKEN_CLAUSES]
+    assert speaker.utterances == [SPOKEN_CLAUSES, SPOKEN_CLAUSES]
     spoken = [text for name, text in log if name == "speak"]
     assert all(TRUNCATED_ARGUMENTS not in str(text) for text in spoken)
 
@@ -1774,9 +1713,8 @@ async def test_a_visual_tool_call_reaches_the_channel_before_the_sentence_that_f
     tmp_path: Path,
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     deltas = [visual_call("push_diagram", DIAGRAM_ARGUMENTS, VISUAL_CALL_ID)]
     reasoning = FakeReasoning(log, deltas, speaker.received, follow_up=spoken_chunks(SPOKEN_DELTAS))
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
@@ -1805,7 +1743,8 @@ async def test_a_visual_tool_call_reaches_the_channel_before_the_sentence_that_f
         "push_app",
     ]
     assert reasoning.tools[1] is None
-    assert speaker.utterances == [[lead_in_sentence([result])] + SPOKEN_CLAUSES]
+    assert speaker.utterances == [SPOKEN_CLAUSES]
+    assert search.calls == []
     await loop.aclose()
 
 
@@ -1909,6 +1848,7 @@ async def test_grounding_reaches_the_channel_before_a_highlight_and_an_ungrounde
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, result)
     deltas = [
+        SEARCH_CALL,
         visual_call("highlight_source", GROUNDED_HIGHLIGHT, VISUAL_CALL_ID),
         visual_call("highlight_source", UNGROUNDED_HIGHLIGHT, "call-visual-2"),
     ]
@@ -1932,6 +1872,7 @@ async def test_grounding_reaches_the_channel_before_a_highlight_and_an_ungrounde
     ]
     exchange = reasoning.prompts[1].tool_exchange
     assert [message.content for message in exchange[1:]] == [
+        result.model_dump_json(),
         "highlight_source: sent",
         f"highlight_source: error: ungrounded highlight {UNGROUNDED_PATH!r}:30",
     ]
@@ -1943,9 +1884,8 @@ async def test_a_transport_error_in_a_push_ends_the_drain_and_the_next_turn_is_t
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     deltas = [visual_call("push_diagram", DIAGRAM_ARGUMENTS, VISUAL_CALL_ID)]
     reasoning = FakeReasoning(log, deltas, speaker.received, follow_up=spoken_chunks(SPOKEN_DELTAS))
     source = SerialSource([USER_TEXT, SECOND_TEXT])
@@ -1967,8 +1907,7 @@ async def test_a_transport_error_in_a_push_ends_the_drain_and_the_next_turn_is_t
     assert "turn.reasoning_failed turn_id=turn-1 error=ChannelClosed" in messages
     assert "turn.reasoning_failed turn_id=turn-2 error=ChannelClosed" in messages
     assert [prompt.user_text for prompt in reasoning.prompts] == [USER_TEXT, SECOND_TEXT]
-    lead_in = lead_in_sentence([result])
-    assert speaker.utterances == [[lead_in], [lead_in]]
+    assert speaker.utterances == [[], []]
     await loop.aclose()
 
 
@@ -1979,14 +1918,7 @@ async def test_the_tool_round_carries_its_own_token_cap_and_the_follow_up_the_de
     result = found()
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, result)
-    deltas = [
-        TurnChunk(
-            kind="tool_call",
-            text=SEARCH_ARGUMENTS,
-            tool_call_id=SEARCH_CALL_ID,
-            tool_name="search_code",
-        )
-    ]
+    deltas = [SEARCH_CALL]
     reasoning = FakeReasoning(log, deltas, speaker.received, follow_up=spoken_chunks(SPOKEN_DELTAS))
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
     cfg = config(tmp_path)
@@ -2015,8 +1947,8 @@ async def test_an_ungrounded_chunk_is_withheld_from_the_speaker(
     registry = TurnRegistry()
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, result)
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in PATH_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received)
+    follow_up = spoken_chunks(PATH_DELTAS)
+    reasoning = FakeReasoning(log, [SEARCH_CALL], speaker.received, follow_up=follow_up)
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
     loop = TurnLoop(
         config(tmp_path),
@@ -2048,8 +1980,8 @@ async def test_a_bare_count_is_withheld_from_the_speaker(
     registry = TurnRegistry()
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, result)
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in COUNT_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received)
+    follow_up = spoken_chunks(COUNT_DELTAS)
+    reasoning = FakeReasoning(log, [SEARCH_CALL], speaker.received, follow_up=follow_up)
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
     loop = TurnLoop(
         config(tmp_path),
@@ -2078,8 +2010,8 @@ async def test_a_recorded_position_reaches_the_speaker_unchanged(tmp_path: Path)
     registry = TurnRegistry()
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, result)
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in LINE_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received)
+    follow_up = spoken_chunks(LINE_DELTAS)
+    reasoning = FakeReasoning(log, [SEARCH_CALL], speaker.received, follow_up=follow_up)
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
     loop = TurnLoop(
         config(tmp_path),
@@ -2105,8 +2037,8 @@ async def test_last_turns_position_does_not_authorize_this_turn(tmp_path: Path) 
     registry = TurnRegistry()
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, first, later=second)
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in PATH_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received)
+    follow_up = spoken_chunks(PATH_DELTAS)
+    reasoning = FakeReasoning(log, [SEARCH_CALL], speaker.received, follow_up=follow_up)
     source = ScriptedSource(
         [EndOfTurn(text=USER_TEXT), speaker.finished, EndOfTurn(text=SECOND_TEXT)]
     )
@@ -2138,8 +2070,8 @@ async def test_a_lead_in_the_gate_cannot_reparse_is_withheld(
     registry = TurnRegistry()
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, result)
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received)
+    follow_up = spoken_chunks(SPOKEN_DELTAS)
+    reasoning = FakeReasoning(log, [SEARCH_CALL], speaker.received, follow_up=follow_up)
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
     loop = TurnLoop(
         config(tmp_path),
@@ -2166,19 +2098,11 @@ async def test_a_lead_in_the_gate_cannot_reparse_is_withheld(
 
 async def test_a_tool_result_answering_an_abandoned_turn_reaches_nobody(tmp_path: Path) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     registry = TurnRegistry()
     speaker = FakeSpeaker(log)
     gate = asyncio.Event()
-    search = FakeSearch(log, result, gate=gate, later=found(UNGROUNDED_PATH), holds=MODEL_QUERY)
-    deltas = [
-        TurnChunk(
-            kind="tool_call",
-            text=SEARCH_ARGUMENTS,
-            tool_call_id=SEARCH_CALL_ID,
-            tool_name="search_code",
-        )
-    ]
+    search = FakeSearch(log, found(UNGROUNDED_PATH), gate=gate)
+    deltas = [SEARCH_CALL]
     follow_up = [TurnChunk(kind="spoken", text=delta) for delta in PATH_DELTAS]
     reasoning = FakeReasoning(log, deltas, speaker.received, follow_up=follow_up)
     release = asyncio.Event()
@@ -2202,12 +2126,12 @@ async def test_a_tool_result_answering_an_abandoned_turn_reaches_nobody(tmp_path
     release.set()
     await asyncio.wait_for(running, HANG_GUARD_S)
 
-    assert len(search.calls) == 2
+    assert len(search.calls) == 1
     assert ("search_cancelled", MODEL_QUERY) in log
     assert ("search_done", MODEL_QUERY) not in log
     assert not registry.known("turn-1", Position(path=UNGROUNDED_PATH, line=24))
     assert not registry.known("turn-1", Position(path=UNGROUNDED_PATH))
-    assert speaker.utterances == [[lead_in_sentence([result])]]
+    assert speaker.utterances == [[]]
     assert PATH_CLAUSES[1] not in [text for name, text in log if name == "speak"]
 
 
@@ -2215,10 +2139,9 @@ async def test_a_line_number_split_across_the_cut_never_reaches_the_speaker(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     registry = TurnRegistry()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPLIT_DELTAS]
     reasoning = FakeReasoning(log, deltas, speaker.received)
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
@@ -2239,7 +2162,7 @@ async def test_a_line_number_split_across_the_cut_never_reaches_the_speaker(
     clauses, remainder = split_clauses("".join(SPLIT_DELTAS), 3, 12)
     spoken = [text for name, text in log if name == "speak"]
     assert clauses + [remainder] == SPLIT_CLAUSES
-    assert speaker.utterances == [[lead_in_sentence([result]), *SPLIT_CLAUSES[:2]]]
+    assert speaker.utterances == [SPLIT_CLAUSES[:2]]
     assert all(str(SPLIT_LINE) not in chunk for chunk in spoken)
 
     messages = session_messages(caplog)
@@ -2253,8 +2176,10 @@ async def test_a_stage_waits_out_the_gap_and_stops_once_the_model_speaks(tmp_pat
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, result, later=found())
     gate = asyncio.Event()
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
+    follow_up = spoken_chunks(SPOKEN_DELTAS)
+    reasoning = FakeReasoning(
+        log, [SEARCH_CALL], speaker.received, follow_up=follow_up, follow_up_gate=gate
+    )
     source = ScriptedSource(
         [EndOfTurn(text=USER_TEXT), speaker.finished, EndOfTurn(text=SECOND_TEXT)]
     )
@@ -2280,6 +2205,7 @@ async def test_a_stage_waits_out_the_gap_and_stops_once_the_model_speaks(tmp_pat
     stagers = [task for task in asyncio.all_tasks() if task.get_name() == STAGER_TASK]
     assert len(stagers) == 1
     assert speaker.utterances == [[lead_in]]
+    assert search.calls == [(MODEL_QUERY, MODEL_GLOBS, tmp_path, SearchBudget())]
     assert pace.waits == [cfg.stage_gap_ms / 1000]
 
     speaker.received.clear()
@@ -2313,8 +2239,10 @@ async def test_every_stage_is_verified_as_a_lead_in_chunk_on_the_turn(tmp_path: 
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, result)
     gate = asyncio.Event()
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
+    follow_up = spoken_chunks(SPOKEN_DELTAS)
+    reasoning = FakeReasoning(
+        log, [SEARCH_CALL], speaker.received, follow_up=follow_up, follow_up_gate=gate
+    )
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
     pace = HeldPace()
     loop = TurnLoop(
@@ -2339,7 +2267,9 @@ async def test_every_stage_is_verified_as_a_lead_in_chunk_on_the_turn(tmp_path: 
     gate.set()
     await asyncio.wait_for(running, HANG_GUARD_S)
 
-    assert speaker.utterances == [[lead_in_sentence([result]), *stages[:2], *SPOKEN_CLAUSES]]
+    lead_in = lead_in_sentence([result])
+    assert speaker.utterances == [[lead_in, *stages[:2], *SPOKEN_CLAUSES]]
+    assert ("turn-1", lead_in, "lead_in") in registry.verified
     for sentence in stages[:2]:
         assert ("turn-1", sentence, "lead_in") in registry.verified
     sources = {source for _, text, source in registry.verified if text in stages}
@@ -2360,8 +2290,10 @@ async def test_a_stage_never_lends_its_path_to_the_model_stream(
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, result)
     gate = asyncio.Event()
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in CARRY_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
+    follow_up = spoken_chunks(CARRY_DELTAS)
+    reasoning = FakeReasoning(
+        log, [SEARCH_CALL], speaker.received, follow_up=follow_up, follow_up_gate=gate
+    )
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
     pace = HeldPace()
     loop = TurnLoop(
@@ -2395,6 +2327,7 @@ async def test_a_stage_never_lends_its_path_to_the_model_stream(
     assert [message for message in messages if message.startswith("turn.stage")] == [
         "turn.stage turn_id=turn-1 n=1",
         "turn.stage turn_id=turn-1 n=2",
+        "turn.stage turn_id=turn-1 n=3",
     ]
     await loop.aclose()
 
@@ -2407,8 +2340,10 @@ async def test_the_first_spoken_chunk_mid_stage_rides_the_turns_one_iterator(
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, result)
     gate = asyncio.Event()
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
+    follow_up = spoken_chunks(SPOKEN_DELTAS)
+    reasoning = FakeReasoning(
+        log, [SEARCH_CALL], speaker.received, follow_up=follow_up, follow_up_gate=gate
+    )
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
     pace = HeldPace()
     loop = TurnLoop(
@@ -2447,8 +2382,10 @@ async def test_a_stalled_speaker_holds_the_next_stage_back(tmp_path: Path) -> No
     speaker = FakeSpeaker(log, gate=hold)
     search = FakeSearch(log, result)
     gate = asyncio.Event()
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
+    follow_up = spoken_chunks(SPOKEN_DELTAS)
+    reasoning = FakeReasoning(
+        log, [SEARCH_CALL], speaker.received, follow_up=follow_up, follow_up_gate=gate
+    )
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
     pace = HeldPace(log)
     cfg = config(tmp_path)
@@ -2507,9 +2444,8 @@ def spoken_spans(caplog: pytest.LogCaptureFixture) -> list[str]:
 
 async def test_partials_are_ignored_with_speculation_off(tmp_path: Path) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
     reasoning = FakeReasoning(log, deltas, speaker.received)
     endpoint = asyncio.Event()
@@ -2543,9 +2479,9 @@ async def test_partials_are_ignored_with_speculation_off(tmp_path: Path) -> None
     await pull_past(source, endpoint)
     await asyncio.wait_for(running, HANG_GUARD_S)
 
-    assert search.calls == [(USER_TEXT, GLOBS, tmp_path, SearchBudget())]
+    assert search.calls == []
     assert [entry for entry in log if entry[0] == "start_turn"] == [("start_turn", USER_TEXT)]
-    assert speaker.utterances == [[lead_in_sentence([result])] + SPOKEN_CLAUSES]
+    assert speaker.utterances == [SPOKEN_CLAUSES]
     await loop.aclose()
 
 
@@ -2553,12 +2489,10 @@ async def test_a_partial_issues_the_request_and_a_matching_final_reuses_it(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     gate = asyncio.Event()
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received, gate=gate)
     endpoint = asyncio.Event()
     source = ScriptedSource(
         [
@@ -2579,26 +2513,22 @@ async def test_a_partial_issues_the_request_and_a_matching_final_reuses_it(
         FakeRegistry(log),
         FakeClock(),
     )
-    lead_in = lead_in_sentence([result])
     with caplog.at_level(logging.INFO, logger="tutor.session"):
         running = asyncio.create_task(loop.run())
 
         await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
         await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
-        assert [call[0] for call in search.calls] == [PARTIAL_TEXT]
+        assert search.calls == []
         assert [entry for entry in log if entry[0] == "start_turn"] == [
             ("start_turn", PARTIAL_TEXT)
         ]
         assert ("stream_open", False) in log
         assert reasoning.streams[0].iterations == 1
-        assert reasoning.prompts[0].tool_context == [result]
+        assert reasoning.prompts[0].tool_context == []
         assert speaker.openers == []
         assert speaker.utterances == []
 
         await pull_past(source, endpoint)
-        await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
-        assert speaker.openers == [OPENER, opener_key([result])]
-        assert speaker.utterances == [[lead_in]]
         assert [entry for entry in log if entry[0] == "start_turn"] == [
             ("start_turn", PARTIAL_TEXT)
         ]
@@ -2606,11 +2536,13 @@ async def test_a_partial_issues_the_request_and_a_matching_final_reuses_it(
         gate.set()
         await asyncio.wait_for(running, HANG_GUARD_S)
 
+    assert search.calls == []
     assert [entry for entry in log if entry[0] == "start_turn"] == [("start_turn", PARTIAL_TEXT)]
     assert reasoning.streams[-1].iterations == 1
-    assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]]
+    assert speaker.openers == []
+    assert speaker.utterances == [SPOKEN_CLAUSES]
     assert [entry for entry in log if entry[0] == "open_turn"] == [("open_turn", TURN_TASK)]
-    assert [entry for entry in log if entry[0] == "record"] == [("record", TURN_TASK)]
+    assert "record" not in [name for name, _ in log]
     assert "abandon" not in [name for name, _ in log]
     assert len(spoken_spans(caplog)) == 1
     messages = session_messages(caplog)
@@ -2620,9 +2552,8 @@ async def test_a_partial_issues_the_request_and_a_matching_final_reuses_it(
 
 async def test_a_speculative_round_carries_no_visual_tools(tmp_path: Path) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     gate = asyncio.Event()
     reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received, gate=gate)
     endpoint = asyncio.Event()
@@ -2650,14 +2581,13 @@ async def test_a_speculative_round_carries_no_visual_tools(tmp_path: Path) -> No
     await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
     await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
     await pull_past(source, endpoint)
-    await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
     gate.set()
     await asyncio.wait_for(running, HANG_GUARD_S)
 
     assert reasoning.tools == [[SEARCH_CODE_TOOL]]
-    pushed = [payload for name, payload in log if name == "send_json"]
-    assert [payload for payload in pushed if payload["type"] in VISUAL_PAYLOAD_TYPES] == []
-    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
+    assert search.calls == []
+    assert not any(sent(log, kind) for kind in VISUAL_PAYLOAD_TYPES)
+    assert speaker.utterances == [SPOKEN_CLAUSES]
     await loop.aclose()
 
 
@@ -2665,9 +2595,8 @@ async def test_a_later_partial_cancels_and_reissues_the_request(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     gate = asyncio.Event()
     deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
     reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
@@ -2723,7 +2652,8 @@ async def test_a_later_partial_cancels_and_reissues_the_request(
 
     assert [name for name, _ in log].count("start_turn") == 2
     assert reasoning.streams[-1].iterations == 1
-    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
+    assert speaker.utterances == [SPOKEN_CLAUSES]
+    assert search.calls == []
     assert [name for name, _ in log].count("abandon") == 1
     assert len(spoken_spans(caplog)) == 1
     await loop.aclose()
@@ -2733,9 +2663,8 @@ async def test_a_mismatching_final_discards_the_speculation(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     gate = asyncio.Event()
     deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
     reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
@@ -2786,17 +2715,16 @@ async def test_a_mismatching_final_discards_the_speculation(
         < log.index(("start_turn", SECOND_TEXT))
     )
     assert [name for name, _ in log].count("abandon") == 1
-    assert search.calls[1][0] == SECOND_TEXT
-    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
+    assert search.calls == []
+    assert speaker.utterances == [SPOKEN_CLAUSES]
     assert len(spoken_spans(caplog)) == 1
     await loop.aclose()
 
 
 async def test_speech_start_cancels_the_speculation(tmp_path: Path) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     gate = asyncio.Event()
     deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
     reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
@@ -2847,15 +2775,15 @@ async def test_speech_start_cancels_the_speculation(tmp_path: Path) -> None:
         ("start_turn", USER_TEXT),
     ]
     assert log.index(("abandon", TURN_TASK)) < log.index(("start_turn", USER_TEXT))
-    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
+    assert speaker.utterances == [SPOKEN_CLAUSES]
+    assert search.calls == []
     await loop.aclose()
 
 
 async def test_aclose_cancels_a_speculation_in_flight(tmp_path: Path) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     gate = asyncio.Event()
     deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
     reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate)
@@ -2890,19 +2818,19 @@ async def test_aclose_cancels_a_speculation_in_flight(tmp_path: Path) -> None:
     await asyncio.wait_for(running, HANG_GUARD_S)
 
     assert speaker.utterances == []
+    assert search.calls == []
     assert [name for name, _ in log].count("start_turn") == 1
 
 
-async def test_a_failed_speculation_is_reported_and_the_final_grounds_itself(
+async def test_a_failed_speculation_is_reported_and_the_final_starts_its_own_call(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    gate = asyncio.Event()
-    search = FakeSearch(log, result, gate=gate, fails=PARTIAL_TEXT, holds=PARTIAL_TEXT)
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received)
+    search = FakeSearch(log, found())
+    reasoning = FakeReasoning(
+        log, spoken_chunks(SPOKEN_DELTAS), speaker.received, fails=PARTIAL_TEXT
+    )
     endpoint = asyncio.Event()
     source = ScriptedSource(
         [
@@ -2925,40 +2853,44 @@ async def test_a_failed_speculation_is_reported_and_the_final_grounds_itself(
     with caplog.at_level(logging.INFO, logger="tutor.session"):
         running = asyncio.create_task(loop.run())
 
-        await asyncio.wait_for(search.held.wait(), HANG_GUARD_S)
-        speculation = speculation_task()
-        gate.set()
-        await asyncio.wait_for(asyncio.wait([speculation]), HANG_GUARD_S)
-        assert not speculation.cancelled()
-        assert reasoning.prompts == []
+        await asyncio.wait_for(source.blocked.wait(), HANG_GUARD_S)
+        assert [entry for entry in log if entry[0] == "start_turn"] == [
+            ("start_turn", PARTIAL_TEXT)
+        ]
+        assert speaker.utterances == []
 
         await pull_past(source, endpoint)
         await asyncio.wait_for(running, HANG_GUARD_S)
 
-    assert [call[0] for call in search.calls] == [PARTIAL_TEXT, USER_TEXT]
-    assert [entry for entry in log if entry[0] == "start_turn"] == [("start_turn", USER_TEXT)]
-    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
+    assert search.calls == []
+    assert [entry for entry in log if entry[0] == "start_turn"] == [
+        ("start_turn", PARTIAL_TEXT),
+        ("start_turn", USER_TEXT),
+    ]
+    assert speaker.utterances == [SPOKEN_CLAUSES]
     messages = session_messages(caplog)
     assert [message for message in messages if message.startswith("turn.speculation_failed")] == [
-        "turn.speculation_failed turn_id=turn-1 error=SearchFailed"
+        "turn.speculation_failed turn_id=turn-1 error=RateLimited"
     ]
     assert [message for message in messages if message.startswith("turn.failed")] == []
     assert len(spoken_spans(caplog)) == 1
     captured = [record.getMessage() for record in caplog.records]
     assert all(PARTIAL_TEXT not in message for message in captured)
+    assert all(RATE_LIMIT_DETAIL not in message for message in captured)
     await loop.aclose()
 
 
-async def test_a_claimed_speculation_that_fails_fails_the_turn(
+async def test_a_claimed_speculation_that_fails_ends_the_turn_as_a_reasoning_failure(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
     gate = asyncio.Event()
-    search = FakeSearch(log, result, gate=gate, fails=PARTIAL_TEXT, holds=PARTIAL_TEXT)
-    deltas = [TurnChunk(kind="spoken", text=delta) for delta in SPOKEN_DELTAS]
-    reasoning = FakeReasoning(log, deltas, speaker.received)
+    search = FakeSearch(log, found(), gate=gate, fails=MODEL_QUERY)
+    turns = [[SEARCH_CALL], spoken_chunks(SPOKEN_DELTAS)]
+    reasoning = FakeReasoning(
+        log, [], speaker.received, follow_up=spoken_chunks(SPOKEN_DELTAS), turns=turns
+    )
     endpoint = asyncio.Event()
     second = asyncio.Event()
     source = ScriptedSource(
@@ -2988,16 +2920,17 @@ async def test_a_claimed_speculation_that_fails_fails_the_turn(
         speculation = speculation_task()
 
         await pull_past(source, endpoint)
-        assert speaker.openers == [OPENER]
-        turn = next(task for task in asyncio.all_tasks() if task.get_name() == TURN_TASK)
+        turn = turn_task()
+        assert speaker.openers == []
+        assert speaker.utterances == [[]]
 
         gate.set()
         await asyncio.wait_for(asyncio.wait([speculation, turn]), HANG_GUARD_S)
         assert not turn.cancelled()
-        assert isinstance(turn.exception(), SearchFailed)
+        assert turn.exception() is None
         assert isinstance(speculation.exception(), SearchFailed)
-        assert speaker.utterances == []
-        assert reasoning.prompts == []
+        assert speaker.utterances == [[]]
+        assert len(reasoning.prompts) == 1
         assert [entry for entry in log if entry[0] in ("open_turn", "record", "abandon")] == [
             ("open_turn", TURN_TASK)
         ]
@@ -3005,17 +2938,16 @@ async def test_a_claimed_speculation_that_fails_fails_the_turn(
         await pull_past(source, second)
         await asyncio.wait_for(running, HANG_GUARD_S)
 
-    assert [call[0] for call in search.calls] == [PARTIAL_TEXT, SECOND_TEXT]
-    assert speaker.openers == [OPENER, OPENER, opener_key([result])]
-    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
-    assert [prompt.user_text for prompt in reasoning.prompts] == [SECOND_TEXT]
+    assert search.calls == [(MODEL_QUERY, MODEL_GLOBS, tmp_path, SearchBudget())]
+    assert speaker.utterances == [[], SPOKEN_CLAUSES]
+    assert [prompt.user_text for prompt in reasoning.prompts] == [PARTIAL_TEXT, SECOND_TEXT]
     messages = session_messages(caplog)
-    assert [message for message in messages if message.startswith("turn.failed")] == [
-        "turn.failed turn_id=turn-1 error=SearchFailed"
+    assert [message for message in messages if message.startswith("turn.reasoning_failed")] == [
+        "turn.reasoning_failed turn_id=turn-1 error=SearchFailed"
     ]
+    assert [message for message in messages if message.startswith("turn.failed")] == []
     assert [message for message in messages if message.startswith("turn.speculation_failed")] == []
-    assert len(spoken_spans(caplog)) == 1
-    assert "turn_id=turn-2" in spoken_spans(caplog)[0]
+    assert len(spoken_spans(caplog)) == 2
     captured = [record.getMessage() for record in caplog.records]
     assert all(PARTIAL_TEXT not in message for message in captured)
     await loop.aclose()
@@ -3023,9 +2955,8 @@ async def test_a_claimed_speculation_that_fails_fails_the_turn(
 
 async def test_the_prompt_carries_the_directive_for_the_current_phase(tmp_path: Path) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
     loop = TurnLoop(
@@ -3048,7 +2979,7 @@ async def test_the_prompt_carries_the_directive_for_the_current_phase(tmp_path: 
     assert OUTCOME_MARKER in system
     assert CONCRETE_DIRECTIVE not in system
     assert INTERROGATE_DIRECTIVE not in system
-    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
+    assert speaker.utterances == [SPOKEN_CLAUSES]
     await loop.aclose()
 
 
@@ -3056,9 +2987,8 @@ async def test_a_misconception_in_interrogate_scopes_the_next_turn_to_where_it_s
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     turns = [
         spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME]),
         spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME]),
@@ -3089,15 +3019,15 @@ async def test_a_misconception_in_interrogate_scopes_the_next_turn_to_where_it_s
     assert CONCRETE_DIRECTIVE in systems[3]
     assert INTERROGATE_DIRECTIVE not in systems[3]
     assert all(SECOND_PATH not in system for system in systems[:3])
-    assert [call[1] for call in search.calls] == [GLOBS, GLOBS, GLOBS, SETTLING_PATHS]
+    assert search.calls == []
+    assert f"Search {GROUNDED_PATH} line 24, {SECOND_PATH} line 41 first" in systems[3]
     assert outcome_lines(caplog) == [
         "turn.outcome turn_id=turn-1 signal=covered phase=concrete",
         "turn.outcome turn_id=turn-2 signal=covered phase=interrogate",
         "turn.outcome turn_id=turn-3 signal=misconception phase=concrete",
         "turn.outcome turn_id=turn-4 signal=None phase=concrete",
     ]
-    lead_in = lead_in_sentence([result])
-    assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]] * 4
+    assert speaker.utterances == [SPOKEN_CLAUSES] * 4
     spoken = [str(text) for name, text in log if name == "speak"]
     assert all(OUTCOME_MARKER not in text for text in spoken)
     assert all("signal" not in text and "{" not in text for text in spoken)
@@ -3105,13 +3035,12 @@ async def test_a_misconception_in_interrogate_scopes_the_next_turn_to_where_it_s
 
 
 @pytest.mark.parametrize("path", ["", "!" + GROUNDED_PATH], ids=["empty", "negated"])
-async def test_an_unusable_settling_path_never_reaches_the_search(
+async def test_an_unusable_settling_path_never_reaches_the_directive(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, path: str
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     outcome = OUTCOME_MARKER + json.dumps(
         {
             "signal": "misconception",
@@ -3140,7 +3069,8 @@ async def test_an_unusable_settling_path_never_reaches_the_search(
     with caplog.at_level(logging.INFO, logger="tutor.session"):
         await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    assert [call[1] for call in search.calls] == [GLOBS] * 4
+    assert search.calls == []
+    assert all(GROUNDED_PATH not in prompt.system for prompt in reasoning.prompts)
     assert outcome_lines(caplog) == [
         "turn.outcome turn_id=turn-1 signal=covered phase=concrete",
         "turn.outcome turn_id=turn-2 signal=covered phase=interrogate",
@@ -3148,8 +3078,7 @@ async def test_an_unusable_settling_path_never_reaches_the_search(
         "turn.outcome turn_id=turn-4 signal=None phase=interrogate",
     ]
     assert INTERROGATE_DIRECTIVE in reasoning.prompts[3].system
-    lead_in = lead_in_sentence([result])
-    assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]] * 4
+    assert speaker.utterances == [SPOKEN_CLAUSES] * 4
     await loop.aclose()
 
 
@@ -3157,9 +3086,8 @@ async def test_a_marker_split_across_deltas_is_still_stripped(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     reasoning = FakeReasoning(log, spoken_chunks(SPLIT_OUTCOME_DELTAS), speaker.received)
     source = ScriptedSource([EndOfTurn(text=USER_TEXT), speaker.finished])
     registry = RecordingRegistry(log)
@@ -3177,7 +3105,7 @@ async def test_a_marker_split_across_deltas_is_still_stripped(
     with caplog.at_level(logging.INFO, logger="tutor.session"):
         await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
+    assert speaker.utterances == [SPOKEN_CLAUSES]
     assert outcome_lines(caplog) == ["turn.outcome turn_id=turn-1 signal=covered phase=concrete"]
     verified = [text for _, text, _ in registry.verified]
     assert verified
@@ -3189,9 +3117,8 @@ async def test_a_malformed_outcome_holds_the_phase_and_finishes_the_turn(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     turns = [spoken_chunks([*SPOKEN_DELTAS, MALFORMED_OUTCOME]), spoken_chunks(SPOKEN_DELTAS)]
     reasoning = FakeReasoning(log, [], speaker.received, turns=turns)
     source = SerialSource([USER_TEXT, USER_TEXT])
@@ -3212,8 +3139,7 @@ async def test_a_malformed_outcome_holds_the_phase_and_finishes_the_turn(
     spoken = [message for message in spoken_spans(caplog) if "turn_id=turn-1 " in message]
     assert len(spoken) == 1
     assert "turn.failed turn_id=turn-1" not in "\n".join(session_messages(caplog))
-    lead_in = lead_in_sentence([result])
-    assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]] * 2
+    assert speaker.utterances == [SPOKEN_CLAUSES] * 2
     assert all("not json" not in str(text) for name, text in log if name == "speak")
     assert outcome_lines(caplog) == [
         "turn.outcome turn_id=turn-1 signal=None phase=teach",
@@ -3227,9 +3153,8 @@ async def test_a_reply_without_a_marker_speaks_everything_and_holds_the_phase(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
     source = SerialSource([USER_TEXT, USER_TEXT])
     loop = TurnLoop(
@@ -3246,8 +3171,7 @@ async def test_a_reply_without_a_marker_speaks_everything_and_holds_the_phase(
     with caplog.at_level(logging.INFO, logger="tutor.session"):
         await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    lead_in = lead_in_sentence([result])
-    assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]] * 2
+    assert speaker.utterances == [SPOKEN_CLAUSES] * 2
     assert outcome_lines(caplog) == [
         "turn.outcome turn_id=turn-1 signal=None phase=teach",
         "turn.outcome turn_id=turn-2 signal=None phase=teach",
@@ -3260,10 +3184,9 @@ async def test_a_barge_in_leaves_the_phase_where_it_was(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     hold = asyncio.Event()
-    speaker = FakeSpeaker(log, gate=hold)
-    search = FakeSearch(log, result)
+    speaker = FakeSpeaker(log, gate=hold, hold_at=1)
+    search = FakeSearch(log, found())
     gate = asyncio.Event()
     deltas = spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME])
     reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate, holds_at=3)
@@ -3282,7 +3205,6 @@ async def test_a_barge_in_leaves_the_phase_where_it_was(
         FakeRegistry(log),
         FakeClock(),
     )
-    lead_in = lead_in_sentence([result])
     with caplog.at_level(logging.INFO, logger="tutor.session"):
         running = asyncio.create_task(loop.run())
 
@@ -3303,7 +3225,7 @@ async def test_a_barge_in_leaves_the_phase_where_it_was(
 
     assert outcome_lines(caplog) == ["turn.outcome turn_id=turn-2 signal=covered phase=concrete"]
     assert [TEACH_DIRECTIVE in prompt.system for prompt in reasoning.prompts] == [True, True]
-    assert speaker.utterances == [[lead_in, SPOKEN_CLAUSES[0]], [lead_in, *SPOKEN_CLAUSES]]
+    assert speaker.utterances == [[SPOKEN_CLAUSES[0]], SPOKEN_CLAUSES]
     await loop.aclose()
 
 
@@ -3311,9 +3233,8 @@ async def test_a_discarded_speculation_never_advances_the_phase(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     close_gate = asyncio.Event()
     speculative_deltas = [*SPOKEN_DELTAS, COVERED_OUTCOME]
     turns = [
@@ -3367,8 +3288,8 @@ async def test_a_discarded_speculation_never_advances_the_phase(
         "turn.outcome turn_id=turn-2 signal=None phase=teach",
     ]
     assert [TEACH_DIRECTIVE in prompt.system for prompt in reasoning.prompts] == [True] * 3
-    lead_in = lead_in_sentence([result])
-    assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]] * 2
+    assert speaker.utterances == [SPOKEN_CLAUSES] * 2
+    assert search.calls == []
     await loop.aclose()
 
 
@@ -3379,16 +3300,10 @@ async def test_a_misconception_in_the_follow_up_is_the_turns_outcome(
     result = found()
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, result)
-    call = TurnChunk(
-        kind="tool_call",
-        text=SEARCH_ARGUMENTS,
-        tool_call_id=SEARCH_CALL_ID,
-        tool_name="search_code",
-    )
     turns = [
         spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME]),
         spoken_chunks([*SPOKEN_DELTAS, COVERED_OUTCOME]),
-        [call],
+        [SEARCH_CALL],
         spoken_chunks(SPOKEN_DELTAS),
     ]
     follow_up = spoken_chunks([*SPOKEN_DELTAS, MISCONCEPTION_OUTCOME])
@@ -3408,7 +3323,7 @@ async def test_a_misconception_in_the_follow_up_is_the_turns_outcome(
     with caplog.at_level(logging.INFO, logger="tutor.session"):
         await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    assert [call[1] for call in search.calls] == [GLOBS, GLOBS, GLOBS, MODEL_GLOBS, SETTLING_PATHS]
+    assert search.calls == [(MODEL_QUERY, MODEL_GLOBS, tmp_path, SearchBudget())]
     assert reasoning.tools == [
         [SEARCH_CODE_TOOL, *VISUAL_TOOLS],
         [SEARCH_CODE_TOOL, *VISUAL_TOOLS],
@@ -3423,8 +3338,17 @@ async def test_a_misconception_in_the_follow_up_is_the_turns_outcome(
         "turn.outcome turn_id=turn-4 signal=None phase=concrete",
     ]
     assert CONCRETE_DIRECTIVE in reasoning.prompts[4].system
+    assert (
+        f"Search {GROUNDED_PATH} line 24, {SECOND_PATH} line 41 first"
+        in reasoning.prompts[4].system
+    )
     lead_in = lead_in_sentence([result])
-    assert speaker.utterances == [[lead_in, *SPOKEN_CLAUSES]] * 4
+    assert speaker.utterances == [
+        SPOKEN_CLAUSES,
+        SPOKEN_CLAUSES,
+        [lead_in, *SPOKEN_CLAUSES],
+        SPOKEN_CLAUSES,
+    ]
     spoken = [str(text) for name, text in log if name == "speak"]
     assert all(OUTCOME_MARKER not in text and "{" not in text for text in spoken)
     await loop.aclose()
@@ -3768,9 +3692,8 @@ async def test_a_turn_with_a_folder_still_withholds_a_bare_number(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     log: list[tuple[str, object]] = []
-    result = found()
     speaker = FakeSpeaker(log)
-    search = FakeSearch(log, result)
+    search = FakeSearch(log, found())
     reasoning = FakeReasoning(log, spoken_chunks(CONCEPT_DELTAS), speaker.received)
     source = SerialSource([CONCEPT_TEXT])
     loop = TurnLoop(
@@ -3786,7 +3709,7 @@ async def test_a_turn_with_a_folder_still_withholds_a_bare_number(
     with caplog.at_level(logging.INFO, logger="tutor.session"):
         await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    assert speaker.utterances == [[lead_in_sentence([result])]]
+    assert speaker.utterances == [[]]
     withheld = [m for m in session_messages(caplog) if m.startswith("turn.chunk_withheld")]
     assert withheld == [
         "turn.chunk_withheld turn_id=turn-1 source=model ungrounded=2",
@@ -3956,12 +3879,21 @@ async def test_a_transport_error_on_a_state_push_ends_the_turn_and_the_next_is_t
     await loop.aclose()
 
 
-async def test_a_partial_with_no_folder_starts_no_speculation() -> None:
+async def test_a_partial_with_no_folder_starts_a_speculation_with_no_tools() -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, found())
-    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
-    source = ScriptedSource([PartialTranscript(text=PARTIAL_TEXT)])
+    gate = asyncio.Event()
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received, gate=gate)
+    endpoint = asyncio.Event()
+    source = ScriptedSource(
+        [
+            PartialTranscript(text=CONCEPT_PARTIAL),
+            endpoint,
+            EndOfTurn(text=CONCEPT_TEXT),
+            speaker.finished,
+        ]
+    )
     loop = TurnLoop(
         concept_cfg().model_copy(update={"speculative_reasoning": True}),
         source,
@@ -3971,15 +3903,26 @@ async def test_a_partial_with_no_folder_starts_no_speculation() -> None:
         reasoning,
         FakeRegistry(log),
     )
+    running = asyncio.create_task(loop.run())
 
-    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
-
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+    assert CONCEPT_TEXT.startswith(CONCEPT_PARTIAL)
     assert [
         task.get_name() for task in asyncio.all_tasks() if task.get_name() == SPECULATION_TASK
-    ] == []
+    ] == [SPECULATION_TASK]
+
+    await pull_past(source, endpoint)
+    gate.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
     assert search.calls == []
-    assert reasoning.prompts == []
-    assert log == []
+    assert len(reasoning.prompts) == 1
+    assert reasoning.tools == [None]
+    assert reasoning.prompts[0].tool_context == []
+    assert reasoning.prompts[0].user_text == CONCEPT_PARTIAL
+    assert [entry for entry in log if entry[0] == "open_turn"] == [("open_turn", TURN_TASK)]
+    assert speaker.utterances == [SPOKEN_CLAUSES]
     await loop.aclose()
 
 

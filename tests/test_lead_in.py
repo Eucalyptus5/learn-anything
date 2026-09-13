@@ -2,8 +2,7 @@ from collections.abc import Callable
 
 import pytest
 
-from tutor.lead_in import lead_in_sentence, lead_in_stages, opener_key
-from tutor.openers import OPENER_PHRASES
+from tutor.lead_in import lead_in_sentence, lead_in_stages
 from tutor.tools.models import ContextLine, Position, SearchMatch, SearchResult
 from tutor.tools.provenance import TurnRegistry, extract_positions
 
@@ -171,11 +170,6 @@ def test_sentence_spells_every_path_whole(shape: Shape) -> None:
 
 
 @pytest.mark.parametrize("shape", SHAPES)
-def test_opener_key_is_a_key_the_opener_table_holds(shape: Shape) -> None:
-    assert opener_key(shape()) in OPENER_PHRASES
-
-
-@pytest.mark.parametrize("shape", SHAPES)
 def test_every_line_inside_a_spoken_range_is_a_line_the_results_hold(shape: Shape) -> None:
     results = shape()
     held: dict[str, set[int]] = {}
@@ -197,7 +191,6 @@ def test_single_file_hit_speaks_its_line_number() -> None:
     results = _single_file()
 
     assert extract_positions(lead_in_sentence(results)) == [Position(path="src/pool.py", line=11)]
-    assert opener_key(results) == "file_hit"
 
 
 def test_many_files_sentence_names_every_path_once() -> None:
@@ -206,7 +199,6 @@ def test_many_files_sentence_names_every_path_once() -> None:
 
     for match in results[0].matches:
         assert sentence.count(match.path) == 1
-    assert opener_key(results) == "many_files"
 
 
 def test_symbol_spoken_comes_from_the_match_text() -> None:
@@ -249,12 +241,6 @@ def test_empty_results_say_nothing_was_found(results: list[SearchResult]) -> Non
     assert not any(character.isdigit() for character in sentence)
     assert "/" not in sentence
     assert extract_positions(sentence) == []
-    assert opener_key(results) in OPENER_PHRASES
-
-
-def test_opener_key_on_no_results_is_a_key_the_opener_table_holds() -> None:
-    assert opener_key([]) in OPENER_PHRASES
-    assert opener_key([]) == "empty"
 
 
 def test_stages_walk_the_matches_in_order_without_repeating_one() -> None:

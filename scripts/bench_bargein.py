@@ -64,7 +64,7 @@ def overlap_ms(intervals: Sequence[Interval], t_c: float) -> tuple[int, int] | N
 
 
 def accept_ms(ledger: Sequence[Enqueued], t_c: float) -> int | None:
-    at = next((entry.at for entry in ledger if entry.at > t_c and entry.text is None), None)
+    at = next((entry.at for entry in ledger if entry.at > t_c), None)
     return None if at is None else int((at - t_c) * 1000)
 
 
@@ -102,8 +102,8 @@ class BusySynth(TaggedSynth):
 
 
 class FlushTransport(BenchTransport):
-    def __init__(self, synth: BusySynth, openers: dict[str, np.ndarray]) -> None:
-        super().__init__(synth, openers)
+    def __init__(self, synth: BusySynth) -> None:
+        super().__init__(synth)
         self.flushes: list[float] = []
 
     def flush_playout(self) -> None:
@@ -156,11 +156,9 @@ class Bench:
         request = SessionRequest(subject=subject, folder=root)
         loaded = await asyncio.to_thread(load_models)
         synth = BusySynth(loaded.synth)
-        models = Models(
-            partial=loaded.partial, final=loaded.final, synth=synth, openers=loaded.openers
-        )
+        models = Models(partial=loaded.partial, final=loaded.final, synth=synth)
         reasoning = MeteredReasoning(ReasoningClient(cfg))
-        transport = FlushTransport(synth, models.openers)
+        transport = FlushTransport(synth)
         source = ScriptedSource()
         loop = build_loop(cfg, models, reasoning, source, transport, request)
         watch = FailureWatch()
@@ -278,8 +276,8 @@ def report(cfg: Settings, args: argparse.Namespace, samples: list[Sample], bench
         "floored at 0; the track ticks every 20 ms, and the browser's jitter buffer is excluded."
     )
     print(
-        "next turn accepted: t_c to the next turn's cached opener reaching play(). next turn first "
-        "sound: t_c to the first real frame after the flush."
+        "next turn accepted: t_c to the next turn's first buffer reaching play(). next turn "
+        "first sound: t_c to the first real frame after the flush."
     )
     print(
         "synth overlap: how long the cancelled clause's native synthesis kept running after the "

@@ -4,13 +4,11 @@ import signal
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
 from aiohttp import web
 
 from tutor import signaling
 from tutor.config import Settings, settings
 from tutor.input_path import InputPath
-from tutor.openers import synthesize_openers
 from tutor.prompt import SYSTEM_PROMPT
 from tutor.reasoning import ReasoningClient
 from tutor.session import TurnLoop, TurnLoopConfig
@@ -38,16 +36,13 @@ class Models:
     partial: Transcriber
     final: Transcriber
     synth: KokoroSynthesizer
-    openers: dict[str, np.ndarray]
 
 
 def load_models() -> Models:
-    synth = KokoroSynthesizer(KOKORO_WEIGHTS, KOKORO_VOICES)
     return Models(
         partial=Transcriber(load_whisper(WHISPER_DIR, PARTIAL_CPU_THREADS)),
         final=Transcriber(load_whisper(WHISPER_DIR, FINAL_CPU_THREADS)),
-        synth=synth,
-        openers=synthesize_openers(synth),
+        synth=KokoroSynthesizer(KOKORO_WEIGHTS, KOKORO_VOICES),
     )
 
 
@@ -59,7 +54,7 @@ def build_loop(
     transport: Connection,
     request: SessionRequest,
 ) -> TurnLoop:
-    speaker = Speaker(models.synth, transport, models.openers)
+    speaker = Speaker(models.synth, transport)
     loop_cfg = TurnLoopConfig(
         system=SYSTEM_PROMPT,
         subject=request.subject,

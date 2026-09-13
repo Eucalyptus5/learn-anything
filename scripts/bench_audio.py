@@ -631,13 +631,12 @@ def load_kokoro() -> "KokoroSynthesizer":
 
 async def bench_chunked(samples: int) -> None:
     from tutor.chunker import clause_chunks
-    from tutor.openers import synthesize_openers
     from tutor.speech import Speaker
 
     b = begin("output path (kokoro fp16 through the clause chunker)")
     synth = TimedSynthesizer(load_kokoro())
     transport = StampingTransport()
-    speaker = Speaker(synth, transport, await asyncio.to_thread(synthesize_openers, synth))
+    speaker = Speaker(synth, transport)
 
     first: list[float] = []
     full: list[float] = []
@@ -685,21 +684,9 @@ async def bench_chunked(samples: int) -> None:
         print(f"  whole turn {index + 1}/{samples + 1}", end="\r", file=sys.stderr)
     print(" " * 40, end="\r", file=sys.stderr)
 
-    opener: list[float] = []
-    opener_audio = 0.0
-    for index in range(samples + 1):
-        transport.reset()
-        t = time.perf_counter()
-        await speaker.speak_opener("thinking")
-        if index >= 1:
-            opener.append(transport.stamps[0] - t)
-        opener_audio = transport.lengths[0] / TTS_SAMPLE_RATE
-
     report("chunked time to first audio", first)
     report("whole turn time to first audio", whole_first)
     report("chunked full turn", full)
-    report_us("opener to playout", opener)
-    print(f"  opener audio {opener_audio * 1000:.0f}ms")
     print(f"  the turn speaks {spoken:.2f}s of audio")
     report(f"{CHUNK_MAX_WORDS}-word chunk synthesis", chunk_cost)
     report("preceding chunk playout", previous_playout)
@@ -714,7 +701,7 @@ async def bench_cancel(samples: int) -> None:
     b = begin("barge-in (cancel a full turn, replace it with a clause)")
     synth = TimedSynthesizer(load_kokoro())
     transport = StampingTransport()
-    speaker = Speaker(synth, transport, {})
+    speaker = Speaker(synth, transport)
     replacement_words = len(REPLACEMENT_TEXT.split())
 
     to_first: list[float] = []
@@ -773,7 +760,6 @@ async def bench_cancel(samples: int) -> None:
 
 
 def bench_combined(audio: np.ndarray) -> None:
-    from tutor.openers import synthesize_openers
     from tutor.stt import FINAL_CPU_THREADS, PARTIAL_CPU_THREADS, Transcriber, load_whisper
     from tutor.vad import SileroVad
 
@@ -786,8 +772,6 @@ def bench_combined(audio: np.ndarray) -> None:
     print(f"  rss with the final whisper {rss_mb():.0f} MB")
     synth = load_kokoro()
     print(f"  rss with kokoro {rss_mb():.0f} MB")
-    openers = synthesize_openers(synth)
-    print(f"  rss with {len(openers)} openers cached {rss_mb():.0f} MB")
 
     frames = [
         audio[i : i + FRAME_SAMPLES]

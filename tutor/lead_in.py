@@ -58,12 +58,3 @@ def lead_in_sentence(results: list[SearchResult]) -> str:
     else:
         listed = ", ".join(paths[:-1]) + f", and {paths[-1]}"
     return f"It shows up in {listed}."
-
-
-def opener_key(results: list[SearchResult]) -> str:
-    paths = _paths(results)
-    if not paths:
-        return "empty"
-    if len(paths) == 1:
-        return "file_hit"
-    return "many_files"

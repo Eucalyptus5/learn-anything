@@ -126,8 +126,8 @@ VISUAL_KINDS = frozenset({"diagram.push", "diagram.clear", "source.highlight", "
 
 
 class LeadTransport(BenchTransport):
-    def __init__(self, synth: TaggedSynth, openers: dict[str, np.ndarray]) -> None:
-        super().__init__(synth, openers)
+    def __init__(self, synth: TaggedSynth) -> None:
+        super().__init__(synth)
         self.pushes: list[tuple[float, str]] = []
 
     async def send_json(self, payload: dict[str, object]) -> None:
@@ -185,10 +185,8 @@ class Bench:
         request = SessionRequest(subject=SUBJECT, folder=root)
         loaded = await asyncio.to_thread(load_models)
         synth = TaggedSynth(loaded.synth)
-        models = Models(
-            partial=loaded.partial, final=loaded.final, synth=synth, openers=loaded.openers
-        )
-        transport = LeadTransport(synth, models.openers)
+        models = Models(partial=loaded.partial, final=loaded.final, synth=synth)
+        transport = LeadTransport(synth)
         source = ScriptedSource()
         loop = build_loop(cfg, models, ScriptedReasoning(), source, transport, request)
         watch = OutcomeWatch()
@@ -265,7 +263,7 @@ def report(args: argparse.Namespace, samples: list[LeadSample]) -> None:
     )
     print(
         "playout gap: from the same push to the first 48 kHz frame carrying that clause leaving "
-        "the playout track; it includes the opener and the lead-in still draining ahead of it."
+        "the playout track; it includes the lead-in still draining ahead of it."
     )
     print(f"samples={len(samples)} (plus {WARMUP} discarded warm-ups)  root={args.root}")
     leads = [s.lead_ms for s in samples if s.lead_ms is not None]

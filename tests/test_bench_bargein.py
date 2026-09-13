@@ -53,19 +53,19 @@ def test_overlap_with_no_call_in_flight_is_none() -> None:
     assert bench_bargein.overlap_ms([], 1.125) is None
 
 
-def test_accept_is_the_first_opener_after_the_barge_in() -> None:
+def test_accept_is_the_first_buffer_after_the_barge_in() -> None:
     ledger = [
-        Enqueued(0.5, None, 100),
+        Enqueued(0.5, "an old clause", 100),
         Enqueued(1.0, "a clause", 200),
-        Enqueued(1.375, None, 100),
-        Enqueued(1.875, None, 100),
+        Enqueued(1.375, "the next turn", 100),
+        Enqueued(1.875, "and its second clause", 100),
     ]
 
     assert bench_bargein.accept_ms(ledger, 1.125) == 250
 
 
-def test_accept_without_an_opener_after_the_barge_in_is_none() -> None:
-    ledger = [Enqueued(0.5, None, 100), Enqueued(1.25, "a clause", 200)]
+def test_accept_with_nothing_enqueued_after_the_barge_in_is_none() -> None:
+    ledger = [Enqueued(0.5, "an old clause", 100), Enqueued(1.0, "a clause", 200)]
 
     assert bench_bargein.accept_ms(ledger, 1.125) is None
 

@@ -17,9 +17,8 @@ from tutor import app
 from tutor.app import Models, Sessions, build_loop
 from tutor.config import Settings
 from tutor.input_path import EndOfTurn, InputEvent, InputPath
-from tutor.openers import OPENER_PHRASES, synthesize_openers
 from tutor.prompt import SYSTEM_PROMPT
-from tutor.session import OPENER, TurnLoop
+from tutor.session import TurnLoop
 from tutor.signaling import SessionRequest
 
 HANG_GUARD_S = 20.0
@@ -154,29 +153,7 @@ def fake_models() -> Models:
         partial=FakeTranscriber(),
         final=FakeTranscriber(),
         synth=FakeSynthesizer(),
-        openers=synthesize_openers(FakeSynthesizer()),
     )
-
-
-def test_load_models_synthesizes_the_openers_once_in_the_loading_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    synths: list[FakeSynthesizer] = []
-
-    def fake_kokoro(weights: Path, voices: Path) -> FakeSynthesizer:
-        synths.append(FakeSynthesizer())
-        return synths[-1]
-
-    monkeypatch.setattr(app, "load_whisper", lambda path, threads: None)
-    monkeypatch.setattr(app, "Transcriber", lambda model: FakeTranscriber())
-    monkeypatch.setattr(app, "KokoroSynthesizer", fake_kokoro)
-
-    models = app.load_models()
-
-    (synth,) = synths
-    assert models.synth is synth
-    assert synth.calls == list(OPENER_PHRASES.values())
-    assert set(models.openers) == set(OPENER_PHRASES)
 
 
 def test_main_boots_from_injected_settings_and_shuts_down_on_sigint(
@@ -231,8 +208,7 @@ async def test_build_loop_runs_a_concept_turn_from_the_session_request(tmp_path:
     assert prompt.tool_context == []
     assert prompt.user_text == USER_TEXT
     assert len(transport.played) == len(models.synth.calls) > 0
-    openers = list(models.openers.values())
-    assert all(pcm is not opener for pcm in transport.played for opener in openers)
+    assert [len(pcm) for pcm in transport.played] == [len(text) for text in models.synth.calls]
     assert transport.sent[0] == {
         "type": "transcript",
         "turn_id": "turn-1",
@@ -256,7 +232,8 @@ async def test_session_ends_on_its_own_when_the_frames_end(
 
     assert task.result() is None
     assert connection.closed
-    assert connection.played[0].size == len(OPENER_PHRASES[OPENER])
+    assert [len(pcm) for pcm in connection.played] == [len(text) for text in models.synth.calls]
+    assert len(connection.played) > 0
     assert ("stream_closed", len(SPOKEN_DELTAS)) in log
     (vad,) = vads
     assert vad.resets == 1
