@@ -375,6 +375,22 @@ async def test_start_turn_arguments_override_settings() -> None:
     assert bodies[1]["tools"] == tools
 
 
+async def test_tool_choice_reaches_the_request() -> None:
+    bodies: list[dict[str, object]] = []
+    client = ReasoningClient(_settings(), http_client=_mock_client(TWO_THEN_THREE, bodies))
+    tools = [
+        {"type": "function", "function": {"name": "push_app", "parameters": {"type": "object"}}}
+    ]
+
+    assert [chunk async for chunk in client.start_turn(PROMPT, tools=tools)]
+    assert [chunk async for chunk in client.start_turn(PROMPT, tools=tools, tool_choice="required")]
+
+    await client.aclose()
+
+    assert "tool_choice" not in bodies[0]
+    assert bodies[1]["tool_choice"] == "required"
+
+
 class _ParkedBody(httpx2.AsyncByteStream):
     def __init__(self, head: list[str], release: asyncio.Event, tail: list[str]) -> None:
         self._head = head

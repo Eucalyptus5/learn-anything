@@ -210,6 +210,7 @@ class ReasoningClient:
         tools: Sequence[dict] | None = None,
         effort: str | None = None,
         max_tokens: int | None = None,
+        tool_choice: str | None = None,
     ) -> TurnStream:
         request: dict[str, object] = {
             "model": self._cfg.reasoning_model,
@@ -221,6 +222,8 @@ class ReasoningClient:
         }
         if tools is not None:
             request["tools"] = list(tools)
+        if tool_choice is not None:
+            request["tool_choice"] = tool_choice
         return TurnStream(self._client, request, time.perf_counter())
 
     async def aclose(self) -> None:

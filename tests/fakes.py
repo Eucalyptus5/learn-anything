@@ -1,6 +1,7 @@
 import asyncio
 import fractions
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import av
@@ -82,6 +83,7 @@ class FakeTransport:
     def __init__(self) -> None:
         self.played: list[np.ndarray] = []
         self.sent: list[dict[str, object]] = []
+        self.handlers: list[Callable[[dict[str, object]], None]] = []
         self.flushes = 0
 
     async def play(self, pcm: np.ndarray) -> None:
@@ -92,6 +94,9 @@ class FakeTransport:
 
     async def send_json(self, payload: dict[str, object]) -> None:
         self.sent.append(payload)
+
+    def on_json(self, handler: Callable[[dict[str, object]], None]) -> None:
+        self.handlers.append(handler)
 
 
 def numbered_frame(value: int, pts: int) -> av.AudioFrame:

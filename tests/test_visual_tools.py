@@ -5,7 +5,12 @@ import logging
 import pytest
 
 from tests.fakes import FakeConnection, grounded_registry
-from tutor.visual_tools import VISUAL_TOOLS, dispatch_visual_tool
+from tutor.visual_tools import (
+    VISUAL_CALL_TOOLS,
+    VISUAL_TOOLS,
+    VOICE_VISUAL_TOOLS,
+    dispatch_visual_tool,
+)
 from tutor.visuals import AppPush, DiagramClear, DiagramPush, SourceHighlight, VisualChannel
 
 _TOOL_MODELS = [
@@ -68,6 +73,16 @@ def test_the_tool_schema_carries_title_for_both_pushes() -> None:
         assert "under eighty characters" in by_name[name]["description"]
     assert "title" not in by_name["clear_diagram"]["parameters"]["properties"]
     assert "title" not in by_name["highlight_source"]["parameters"]["properties"]
+
+
+def test_the_call_tools_and_voice_tools_partition_the_surface() -> None:
+    call_names = [t["function"]["name"] for t in VISUAL_CALL_TOOLS]
+    voice_names = [t["function"]["name"] for t in VOICE_VISUAL_TOOLS]
+
+    assert call_names == ["push_diagram", "push_app"]
+    assert voice_names == ["clear_diagram", "highlight_source"]
+    assert sorted(call_names + voice_names) == sorted(t["function"]["name"] for t in VISUAL_TOOLS)
+    assert all(t in VISUAL_TOOLS for t in [*VISUAL_CALL_TOOLS, *VOICE_VISUAL_TOOLS])
 
 
 @pytest.mark.parametrize("arguments", ["{", "", "not json", "{'id': 1}"])
