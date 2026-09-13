@@ -1,6 +1,6 @@
 <!doctype html>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-src 'self'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; font-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'none'">
 <title>visual check</title>
 <style>
   body { font: 14px ui-monospace, Menlo, monospace; margin: 2rem; max-width: 46rem; }
@@ -11,8 +11,9 @@
 <h2>Visual payload check</h2>
 
 <p>Runs <code>validate()</code> over good and hostile payloads, then pushes a mini app whose
-script tries to escape its sandbox and reports what each attempt threw. Load this page from the
-tutor server, not from a file URL.</p>
+script tries to escape its sandbox and reports what each attempt threw. A last app loads the
+vendored KaTeX and Plotly bundles and reports whether each rendered with its fonts. Load this
+page from the tutor server, not from a file URL.</p>
 
 <div id="log">starting</div>
 <div id="canvas"></div>
@@ -110,6 +111,22 @@ setTimeout(() => {
 }, 300);
 <\/script>`;
 
+const libsHtml = `<!doctype html><meta charset="utf-8">
+<link rel="stylesheet" href="/vendor/katex/katex.min.css">
+<script src="/vendor/katex/katex.min.js"><\/script>
+<script src="/vendor/plotly.min.js"><\/script>
+<div id="math"></div><div id="plot"></div>
+<script>
+katex.render("r_t(\\\\theta)", document.getElementById("math"));
+Plotly.newPlot("plot", [{ x: [0, 1], y: [0, 1] }], { margin: { t: 0 } });
+document.fonts.ready.then(() => setTimeout(() => {
+  parent.postMessage({ libs: {
+    katex: !!document.querySelector(".katex") && document.fonts.check("12px KaTeX_Main"),
+    plotly: !!document.querySelector(".plotly svg"),
+  } }, "*");
+}, 800));
+<\/script>`;
+
 let hostFrameSrcViolations = 0;
 document.addEventListener("securitypolicyviolation", (event) => {
   log("host csp " + event.violatedDirective + " " + event.blockedURI);
@@ -169,6 +186,20 @@ window.addEventListener("message", (event) => {
   if (typeof event.data !== "object" || event.data === null) return;
   if (event.data.seq !== 102) return;
   log(event.data.ok === true ? "diagram: ok" : "diagram: FAIL");
+  receive({ type: "app.push", seq: 103, id: "libs", html: libsHtml, title: "libs" });
+  const pushed = canvas.querySelectorAll("iframe");
+  appFrame = pushed[pushed.length - 1];
+});
+
+window.addEventListener("message", (event) => {
+  if (event.source !== appFrame.contentWindow) return;
+  if (typeof event.data !== "object" || event.data === null) return;
+  if (typeof event.data.libs !== "object" || event.data.libs === null) return;
+  const katex = event.data.libs.katex === true;
+  const plotly = event.data.libs.plotly === true;
+  log("katex: " + katex);
+  log("plotly: " + plotly);
+  log(katex && plotly ? "libs: ok" : "libs: FAIL");
   log("done");
 });
 </script>

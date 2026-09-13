@@ -20,6 +20,7 @@ VISUALS = "export const visuals = true;\n"
 VISUAL_CHECK = "<!doctype html><title>visual check</title><div id=canvas></div>"
 BENCH_MERMAID = "<!doctype html><title>mermaid bench</title><div id=canvas></div>"
 VENDOR = "globalThis.mermaid = {};\n"
+FONT = b"wOF2\x00\x01"
 JSON_HEADERS = {"Content-Type": "application/json"}
 PLAIN_HEADERS = {"Content-Type": "text/plain;charset=UTF-8"}
 SESSION = {"subject": "PPO", "folder": "", "starting_from": "I know policy gradients"}
@@ -144,6 +145,25 @@ async def test_the_mermaid_benchmark_is_served(client: TestClient) -> None:
 
     assert harness.status == 200
     assert await harness.text() == BENCH_MERMAID
+
+
+async def test_a_nested_vendor_file_is_served(client: TestClient, tmp_path: Path) -> None:
+    font = tmp_path / "vendor" / "katex" / "fonts" / "a.woff2"
+    font.parent.mkdir(parents=True)
+    font.write_bytes(FONT)
+
+    response = await client.get("/vendor/katex/fonts/a.woff2", headers={"Origin": "null"})
+
+    assert response.status == 200
+    assert await response.read() == FONT
+    assert response.headers["Access-Control-Allow-Origin"] == "*"
+
+
+@pytest.mark.parametrize("path", ["/vendor/../index.html", "/vendor/%2e%2e/index.html"])
+async def test_a_vendor_path_that_climbs_out_is_a_not_found(client: TestClient, path: str) -> None:
+    response = await client.get(URL(path, encoded=True))
+
+    assert response.status == 404
 
 
 async def test_a_missing_vendor_bundle_is_a_not_found_rather_than_a_crash(

@@ -91,7 +91,11 @@ def create_app(
         return web.FileResponse(client_root / "bench_mermaid.html")
 
     async def vendor(request: web.Request) -> web.FileResponse:
-        return web.FileResponse(client_root / "vendor" / "mermaid.min.js")
+        root = (client_root / "vendor").resolve()
+        target = (root / request.match_info["path"]).resolve()
+        if not target.is_relative_to(root) or not target.is_file():
+            raise web.HTTPNotFound()
+        return web.FileResponse(target, headers={"Access-Control-Allow-Origin": "*"})
 
     async def offer(request: web.Request) -> web.Response:
         origin = request.headers.get("Origin")
@@ -141,7 +145,7 @@ def create_app(
     app.router.add_get("/visuals.js", visuals)
     app.router.add_get("/visual_check.html", visual_check)
     app.router.add_get("/bench_mermaid.html", bench_mermaid)
-    app.router.add_get("/vendor/mermaid.min.js", vendor)
+    app.router.add_get("/vendor/{path:.+}", vendor)
     app.router.add_post("/offer", offer)
     app.on_shutdown.append(_close_connections)
     return app

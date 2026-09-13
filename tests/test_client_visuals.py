@@ -11,9 +11,10 @@ GUARDED = [CLIENT, VISUALS, FRAME]
 HOST_POLICY = {
     "default-src": ["'none'"],
     "script-src": ["'self'", "'unsafe-inline'"],
-    "style-src": ["'unsafe-inline'"],
+    "style-src": ["'self'", "'unsafe-inline'"],
     "connect-src": ["'self'"],
     "img-src": ["'self'", "data:"],
+    "font-src": ["'self'"],
     "frame-src": ["'self'"],
     "base-uri": ["'none'"],
     "form-action": ["'none'"],
@@ -96,7 +97,7 @@ def test_every_push_on_the_check_page_carries_a_title() -> None:
     pushes = re.findall(r'\{ type: "(?:diagram|app)\.push"[^}]*\}', good[1])
     receives = re.findall(r'receive\(\{ type: "(?:diagram|app)\.push"[^}]*\}\)', text)
     assert len(pushes) == 2
-    assert len(receives) == 3
+    assert len(receives) == 4
     for literal in pushes + receives:
         assert "title:" in literal, literal
     for name in ('"title of 81"', '"app.push missing title"', '"diagram.push missing title"'):
