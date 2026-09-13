@@ -3,7 +3,8 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
 <title>tutor diagram</title>
 <style>
-  body { font: 14px ui-monospace, Menlo, monospace; margin: 0; padding: 1rem; background: #fff; }
+  body { font: 14px ui-monospace, Menlo, monospace; margin: 0; padding: 1rem; background: transparent; }
+  body[data-theme="dark"] { color: #ebeae6; }
   #d { overflow: auto; }
   #d svg { max-width: 100%; height: auto; }
 </style>
@@ -13,15 +14,16 @@
 <script src="/vendor/mermaid.min.js"></script>
 <script type="module">
 const KINDS = new Set(["flowchart", "sequence"]);
-const d = document.getElementById("d");
-let chain = Promise.resolve();
-
-mermaid.initialize({
+const INIT = {
   startOnLoad: false,
   securityLevel: "strict",
   htmlLabels: false,
   suppressErrorRendering: true,
-});
+};
+const d = document.getElementById("d");
+let chain = Promise.resolve();
+
+mermaid.initialize(INIT);
 
 async function render(m) {
   try {
@@ -40,6 +42,13 @@ async function clear() {
   return true;
 }
 
+async function retheme(theme) {
+  mermaid.initialize({ ...INIT, theme: theme === "dark" ? "dark" : "default" });
+  document.body.dataset.theme = theme;
+  document.documentElement.style.colorScheme = theme;
+  return true;
+}
+
 window.addEventListener("message", (event) => {
   if (event.origin !== new URL(location.href).origin) return;
   const m = event.data;
@@ -49,6 +58,8 @@ window.addEventListener("message", (event) => {
     step = clear;
   } else if (KINDS.has(m.kind) && typeof m.source === "string") {
     step = () => render(m);
+  } else if (m.theme === "light" || m.theme === "dark") {
+    step = () => retheme(m.theme);
   } else {
     return;
   }

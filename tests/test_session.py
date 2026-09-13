@@ -4489,6 +4489,29 @@ async def test_a_theme_message_reaches_the_visual_prompt(theme: object) -> None:
     assert ("off-white" in system) == (theme != "dark")
 
 
+async def test_an_accepted_theme_is_logged_and_a_rejected_one_is_not(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(
+        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL]
+    )
+    transport = LoggingTransport(log)
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning, transport=transport)
+    (handler,) = transport.handlers
+
+    with caplog.at_level(logging.DEBUG, logger="tutor.session"):
+        handler({"type": "theme", "theme": "sepia"})
+        handler({"type": "theme", "theme": "dark"})
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    themes = [line for line in session_messages(caplog) if line.startswith("session.theme")]
+    assert themes == ["session.theme theme=dark"]
+
+
 async def test_aclose_cancels_a_visual_call_in_flight() -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)

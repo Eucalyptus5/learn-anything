@@ -200,6 +200,7 @@ class TurnLoop:
         theme = payload.get("theme")
         if payload.get("type") == "theme" and isinstance(theme, str) and theme in THEMES:
             self._theme = theme
+            logger.debug("session.theme theme=%s", theme)
 
     async def run(self) -> None:
         async for event in self._source.events():

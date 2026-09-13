@@ -13,6 +13,7 @@ const KEYS = {
 const CAPS = { id: 64, source: 8000, html: 64000, path: 4096, title: 80, turn_id: 32 };
 const TEXT_CAPS = { caption: 2000, transcript: 4000 };
 const listeners = new Map();
+const history = [];
 
 let canvas = null;
 let frame = null;
@@ -20,6 +21,7 @@ let highlight = null;
 let app = null;
 let loaded = Promise.resolve();
 let lastSeq = 0;
+let themeSeq = 0;
 
 function reject(reason) {
   console.warn("visual payload rejected: " + reason);
@@ -82,20 +84,48 @@ export function onPayload(type, handler) {
   listeners.set(type, handler);
 }
 
+function sandboxedFrame() {
+  const element = document.createElement("iframe");
+  element.setAttribute("sandbox", "allow-scripts");
+  element.setAttribute("allow", "");
+  element.setAttribute("referrerpolicy", "no-referrer");
+  return element;
+}
+
 export function mount(root) {
   canvas = root;
-  frame = document.createElement("iframe");
-  frame.setAttribute("sandbox", "allow-scripts");
-  frame.setAttribute("allow", "");
-  frame.setAttribute("referrerpolicy", "no-referrer");
+  frame = sandboxedFrame();
   loaded = new Promise((resolve) => frame.addEventListener("load", resolve, { once: true }));
   frame.src = "/frame.html";
   highlight = document.createElement("div");
+  highlight.className = "highlight";
   canvas.append(frame, highlight);
 }
 
 function post(message) {
   loaded = loaded.then(() => frame.contentWindow.postMessage(message, "*"));
+}
+
+function unmountApp() {
+  if (app !== null) app.remove();
+  app = null;
+  frame.hidden = false;
+}
+
+function render(payload) {
+  unmountApp();
+  if (payload.type === "diagram.push") {
+    post({ seq: payload.seq, kind: payload.kind, source: payload.source });
+    return;
+  }
+  app = sandboxedFrame();
+  app.srcdoc = payload.html;
+  canvas.append(app);
+  frame.hidden = true;
+}
+
+function announce(current) {
+  listeners.get("history")?.(history.map((h, i) => ({ i, title: h.title })), current);
 }
 
 export function receive(payload) {
@@ -104,23 +134,19 @@ export function receive(payload) {
   lastSeq = payload.seq;
   switch (payload.type) {
     case "diagram.push":
-      post({ seq: payload.seq, kind: payload.kind, source: payload.source });
+    case "app.push":
+      history.push({ payload, title: payload.title });
+      render(payload);
+      announce(history.length - 1);
       break;
     case "diagram.clear":
+      unmountApp();
       post({ seq: payload.seq, clear: true });
+      announce(-1);
       break;
     case "source.highlight":
       highlight.textContent =
         payload.path + ":" + payload.start_line + "-" + payload.end_line;
-      break;
-    case "app.push":
-      if (app !== null) app.remove();
-      app = document.createElement("iframe");
-      app.setAttribute("sandbox", "allow-scripts");
-      app.setAttribute("allow", "");
-      app.setAttribute("referrerpolicy", "no-referrer");
-      app.srcdoc = payload.html;
-      canvas.append(app);
       break;
     case "state":
     case "caption":
@@ -130,6 +156,20 @@ export function receive(payload) {
   }
 }
 
+export function show(i) {
+  render(history[i].payload);
+  announce(i);
+}
+
+export function theme(name) {
+  post({ seq: ++themeSeq, theme: name });
+}
+
 export function reset() {
   lastSeq = 0;
+  history.length = 0;
+  unmountApp();
+  highlight.textContent = "";
+  post({ seq: 0, clear: true });
+  announce(-1);
 }

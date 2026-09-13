@@ -20,6 +20,12 @@ HOST_POLICY = {
     "form-action": ["'none'"],
 }
 POLICY_META = re.compile(r'<meta http-equiv="Content-Security-Policy" content="([^"]*)">')
+HTML_SINKS = [
+    re.compile(r"insertAdjacentHTML\s*\("),
+    re.compile(r"\.outerHTML\s*="),
+    re.compile(r"document\.write\s*\("),
+    re.compile(r"\.innerHTML\s*="),
+]
 
 
 def host_policy(text: str) -> dict[str, list[str]]:
@@ -33,7 +39,9 @@ def host_policy(text: str) -> dict[str, list[str]]:
 def test_sandbox_attribute_is_exactly_allow_scripts() -> None:
     texts = {path.name: path.read_text() for path in GUARDED}
     sandboxes = re.findall(r'setAttribute\("sandbox",\s*"([^"]*)"\)', texts["visuals.js"])
-    assert sandboxes == ["allow-scripts", "allow-scripts"]
+    assert sandboxes == ["allow-scripts"]
+    assert len(re.findall(r'createElement\("iframe"\)', texts["visuals.js"])) == 1
+    assert 'createElement("iframe")' not in texts["client.js"]
     for name, text in texts.items():
         assert ".sandbox.add(" not in text, name
         assert ".sandbox =" not in text, name
@@ -52,6 +60,72 @@ def test_frame_creation_never_sets_allow_same_origin() -> None:
 def test_no_innerhtml_assignment() -> None:
     for path in (CLIENT, VISUALS):
         assert not re.search(r"\.innerHTML\s*=", path.read_text()), path.name
+
+
+def test_the_offer_body_carries_the_session_from_the_card() -> None:
+    text = CLIENT.read_text()
+    session = re.search(r"session: \{(.*?)\}", text, re.DOTALL)
+    assert session is not None
+    for key in ("subject", "folder", "starting_from"):
+        assert re.search(rf"\b{key}:", session[1]), key
+
+
+def test_the_theme_is_sent_on_open_and_on_change() -> None:
+    text = CLIENT.read_text()
+    assert 'matchMedia("(prefers-color-scheme: dark)")' in text
+    senders = [
+        name
+        for name, body in re.findall(r"function (\w+)\(\) \{(.*?)\n\}", text, re.DOTALL)
+        if 'sendJson({ type: "theme"' in body
+    ]
+    assert len(senders) == 1
+    assert f"onOpen({senders[0]})" in text
+    change = re.search(r'addEventListener\("change",\s*\(\)\s*=>\s*\{(.*?)\n\}\);', text, re.DOTALL)
+    assert change is not None
+    assert f"{senders[0]}()" in change[1]
+
+
+def test_captions_and_transcript_use_text_content_only() -> None:
+    for path in (CLIENT, VISUALS):
+        for sink in HTML_SINKS:
+            assert not sink.search(path.read_text()), (path.name, sink.pattern)
+    client = CLIENT.read_text()
+    for kind in ("caption", "transcript"):
+        handler = re.search(
+            rf'onPayload\("{kind}", \(payload\) => \{{(.*?)\n\}}\);', client, re.DOTALL
+        )
+        assert handler is not None, kind
+        assert "textContent" in handler[1], kind
+        for sink in HTML_SINKS:
+            assert not sink.search(handler[1]), (kind, sink.pattern)
+
+
+def test_history_entries_are_rebuilt_from_stored_payloads() -> None:
+    visuals = VISUALS.read_text()
+    assert "history.push(" in visuals
+    receive = re.search(r"export function receive\(payload\) \{(.*?)\n\}", visuals, re.DOTALL)
+    show = re.search(r"export function show\(i\) \{(.*?)\n\}", visuals, re.DOTALL)
+    assert receive is not None and show is not None
+    assert "render(payload)" in receive[1]
+    assert "render(history[i].payload)" in show[1]
+    client = CLIENT.read_text()
+    assert re.search(r'addEventListener\("click",\s*\(\)\s*=>\s*show\(\w+\)\)', client)
+
+
+def test_a_clear_and_a_reset_drop_the_live_app_frame() -> None:
+    text = VISUALS.read_text()
+    unmount = re.search(r"function unmountApp\(\) \{(.*?)\n\}", text, re.DOTALL)
+    receive = re.search(r"export function receive\(payload\) \{(.*?)\n\}", text, re.DOTALL)
+    reset = re.search(r"export function reset\(\) \{(.*?)\n\}", text, re.DOTALL)
+    assert unmount is not None and receive is not None and reset is not None
+    clear = re.search(r'case "diagram.clear":(.*?)break;', receive[1], re.DOTALL)
+    assert clear is not None
+    assert "app = null" in unmount[1]
+    assert "frame.hidden = false" in unmount[1]
+    for body in (clear[1], reset[1]):
+        assert "unmountApp()" in body
+        assert "clear: true" in body
+        assert "announce(-1)" in body
 
 
 def test_a_second_connect_reopens_the_channel_for_seq_reset() -> None:

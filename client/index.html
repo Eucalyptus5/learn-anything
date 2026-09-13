@@ -1,30 +1,486 @@
 <!doctype html>
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; font-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'none'">
-<title>Codebase tutor</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Learn anything</title>
 <style>
-  body { font: 14px ui-monospace, Menlo, monospace; margin: 2rem; max-width: 46rem; }
-  button { font: inherit; padding: .5rem 1rem; margin-right: .5rem; }
-  #status { white-space: pre-wrap; background: #f4f4f4; padding: .8rem; }
-  #canvas { margin: 1rem 0; }
-  #canvas iframe { width: 100%; height: 24rem; border: 1px solid #ccc; }
+  :root {
+    --page: #e6e7ea;
+    --ground: #f4f4f5;
+    --stage: #f7f7f8;
+    --surface: #ffffff;
+    --raised: #ffffff;
+    --ink: #17181b;
+    --ink-2: #5f6368;
+    --ink-3: #9a9ea6;
+    --accent: #0e7c73;
+    --accent-ink: #ffffff;
+    --hair: color-mix(in srgb, var(--ink) 9%, transparent);
+    --hair-strong: color-mix(in srgb, var(--ink) 16%, transparent);
+    --tint: color-mix(in srgb, var(--ink) 5%, transparent);
+    --lift: 0 1px 2px rgba(23, 24, 27, 0.04), 0 16px 40px -20px rgba(23, 24, 27, 0.18);
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    --serif: Charter, "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+    --mono: ui-monospace, Menlo, Consolas, monospace;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --page: #0d0e11;
+      --ground: #121316;
+      --stage: #17181c;
+      --surface: #1a1b1f;
+      --raised: #212228;
+      --ink: #ebeae6;
+      --ink-2: #a6aab2;
+      --ink-3: #6e737c;
+      --accent: #63d3c4;
+      --accent-ink: #0d1a18;
+      --hair: color-mix(in srgb, var(--ink) 8%, transparent);
+      --hair-strong: color-mix(in srgb, var(--ink) 14%, transparent);
+      --tint: color-mix(in srgb, var(--ink) 6%, transparent);
+      --lift: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 16px 40px -20px rgba(0, 0, 0, 0.6);
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --page: #0d0e11;
+    --ground: #121316;
+    --stage: #17181c;
+    --surface: #1a1b1f;
+    --raised: #212228;
+    --ink: #ebeae6;
+    --ink-2: #a6aab2;
+    --ink-3: #6e737c;
+    --accent: #63d3c4;
+    --accent-ink: #0d1a18;
+    --hair: color-mix(in srgb, var(--ink) 8%, transparent);
+    --hair-strong: color-mix(in srgb, var(--ink) 14%, transparent);
+    --tint: color-mix(in srgb, var(--ink) 6%, transparent);
+    --lift: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 16px 40px -20px rgba(0, 0, 0, 0.6);
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html { background: var(--page); }
+  body {
+    margin: 0;
+    font: 15px/1.5 var(--sans);
+    color: var(--ink);
+    background: var(--page);
+    -webkit-font-smoothing: antialiased;
+  }
+  h1, h2, h3, p { margin: 0; }
+  button, input, textarea { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .app {
+    display: grid;
+    grid-template-columns: 256px 1fr;
+    grid-template-rows: minmax(0, 1fr);
+    height: 100vh;
+    background: var(--surface);
+    overflow: hidden;
+  }
+  .app.with-drawer { grid-template-columns: 256px 1fr 400px; }
+
+  .side {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    padding: 20px 12px 16px;
+    background: var(--ground);
+    box-shadow: inset -1px 0 0 var(--hair);
+  }
+  .wordmark {
+    padding: 4px 12px 28px;
+    font: italic 18px/1.2 var(--serif);
+    letter-spacing: -0.01em;
+  }
+  .side h3 {
+    padding: 0 12px;
+    margin-bottom: 8px;
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    color: var(--ink-3);
+  }
+  .side .empty {
+    padding: 0 12px;
+    font-size: 14px;
+    line-height: 1.45;
+    color: var(--ink-3);
+    max-width: 24ch;
+  }
+  .history { display: flex; flex-direction: column; }
+  .history button {
+    position: relative;
+    display: block;
+    width: 100%;
+    padding: 7px 12px 7px 32px;
+    border: 0;
+    border-radius: 10px;
+    background: transparent;
+    font-size: 14px;
+    line-height: 1.4;
+    text-align: left;
+    color: var(--ink-2);
+    cursor: pointer;
+  }
+  .history button::before {
+    content: "";
+    position: absolute;
+    left: 15px;
+    top: 14px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    box-shadow: 0 0 0 1.5px var(--ink-3);
+    background: var(--ground);
+  }
+  .history button::after {
+    content: "";
+    position: absolute;
+    left: 17.5px;
+    top: 24px;
+    bottom: -9px;
+    width: 1px;
+    background: var(--hair-strong);
+  }
+  .history button:last-child::after { display: none; }
+  .history button:hover { background: var(--tint); }
+  .history button[aria-current="true"] {
+    color: var(--ink);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+  .history button[aria-current="true"]::before {
+    box-shadow: 0 0 0 1.5px var(--accent);
+    background: var(--accent);
+  }
+  .side-foot { margin-top: auto; }
+  .session {
+    padding: 12px 12px 0;
+    box-shadow: inset 0 1px 0 var(--hair);
+    font-size: 13px;
+    color: var(--ink-3);
+  }
+  .session b { display: block; font-weight: 500; color: var(--ink-2); }
+  .keys { margin-top: 12px; padding: 0 12px; font-size: 13px; color: var(--ink-3); }
+  .keys kbd {
+    display: inline-block;
+    min-width: 20px;
+    padding: 0 5px;
+    margin-right: 5px;
+    border-radius: 5px;
+    background: var(--tint);
+    font: 11.5px/18px var(--mono);
+    text-align: center;
+    color: var(--ink-2);
+  }
+  .keys span + span { margin-left: 14px; }
+
+  .main {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    background: var(--stage);
+  }
+  .bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 56px;
+    padding: 0 24px;
+    background: var(--surface);
+    box-shadow: inset 0 -1px 0 var(--hair);
+  }
+  .bar h2 { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; margin-right: 6px; }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    height: 26px;
+    padding: 0 11px;
+    border-radius: 999px;
+    background: var(--tint);
+    font-size: 13px;
+    color: var(--ink-2);
+  }
+  .chip.phase i {
+    display: inline-block;
+    width: 5px;
+    height: 5px;
+    margin-right: -4px;
+    border-radius: 50%;
+    background: var(--hair-strong);
+  }
+  .chip.phase i:nth-child(3) { margin-right: 3px; }
+  .chip.phase[data-phase="teach"] i:nth-child(1),
+  .chip.phase[data-phase="concrete"] i:nth-child(2),
+  .chip.phase[data-phase="interrogate"] i:nth-child(3) { background: var(--ink); }
+  .chip.live {
+    margin-left: auto;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+  }
+  .bars { display: inline-flex; align-items: flex-end; gap: 2px; height: 12px; }
+  .bars i {
+    display: block;
+    width: 3px;
+    height: 40%;
+    border-radius: 1px;
+    background: currentColor;
+    animation: bar 0.9s ease-in-out infinite;
+  }
+  .bars i:nth-child(2) { animation-delay: 0.15s; }
+  .bars i:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes bar {
+    0%, 100% { height: 30%; }
+    50% { height: 100%; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .bars i { animation: none; height: 60%; }
+  }
+
+  .debug {
+    margin: 0;
+    padding: 10px 24px;
+    background: var(--ground);
+    box-shadow: inset 0 -1px 0 var(--hair);
+    font: 12px/1.6 var(--mono);
+    color: var(--ink-2);
+    white-space: pre;
+  }
+
+  .stage {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 24px 32px 0;
+    background:
+      radial-gradient(ellipse 70% 60% at 50% 0%, color-mix(in srgb, var(--accent) 7%, transparent), transparent),
+      var(--stage);
+  }
+  .canvas {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 20px 28px 24px;
+    border-radius: 16px;
+    background: var(--surface);
+    box-shadow: 0 0 0 1px var(--hair), var(--lift);
+  }
+  .canvas .title {
+    margin-bottom: 12px;
+    font-size: 13px;
+    color: var(--ink-3);
+  }
+  .canvas iframe { width: 100%; flex: 1; min-height: 0; border: 0; background: transparent; }
+  .canvas .highlight { font: 12px/1.6 var(--mono); color: var(--ink-3); }
+  .canvas .highlight:empty { display: none; }
+
+  .caption {
+    width: 100%;
+    max-width: 880px;
+    margin: 20px auto 24px;
+    padding: 20px 28px;
+    border-radius: 20px;
+    background: var(--raised);
+    box-shadow: 0 0 0 1px var(--hair-strong), var(--lift);
+    font: 22px/1.45 var(--serif);
+    letter-spacing: -0.005em;
+    color: var(--ink);
+  }
+  .caption.speaking { box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent), var(--lift); }
+  .caption .prev { color: var(--ink-3); }
+
+  .welcome {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 48px 32px;
+    background:
+      radial-gradient(ellipse 70% 60% at 50% 0%, color-mix(in srgb, var(--accent) 7%, transparent), transparent),
+      var(--stage);
+  }
+  .card { width: 100%; max-width: 640px; }
+  .card h1 {
+    font: 40px/1.1 var(--serif);
+    letter-spacing: -0.015em;
+    text-align: center;
+    margin-bottom: 12px;
+  }
+  .card .lede { color: var(--ink-2); text-align: center; margin-bottom: 32px; }
+  .composer {
+    border-radius: 20px;
+    background: var(--raised);
+    box-shadow: 0 0 0 1px var(--hair-strong), var(--lift);
+  }
+  .composer .subject {
+    display: block;
+    width: 100%;
+    padding: 20px 24px;
+    border: 0;
+    border-radius: 20px 20px 0 0;
+    background: transparent;
+    font-size: 20px;
+  }
+  .composer .subject::placeholder { color: var(--ink-3); }
+  .composer .more {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    padding: 16px 16px 8px;
+    box-shadow: inset 0 1px 0 var(--hair);
+  }
+  .field { display: block; }
+  .field span { display: block; font-size: 12.5px; color: var(--ink-3); margin: 0 0 6px 4px; }
+  .field input, .field textarea {
+    width: 100%;
+    padding: 9px 12px;
+    border: 0;
+    border-radius: 10px;
+    background: var(--tint);
+    color: var(--ink);
+    font-size: 14px;
+  }
+  .field input::placeholder, .field textarea::placeholder { color: var(--ink-3); }
+  .field textarea { resize: none; height: 68px; }
+  .composer .foot {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 8px 16px 16px;
+  }
+  .composer .note { font-size: 13px; color: var(--ink-3); max-width: 38ch; margin-left: 4px; }
+  .connect {
+    margin-left: auto;
+    height: 38px;
+    padding: 0 22px;
+    border: 0;
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--accent-ink);
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .drawer {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background: var(--surface);
+    box-shadow: inset 1px 0 0 var(--hair);
+  }
+  .drawer h3 {
+    display: flex;
+    align-items: center;
+    height: 56px;
+    padding: 0 24px;
+    box-shadow: inset 0 -1px 0 var(--hair);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    color: var(--ink-3);
+  }
+  .drawer h3 kbd {
+    margin-left: auto;
+    padding: 0 5px;
+    border-radius: 5px;
+    background: var(--tint);
+    font: 11.5px/18px var(--mono);
+    color: var(--ink-2);
+  }
+  .thread {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+  .learner {
+    align-self: flex-end;
+    max-width: 85%;
+    padding: 10px 14px;
+    border-radius: 18px 18px 6px 18px;
+    background: var(--tint);
+    font-size: 14px;
+    line-height: 1.45;
+    color: var(--ink);
+  }
+  .tutor {
+    max-width: 96%;
+    font: 16px/1.55 var(--serif);
+    color: var(--ink);
+  }
 </style>
 
-<h2>Codebase tutor</h2>
-
-<p>Opens the microphone, negotiates one <code>RTCPeerConnection</code> with the local Python peer
-through <code>POST /offer</code>, plays whatever the tutor sends from the
-<code>&lt;audio&gt;</code> element on this page, and carries JSON both ways on a data channel
-named <code>tutor</code>. Audio and transcripts stay on this machine. The tutor peer currently
-sends digital silence, so read the packet counters and the data channel state below instead of
-listening for a voice; speak, and the microphone level should move. The canvas below shows
-the diagrams and source highlights the tutor pushes.</p>
-
-<p><button id="connect">Connect</button></p>
-
-<div id="status">idle</div>
+<div class="app">
+  <aside class="side">
+    <div class="wordmark">Learn anything</div>
+    <h3>Visuals</h3>
+    <p class="empty">What the tutor draws during the session collects here.</p>
+    <div class="history"></div>
+    <div class="side-foot">
+      <p class="session" hidden><b></b><span></span></p>
+      <p class="keys"><span><kbd>t</kbd>transcript</span><span><kbd>d</kbd>debug</span></p>
+    </div>
+  </aside>
+  <main class="main">
+    <div class="welcome">
+      <div class="card">
+        <h1>What are we learning?</h1>
+        <p class="lede">Name it and talk it through. The tutor explains, draws, and asks you back.</p>
+        <form class="composer">
+          <input class="subject" type="text" placeholder="A concept, a paper, an algorithm, a codebase" aria-label="Subject" required>
+          <div class="more">
+            <label class="field">
+              <span>Folder, if there is one</span>
+              <input class="folder" type="text" placeholder="/path/to/notes or a repository">
+            </label>
+            <label class="field">
+              <span>Starting from</span>
+              <textarea class="starting" placeholder="Where you are with it, in your own words"></textarea>
+            </label>
+          </div>
+          <div class="foot">
+            <p class="note">Your voice stays on this machine. Only text goes to the model.</p>
+            <button class="connect" type="submit">Connect</button>
+          </div>
+        </form>
+      </div>
+    </div>
+    <div class="bar" hidden>
+      <h2></h2>
+      <span class="chip phase" data-phase="teach"><i></i><i></i><i></i><span>teach</span></span>
+      <span class="chip live"><span class="bars"><i></i><i></i><i></i></span><span>listening</span></span>
+    </div>
+    <pre class="debug" hidden></pre>
+    <div class="stage" hidden>
+      <div class="canvas">
+        <p class="title"></p>
+      </div>
+      <p class="caption">
+        <span class="prev"></span>
+        <span class="cur"></span>
+      </p>
+    </div>
+  </main>
+  <aside class="drawer" hidden>
+    <h3>Transcript <kbd>t</kbd></h3>
+    <div class="thread"></div>
+  </aside>
+</div>
 
 <audio id="tutor" autoplay></audio>
-<div id="canvas"></div>
-
 <script type="module" src="/client.js"></script>
