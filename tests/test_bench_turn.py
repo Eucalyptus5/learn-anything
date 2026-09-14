@@ -1,13 +1,16 @@
+import asyncio
 import importlib.util
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
 import numpy as np
 
 from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.config import Settings
-from tutor.cost import UsageLedger
+from tutor.cost import TurnUsage, UsageLedger
 from tutor.input_path import EndOfTurn, SpeechStarted
+from tutor.prompt import TurnPrompt
+from tutor.reasoning import TurnChunk
 from tutor.session import OutcomeSplitter
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "bench_turn.py"
@@ -16,6 +19,9 @@ bench_turn = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bench_turn)
 
 TIMES = [float(n) for n in range(60)]
+HANG_GUARD_S = 30.0
+PROMPT = TurnPrompt(system="s", user_text="teach me ppo")
+HEAD = '<visual>{"kind": "diagram", "title": "PPO update loop", "show": "the loop"}</visual>'
 
 DELTAS = [
     "The `acquire` method pops ",
@@ -105,8 +111,242 @@ def test_floor_lifts_every_zero_sample_and_leaves_the_original_alone() -> None:
 def test_parser_defaults() -> None:
     args = bench_turn.build_parser().parse_args([])
 
-    assert args.root.parts[-3:] == ("tests", "data", "fixture_repo")
+    assert args.root is None
     assert args.model is None
+    assert args.subject is None
+    assert args.starting_from == bench_turn.STARTING_FROM
+
+
+def test_concept_mode_uses_the_ppo_utterances() -> None:
+    assert bench_turn.utterances_for(None) is bench_turn.PPO_UTTERANCES
+    assert bench_turn.PPO_UTTERANCES == (
+        "teach me ppo",
+        "why does it clip the ratio instead of using it directly",
+        "what happens when the advantage is negative",
+        "quiz me on the clipped objective",
+        "the clip makes the gradient larger past epsilon",
+        "just tell me",
+    )
+    assert bench_turn.utterances_for(Path("x")) is bench_turn.UTTERANCES
+
+
+def test_model_text_strips_the_brief_head() -> None:
+    deltas = [
+        "<vis",
+        'ual>{"kind": "app", "title": "Clipped objective", "show": "the plot"}</visual>\n',
+        "The ratio is clipped, ",
+        "and the objective is flat past epsilon.",
+        "\n<outcome>",
+        '{"signal": "covered"}',
+    ]
+
+    model = bench_turn.model_text([deltas])
+
+    assert "<visual>" not in model
+    assert "Clipped objective" not in model
+    assert model.rstrip() == "The ratio is clipped, and the objective is flat past epsilon."
+
+
+class ScriptedStream:
+    def __init__(
+        self,
+        chunks: list[TurnChunk],
+        usage: TurnUsage | None = None,
+        finish_reason: str | None = None,
+        first_chunk_ms: int | None = None,
+    ) -> None:
+        self._chunks = chunks
+        self.usage = usage
+        self.finish_reason = finish_reason
+        self.first_chunk_ms = first_chunk_ms
+
+    async def __aiter__(self) -> AsyncIterator[TurnChunk]:
+        for chunk in self._chunks:
+            yield chunk
+
+
+class ScriptedReasoning:
+    def __init__(self, streams: list[ScriptedStream]) -> None:
+        self._streams = streams
+
+    def start_turn(
+        self,
+        prompt: TurnPrompt,
+        tools: Sequence[dict] | None = None,
+        effort: str | None = None,
+        max_tokens: int | None = None,
+        tool_choice: str | None = None,
+    ) -> ScriptedStream:
+        return self._streams.pop(0)
+
+
+def _spoken(*texts: str) -> list[TurnChunk]:
+    return [TurnChunk(kind="spoken", text=text) for text in texts]
+
+
+async def test_a_voice_stream_records_the_brief_and_sums_its_usage() -> None:
+    first = ScriptedStream(
+        _spoken(HEAD, "PPO clips."), usage=TurnUsage(prompt_tokens=10, completion_tokens=20)
+    )
+    second = ScriptedStream(
+        _spoken("Then it stops."), usage=TurnUsage(prompt_tokens=30, completion_tokens=5)
+    )
+    reasoning = bench_turn.MeteredReasoning(ScriptedReasoning([first, second]))
+    record = reasoning.begin()
+
+    chunks = [chunk async for chunk in reasoning.start_turn(PROMPT, tools=[], max_tokens=10)]
+    assert len(chunks) == 2
+    assert record.brief is not None and record.brief.kind == "diagram"
+    assert record.brief_at is not None
+    assert record.first_spoken_ms is not None
+    assert record.voice_usage == TurnUsage(prompt_tokens=10, completion_tokens=20)
+
+    async for _ in reasoning.start_turn(PROMPT):
+        pass
+
+    assert record.voice_usage == TurnUsage(prompt_tokens=40, completion_tokens=25)
+    assert record.visual_usage is None
+    assert record.visual_task is None
+    assert record.streams == [[HEAD, "PPO clips."], ["Then it stops."]]
+    assert reasoning.ledgers["voice"].turns == 2
+    assert reasoning.ledgers["voice"].total.prompt_tokens == 40
+    assert reasoning.ledgers["visual"].turns == 0
+    assert reasoning.ledger.turns == 2
+
+
+async def test_a_visual_stream_is_attributed_to_the_visual_ledger() -> None:
+    call = TurnChunk(kind="tool_call", text="{}", tool_call_id="c", tool_name="push_diagram")
+    stream = ScriptedStream(
+        [call],
+        usage=TurnUsage(prompt_tokens=30, completion_tokens=40),
+        finish_reason="tool_calls",
+        first_chunk_ms=7,
+    )
+    reasoning = bench_turn.MeteredReasoning(ScriptedReasoning([stream]))
+    record = reasoning.begin()
+
+    metered = reasoning.start_turn(PROMPT, tools=[], max_tokens=10, tool_choice="required")
+    chunks = [chunk async for chunk in metered]
+
+    assert chunks == [call]
+    assert record.visual_task is asyncio.current_task()
+    assert metered.finish_reason == "tool_calls"
+    assert metered.first_chunk_ms == 7
+    assert record.visual_first_chunk_ms == 7
+    assert record.visual_usage == TurnUsage(prompt_tokens=30, completion_tokens=40)
+    assert record.voice_usage is None
+    assert record.first_spoken_ms is None
+    assert record.brief is None
+    assert record.streams == []
+    assert reasoning.ledgers["visual"].turns == 1
+    assert reasoning.ledgers["visual"].total.completion_tokens == 40
+    assert reasoning.ledgers["voice"].turns == 0
+    assert reasoning.ledger.turns == 1
+
+
+async def test_the_sample_waits_for_the_turns_visual_task() -> None:
+    gate = asyncio.Event()
+    task = asyncio.create_task(gate.wait(), name="turn-7-visual")
+    asyncio.get_running_loop().call_soon(gate.set)
+
+    settled = await bench_turn.settle_visual("turn-7", HANG_GUARD_S)
+
+    assert settled is True
+    assert task.done()
+
+
+async def test_a_turn_without_a_visual_task_settles_at_once() -> None:
+    assert await bench_turn.settle_visual("turn-8", HANG_GUARD_S) is False
+
+
+def test_summarize_usd_prints_six_decimals(capsys) -> None:
+    bench_turn.summarize_usd("cost per turn (list)", [0.001, 0.0025, 0.0005])
+    bench_turn.summarize_usd("visual cost per turn (list)", [])
+
+    filled, empty = capsys.readouterr().out.splitlines()
+    assert filled.startswith("cost per turn (list)")
+    assert "n=  3" in filled
+    assert "median=0.001000" in filled
+    assert "p95=0.001000" in filled
+    assert "min=0.000500" in filled
+    assert "max=0.002500" in filled
+    assert "ms" not in filled
+    assert empty.endswith("no samples")
+
+
+def test_a_sample_without_a_visual_reports_none(capsys) -> None:
+    cfg = Settings(_env_file=None, reasoning_api_base="http://x", reasoning_api_key="k")
+    args = bench_turn.build_parser().parse_args([])
+    sample = bench_turn.Sample(
+        first_sound_ms=900,
+        substance_ms=900,
+        first_content_delta_ms=600,
+        stages=0,
+        silent=False,
+        brief=None,
+        brief_gap_ms=None,
+        visual_landed_ms=None,
+        visual_valid=None,
+        visual_truncated=False,
+        audio_ms=4000,
+        voice_usd=0.0001,
+        visual_usd=0.0,
+    )
+
+    bench_turn.report(cfg, args, [sample], bench_turn.MeteredReasoning(ScriptedReasoning([])))
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "turns with a brief 0/1" in lines
+    assert "visual calls 0/1" in lines
+    assert "visuals landed 0/0" in lines
+    assert "visuals valid 0/0" in lines
+    assert "visuals truncated 0/0" in lines
+    (landing,) = [line for line in lines if line.startswith("visual landing")]
+    assert landing.endswith("no samples")
+    assert "turns with unknown cost 0/1" in lines
+    (cost,) = [line for line in lines if line.startswith("cost per turn (list)")]
+    assert "n=  1 median=0.000100" in cost
+    assert any(line.startswith("voice turns=0") for line in lines)
+    assert any(line.startswith("visual turns=0") for line in lines)
+
+
+def test_a_visual_without_a_usage_chunk_has_an_unknown_cost(capsys) -> None:
+    cfg = Settings(_env_file=None, reasoning_api_base="http://x", reasoning_api_key="k")
+    args = bench_turn.build_parser().parse_args([])
+    sample = bench_turn.Sample(
+        first_sound_ms=900,
+        substance_ms=900,
+        first_content_delta_ms=600,
+        stages=0,
+        silent=False,
+        brief="app",
+        brief_gap_ms=300,
+        visual_landed_ms=None,
+        visual_valid=False,
+        visual_truncated=False,
+        audio_ms=4000,
+        voice_usd=0.0001,
+        visual_usd=None,
+    )
+
+    bench_turn.report(cfg, args, [sample], bench_turn.MeteredReasoning(ScriptedReasoning([])))
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "turns with unknown cost 1/1" in lines
+    (cost,) = [line for line in lines if line.startswith("cost per turn (list)")]
+    assert cost.endswith("no samples")
+    (voice,) = [line for line in lines if line.startswith("voice cost per turn (list)")]
+    assert "n=  1" in voice
+    (visual,) = [line for line in lines if line.startswith("visual cost per turn (list)")]
+    assert visual.endswith("no samples")
+
+
+def test_the_visual_predicates_read_the_result_string() -> None:
+    assert bench_turn.is_valid("push_app: sent")
+    assert not bench_turn.is_valid("push_app: error: html: too long")
+    assert not bench_turn.is_valid("visual: timeout")
+    assert bench_turn.is_truncated("visual: error: truncated at 3000 tokens")
+    assert not bench_turn.is_truncated("push_diagram: sent")
 
 
 POWERMETRICS_BLOCKS = """Machine model: Mac14,2

@@ -1,8 +1,9 @@
 """End to end turn latency through the real stack: scripted text in, timestamped 48 kHz frames
-out of the playout track. Reports time to first sound and time to substance per turn. Text only
-on the wire; the fixture repo is the only tree searched. ``--soak MINUTES`` runs the same turns
-for a stated number of minutes while sampling power, thermal pressure, cluster frequency, process
-RSS and swap.
+out of the playout track. Reports time to first sound, time to substance, the visual's landing
+and validity, and the cost per turn. Without ``--root`` the turns are a concept lesson on PPO;
+with it they walk the fixture repo, the only tree searched. Text only on the wire. ``--soak
+MINUTES`` runs the same turns for a stated number of minutes while sampling power, thermal
+pressure, cluster frequency, process RSS and swap.
 """
 
 import argparse
@@ -27,11 +28,13 @@ sys.path.insert(0, str(REPO))
 
 from scripts.bench_llm import summarize
 from tutor.app import Models, build_loop, load_models
+from tutor.brief import BriefSplitter, VisualBrief
 from tutor.chunker import Scrubber
 from tutor.config import Settings, settings
 from tutor.constants import TTS_SAMPLE_RATE, WEBRTC_FRAME_SAMPLES, WEBRTC_SAMPLE_RATE
-from tutor.cost import UsageLedger
+from tutor.cost import TurnUsage, UsageLedger, turn_cost_usd
 from tutor.input_path import EndOfTurn, InputEvent
+from tutor.prompt import TurnPrompt
 from tutor.reasoning import ReasoningClient, TurnChunk, TurnStream
 from tutor.session import OutcomeSplitter, TurnLoop
 from tutor.signaling import SessionRequest
@@ -41,6 +44,8 @@ from tutor.tts import KokoroSynthesizer
 WARMUP = 3
 SAMPLES = 30
 SUBJECT = "a small http client with a bounded connection pool"
+PPO_SUBJECT = "PPO"
+STARTING_FROM = "I know policy gradients and the advantage; I have not read the PPO paper"
 IDLE_FRAMES = 5
 SOAK_SAMPLE_S = 10
 SOAK_EDGE_MIN = 5
@@ -61,6 +66,25 @@ UTTERANCES = (
     "how does with_connection make sure a connection goes back to the pool",
     "what is different between get and post in HttpClient",
 )
+PPO_UTTERANCES = (
+    "teach me ppo",
+    "why does it clip the ratio instead of using it directly",
+    "what happens when the advantage is negative",
+    "quiz me on the clipped objective",
+    "the clip makes the gradient larger past epsilon",
+    "just tell me",
+)
+PUSH_TYPES = frozenset({"diagram.push", "app.push"})
+
+
+def utterances_for(root: Path | None) -> tuple[str, ...]:
+    return PPO_UTTERANCES if root is None else UTTERANCES
+
+
+def subject_for(root: Path | None, subject: str | None) -> str:
+    if subject is not None:
+        return subject
+    return PPO_SUBJECT if root is None else SUBJECT
 
 
 def substance_frame_index(lengths: Sequence[int], m: int) -> int:
@@ -81,8 +105,13 @@ def model_text(streams: Sequence[Sequence[str]]) -> str:
     for n, deltas in enumerate(streams):
         if n:
             pieces.append("\n")
+        head = BriefSplitter()
         splitter = OutcomeSplitter()
-        pieces.extend(text for text in (splitter.feed(delta) for delta in deltas) if text)
+        pieces.extend(
+            text for text in (splitter.feed(head.feed(delta)) for delta in deltas) if text
+        )
+        if text := splitter.feed(head.finish()):
+            pieces.append(text)
         tail, _ = splitter.finish()
         if tail:
             pieces.append(tail)
@@ -97,6 +126,14 @@ def is_model(text: str | None, model: str) -> bool:
     return text is not None and text in model
 
 
+def is_valid(result: str) -> bool:
+    return result.endswith(": sent")
+
+
+def is_truncated(result: str) -> bool:
+    return result.startswith("visual: error: truncated")
+
+
 def floored(pcm: np.ndarray) -> np.ndarray:
     return np.where(pcm == 0, 1, pcm).astype(np.int16)
 
@@ -104,15 +141,29 @@ def floored(pcm: np.ndarray) -> np.ndarray:
 class Sample(BaseModel):
     first_sound_ms: int | None
     substance_ms: int | None
-    first_spoken_delta_ms: int | None
+    first_content_delta_ms: int | None
     stages: int
     silent: bool
+    brief: str | None
+    brief_gap_ms: int | None
+    visual_landed_ms: int | None
+    visual_valid: bool | None
+    visual_truncated: bool
+    audio_ms: int
+    voice_usd: float | None
+    visual_usd: float | None
 
 
 class Enqueued(NamedTuple):
     at: float
     text: str | None
     samples: int
+
+
+class Push(NamedTuple):
+    at: float
+    type: str
+    title: str
 
 
 class PowerSample(BaseModel):
@@ -312,42 +363,105 @@ class TurnRecord:
         self.streams: list[list[str]] = []
         self.requested: float | None = None
         self.first_spoken_ms: int | None = None
+        self.brief: VisualBrief | None = None
+        self.brief_at: float | None = None
+        self.voice_usage: TurnUsage | None = None
+        self.visual_usage: TurnUsage | None = None
+        self.visual_first_chunk_ms: int | None = None
+        self.visual_task: asyncio.Task[str] | None = None
+
+
+def add_usage(total: TurnUsage | None, usage: TurnUsage) -> TurnUsage:
+    if total is None:
+        return usage
+    return TurnUsage(
+        prompt_tokens=total.prompt_tokens + usage.prompt_tokens,
+        completion_tokens=total.completion_tokens + usage.completion_tokens,
+        cached_tokens=total.cached_tokens + usage.cached_tokens,
+        reasoning_chars=total.reasoning_chars + usage.reasoning_chars,
+    )
 
 
 class MeteredStream:
-    def __init__(self, inner: TurnStream, record: TurnRecord, ledger: UsageLedger) -> None:
+    def __init__(
+        self,
+        inner: TurnStream,
+        record: TurnRecord,
+        ledgers: Sequence[UsageLedger],
+        kind: str,
+    ) -> None:
         self._inner = inner
         self._record = record
-        self._ledger = ledger
+        self._ledgers = ledgers
+        self._kind = kind
+
+    @property
+    def finish_reason(self) -> str | None:
+        return self._inner.finish_reason
+
+    @property
+    def first_chunk_ms(self) -> int | None:
+        return self._inner.first_chunk_ms
 
     async def __aiter__(self) -> AsyncIterator[TurnChunk]:
+        record = self._record
+        voice = self._kind == "voice"
         deltas: list[str] = []
-        self._record.streams.append(deltas)
+        head = BriefSplitter()
+        if voice:
+            record.streams.append(deltas)
         async for chunk in self._inner:
-            if chunk.kind == "spoken":
-                if self._record.first_spoken_ms is None:
-                    since = time.perf_counter() - self._record.requested
-                    self._record.first_spoken_ms = int(since * 1000)
+            if voice and chunk.kind == "spoken":
+                if record.first_spoken_ms is None:
+                    record.first_spoken_ms = int((time.perf_counter() - record.requested) * 1000)
+                head.feed(chunk.text)
+                if head.brief is not None and record.brief is None:
+                    record.brief = head.brief
+                    record.brief_at = time.perf_counter()
                 deltas.append(chunk.text)
             yield chunk
-        if self._inner.usage is not None:
-            self._ledger.add(self._inner.usage)
+        if not voice:
+            record.visual_first_chunk_ms = self._inner.first_chunk_ms
+        usage = self._inner.usage
+        if usage is None:
+            return
+        for ledger in self._ledgers:
+            ledger.add(usage)
+        if voice:
+            record.voice_usage = add_usage(record.voice_usage, usage)
+        else:
+            record.visual_usage = add_usage(record.visual_usage, usage)
 
 
 class MeteredReasoning:
     def __init__(self, inner: ReasoningClient) -> None:
         self._inner = inner
         self.ledger = UsageLedger()
+        self.ledgers = {"voice": UsageLedger(), "visual": UsageLedger()}
         self.record = TurnRecord()
 
     def begin(self) -> TurnRecord:
         self.record = TurnRecord()
         return self.record
 
-    def start_turn(self, *args: object, **kwargs: object) -> MeteredStream:
-        if self.record.requested is None:
-            self.record.requested = time.perf_counter()
-        return MeteredStream(self._inner.start_turn(*args, **kwargs), self.record, self.ledger)
+    def start_turn(
+        self,
+        prompt: TurnPrompt,
+        tools: Sequence[dict] | None = None,
+        effort: str | None = None,
+        max_tokens: int | None = None,
+        tool_choice: str | None = None,
+    ) -> MeteredStream:
+        record = self.record
+        if record.requested is None:
+            record.requested = time.perf_counter()
+        kind = "voice" if tool_choice is None else "visual"
+        if kind == "visual":
+            record.visual_task = asyncio.current_task()
+        inner = self._inner.start_turn(
+            prompt, tools=tools, effort=effort, max_tokens=max_tokens, tool_choice=tool_choice
+        )
+        return MeteredStream(inner, record, (self.ledger, self.ledgers[kind]), kind)
 
     async def aclose(self) -> None:
         await self._inner.aclose()
@@ -370,6 +484,7 @@ class BenchTransport(Connection):
         self._track = pc.getSenders()[0].track
         self._synth = synth
         self.ledger: list[Enqueued] = []
+        self.pushes: list[Push] = []
         self.frames: list[tuple[float, bool]] = []
         self.emitted = asyncio.Event()
 
@@ -379,7 +494,9 @@ class BenchTransport(Connection):
         await super().play(floored(pcm))
 
     async def send_json(self, payload: dict[str, object]) -> None:
-        return None
+        if payload["type"] in PUSH_TYPES:
+            at = time.perf_counter()
+            self.pushes.append(Push(at, str(payload["type"]), str(payload["title"])))
 
     async def drain(self) -> None:
         while True:
@@ -418,6 +535,15 @@ class OutcomeWatch(logging.Filter):
             await self.event.wait()
 
 
+async def settle_visual(turn_id: str, timeout_s: float) -> bool:
+    name = f"{turn_id}-visual"
+    task = next((t for t in asyncio.all_tasks() if t.get_name() == name), None)
+    if task is None:
+        return False
+    done, _ = await asyncio.wait({task}, timeout=timeout_s)
+    return bool(done)
+
+
 class Bench:
     def __init__(
         self,
@@ -429,6 +555,7 @@ class Bench:
         synth: TaggedSynth,
         watch: OutcomeWatch,
         loop: TurnLoop,
+        visual_timeout_s: float,
     ) -> None:
         self._loop_task = loop_task
         self._drain_task = drain_task
@@ -438,11 +565,14 @@ class Bench:
         self._synth = synth
         self._watch = watch
         self._loop = loop
+        self._visual_timeout_s = visual_timeout_s
         self._dispatched = 0
 
     @classmethod
-    async def boot(cls, cfg: Settings, root: Path, subject: str) -> "Bench":
-        request = SessionRequest(subject=subject, folder=root)
+    async def boot(
+        cls, cfg: Settings, root: Path | None, subject: str, starting_from: str
+    ) -> "Bench":
+        request = SessionRequest(subject=subject, folder=root, starting_from=starting_from)
         loaded = await asyncio.to_thread(load_models)
         synth = TaggedSynth(loaded.synth)
         models = Models(partial=loaded.partial, final=loaded.final, synth=synth)
@@ -454,7 +584,17 @@ class Bench:
         logging.getLogger("tutor.session").addFilter(watch)
         loop_task = asyncio.create_task(loop.run(), name="bench-loop")
         drain_task = asyncio.create_task(transport.drain(), name="bench-drain")
-        return cls(loop_task, drain_task, source, transport, reasoning, synth, watch, loop)
+        return cls(
+            loop_task,
+            drain_task,
+            source,
+            transport,
+            reasoning,
+            synth,
+            watch,
+            loop,
+            cfg.visual_timeout_s,
+        )
 
     async def turn(self, text: str) -> Sample:
         transport = self._transport
@@ -462,6 +602,7 @@ class Bench:
         since = len(transport.frames)
         await transport.wait_frames(lambda: transport.idle_since(since))
         ledger_since = len(transport.ledger)
+        pushes_since = len(transport.pushes)
         record = self.reasoning.begin()
         self._synth.last = None
         self._dispatched += 1
@@ -483,16 +624,41 @@ class Bench:
             )
         )
 
+        await settle_visual(turn_id, self._visual_timeout_s)
+
         real_times = transport.real_times_since(since)
         first_sound = real_times[0] if real_times else None
         substance = substance_frame_time(lengths, m, real_times) if m is not None else None
         before = played[:m] if m is not None else played
+        pushes = transport.pushes[pushes_since:]
+        task = record.visual_task
+        result = None
+        if task is not None and task.done() and not task.cancelled() and task.exception() is None:
+            result = task.result()
+        brief_at = record.brief_at
+        voice, visual = record.voice_usage, record.visual_usage
+        if task is None:
+            visual_usd = 0.0
+        elif visual is None:
+            visual_usd = None
+        else:
+            visual_usd = turn_cost_usd(visual, list_price=True)
         return Sample(
             first_sound_ms=None if first_sound is None else int((first_sound - t0) * 1000),
             substance_ms=None if substance is None else int((substance - t0) * 1000),
-            first_spoken_delta_ms=record.first_spoken_ms,
+            first_content_delta_ms=record.first_spoken_ms,
             stages=max(sum(1 for entry in before if entry.text is not None) - 1, 0),
             silent=m is None,
+            brief=record.brief.kind if record.brief is not None else None,
+            brief_gap_ms=(
+                None if m is None or brief_at is None else int((played[m].at - brief_at) * 1000)
+            ),
+            visual_landed_ms=None if not pushes else int((pushes[0].at - t0) * 1000),
+            visual_valid=None if task is None else result is not None and is_valid(result),
+            visual_truncated=result is not None and is_truncated(result),
+            audio_ms=sum(entry.samples for entry in played) * 1000 // TTS_SAMPLE_RATE,
+            voice_usd=None if voice is None else turn_cost_usd(voice, list_price=True),
+            visual_usd=visual_usd,
         )
 
     async def aclose(self) -> None:
@@ -513,49 +679,107 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--samples", type=int, default=SAMPLES)
     parser.add_argument("--soak", type=int, default=None)
-    parser.add_argument("--subject", default=SUBJECT)
-    parser.add_argument("--root", type=Path, default=REPO / "tests" / "data" / "fixture_repo")
+    parser.add_argument("--subject", default=None)
+    parser.add_argument("--root", type=Path, default=None)
+    parser.add_argument("--starting-from", default=STARTING_FROM)
     parser.add_argument("--model", default=None)
     return parser
 
 
+def ledger_line(prefix: str, ledger: UsageLedger) -> str:
+    return (
+        f"{prefix}turns={ledger.turns} prompt_tokens={ledger.total.prompt_tokens} "
+        f"completion_tokens={ledger.total.completion_tokens} "
+        f"cost_usd={ledger.cost_usd():.6f} list_usd={ledger.cost_usd(list_price=True):.6f}"
+    )
+
+
 def report(
-    cfg: Settings, args: argparse.Namespace, samples: list[Sample], ledger: UsageLedger
+    cfg: Settings, args: argparse.Namespace, samples: list[Sample], reasoning: MeteredReasoning
 ) -> None:
     print(
         "time to first sound: first 48 kHz frame carrying the first synthesized clause leaving "
-        "the playout track after the scripted EndOfTurn is injected; excludes endpointing, "
-        "recognition and the browser."
+        "the playout track after the scripted EndOfTurn is injected; this is the first spoken "
+        "word. Excludes endpointing, recognition and the browser."
     )
     print(
         "time to substance: frame carrying the first sample synthesized from a model-authored "
         "clause; the lead-in and stage sentences do not count. Frame granularity 20 ms."
     )
     print(
+        "first content delta: the model's first spoken delta after the first request; it is the "
+        "head token when a brief is present."
+    )
+    print(
+        "a visual lands when its diagram.push or app.push payload reaches Connection.send_json "
+        "after the EndOfTurn; brief to first clause runs from the head closing to the first "
+        "model clause reaching Connection.play. Visuals are serialized: each turn waits for its "
+        "own visual task, up to visual_timeout_s, before the next turn is injected, so a visual "
+        "never runs under the following turn's voice call and nothing is superseded."
+    )
+    print(
         "a one-LSB floor is applied to every buffer before playout so an all-zero frame is exactly "
         "padding; it is inaudible and only serves attribution."
     )
     print(
+        "cost is list price from the usage chunk that ends each stream; a stream cancelled or "
+        "failed before that chunk has an unknown cost and is left out of the cost lines."
+    )
+    print(
         f"model={cfg.reasoning_model}  samples={len(samples)} (plus {WARMUP} discarded warm-ups)  "
-        f"subject={args.subject!r}  root={args.root}"
+        f"subject={subject_for(args.root, args.subject)!r}  root={args.root}  "
+        f"starting_from={args.starting_from!r}  visual_timeout_s={cfg.visual_timeout_s}  "
+        f"visual_max_tokens={cfg.visual_max_tokens}"
     )
     summarize(
         "time to first sound", [s.first_sound_ms for s in samples if s.first_sound_ms is not None]
     )
     summarize("time to substance", [s.substance_ms for s in samples if s.substance_ms is not None])
     summarize(
-        "first spoken delta (model, from first request)",
-        [s.first_spoken_delta_ms for s in samples if s.first_spoken_delta_ms is not None],
+        "first content delta (model, from first request)",
+        [s.first_content_delta_ms for s in samples if s.first_content_delta_ms is not None],
     )
+    landed = [s for s in samples if s.visual_landed_ms is not None]
+    summarize("visual landing", [s.visual_landed_ms for s in landed])
+    summarize("audio length, those turns", [s.audio_ms for s in landed])
+    summarize(
+        "brief to first clause", [s.brief_gap_ms for s in samples if s.brief_gap_ms is not None]
+    )
+    priced = [s for s in samples if s.voice_usd is not None and s.visual_usd is not None]
+    summarize_usd("cost per turn (list)", [s.voice_usd + s.visual_usd for s in priced])
+    summarize_usd(
+        "voice cost per turn (list)", [s.voice_usd for s in samples if s.voice_usd is not None]
+    )
+    summarize_usd(
+        "visual cost per turn (list)", [s.visual_usd for s in samples if s.visual_usd is not None]
+    )
+    print(f"turns with unknown cost {len(samples) - len(priced)}/{len(samples)}")
     stages = [s.stages for s in samples if not s.silent]
     if stages:
         print(f"stage sentences before substance median={int(statistics.median(stages))}")
     silent = sum(1 for s in samples if s.silent)
     print(f"silent turns {silent}/{len(samples)}")
+    briefed = sum(1 for s in samples if s.brief is not None)
+    calls = [s for s in samples if s.brief in ("diagram", "app")]
+    print(f"turns with a brief {briefed}/{len(samples)}")
+    print(f"visual calls {len(calls)}/{len(samples)}")
+    print(f"visuals landed {len(landed)}/{len(calls)}")
+    print(f"visuals valid {sum(1 for s in calls if s.visual_valid)}/{len(calls)}")
+    print(f"visuals truncated {sum(1 for s in calls if s.visual_truncated)}/{len(calls)}")
+    print(ledger_line("", reasoning.ledger))
+    print(ledger_line("voice ", reasoning.ledgers["voice"]))
+    print(ledger_line("visual ", reasoning.ledgers["visual"]))
+
+
+def summarize_usd(label: str, values: list[float]) -> None:
+    if not values:
+        print(f"{label:34s} no samples")
+        return
+    ordered = sorted(values)
+    p95 = ordered[max(0, int(len(ordered) * 0.95) - 1)]
     print(
-        f"turns={ledger.turns} prompt_tokens={ledger.total.prompt_tokens} "
-        f"completion_tokens={ledger.total.completion_tokens} "
-        f"cost_usd={ledger.cost_usd():.6f} list_usd={ledger.cost_usd(list_price=True):.6f}"
+        f"{label:34s} n={len(ordered):3d} median={statistics.median(ordered):.6f} "
+        f"p95={p95:.6f} min={ordered[0]:.6f} max={ordered[-1]:.6f}"
     )
 
 
@@ -591,7 +815,10 @@ def report_soak(
         "pressure level (Nominal, Moderate, Heavy, Trapping, Sleeping) and the P-cluster active "
         "frequency are the throttling signals."
     )
-    print(f"model={cfg.reasoning_model}  subject={args.subject!r}  root={args.root}")
+    print(
+        f"model={cfg.reasoning_model}  subject={subject_for(args.root, args.subject)!r}  "
+        f"root={args.root}  starting_from={args.starting_from!r}"
+    )
     summarize_series("cpu power", [r.power.cpu_power_mw for r in records], "mW")
     summarize_series("combined power", [r.power.combined_power_mw for r in records], "mW")
     summarize_series("p-cluster frequency", [r.power.p_cluster_mhz for r in records], "MHz")
@@ -620,16 +847,21 @@ def report_soak(
     summarize(f"substance, first {SOAK_EDGE_MIN} min", present(head, lambda s: s.substance_ms))
     summarize(f"substance, last {SOAK_EDGE_MIN} min", present(tail, lambda s: s.substance_ms))
     summarize(
-        "first spoken delta (model, from first request)",
-        present(samples, lambda s: s.first_spoken_delta_ms),
+        "first content delta (model, from first request)",
+        present(samples, lambda s: s.first_content_delta_ms),
     )
     print(f"turns={len(samples)}")
     silent = sum(1 for s in samples if s.silent)
     print(f"silent turns {silent}/{len(samples)}")
-    print(
-        f"turns={ledger.turns} prompt_tokens={ledger.total.prompt_tokens} "
-        f"completion_tokens={ledger.total.completion_tokens} "
-        f"cost_usd={ledger.cost_usd():.6f} list_usd={ledger.cost_usd(list_price=True):.6f}"
+    print(ledger_line("", ledger))
+
+
+def turn_line(sample: Sample) -> str:
+    return (
+        f"first_sound_ms={sample.first_sound_ms} substance_ms={sample.substance_ms} "
+        f"stages={sample.stages} silent={sample.silent} brief={sample.brief} "
+        f"visual_landed_ms={sample.visual_landed_ms} visual_valid={sample.visual_valid} "
+        f"visual_truncated={sample.visual_truncated} audio_ms={sample.audio_ms}"
     )
 
 
@@ -642,7 +874,9 @@ async def soak(cfg: Settings, args: argparse.Namespace) -> int:
                 "never under sudo as a whole"
             )
             return 2
-        bench = await Bench.boot(cfg, args.root.resolve(), args.subject)
+        root = None if args.root is None else args.root.resolve()
+        utterances = utterances_for(root)
+        bench = await Bench.boot(cfg, root, subject_for(root, args.subject), args.starting_from)
         turns: list[tuple[float, Sample]] = []
         try:
             print(f"soak start {await machine_state()}", flush=True)
@@ -650,14 +884,9 @@ async def soak(cfg: Settings, args: argparse.Namespace) -> int:
             sampler.rebase()
             while (at := time.perf_counter() - started) < args.soak * 60:
                 n = len(turns)
-                sample = await bench.turn(UTTERANCES[n % len(UTTERANCES)])
+                sample = await bench.turn(utterances[n % len(utterances)])
                 turns.append((at, sample))
-                print(
-                    f"turn={n + 1} t={int(at)}s first_sound_ms={sample.first_sound_ms} "
-                    f"substance_ms={sample.substance_ms} stages={sample.stages} "
-                    f"silent={sample.silent}",
-                    file=sys.stderr,
-                )
+                print(f"turn={n + 1} t={int(at)}s {turn_line(sample)}", file=sys.stderr)
             print(f"soak end {await machine_state()}", flush=True)
         finally:
             await bench.aclose()
@@ -681,22 +910,19 @@ async def main() -> int:
     if args.soak is not None:
         return await soak(cfg, args)
 
-    bench = await Bench.boot(cfg, args.root.resolve(), args.subject)
+    root = None if args.root is None else args.root.resolve()
+    utterances = utterances_for(root)
+    bench = await Bench.boot(cfg, root, subject_for(root, args.subject), args.starting_from)
     samples: list[Sample] = []
     try:
         for n in range(WARMUP + args.samples):
-            sample = await bench.turn(UTTERANCES[n % len(UTTERANCES)])
+            sample = await bench.turn(utterances[n % len(utterances)])
             if n >= WARMUP:
                 samples.append(sample)
-            print(
-                f"turn={n + 1}/{WARMUP + args.samples} first_sound_ms={sample.first_sound_ms} "
-                f"substance_ms={sample.substance_ms} stages={sample.stages} "
-                f"silent={sample.silent}",
-                file=sys.stderr,
-            )
+            print(f"turn={n + 1}/{WARMUP + args.samples} {turn_line(sample)}", file=sys.stderr)
     finally:
         await bench.aclose()
-    report(cfg, args, samples, bench.reasoning.ledger)
+    report(cfg, args, samples, bench.reasoning)
     return 0
 
 
