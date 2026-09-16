@@ -1,7 +1,10 @@
 """End to end turn latency through the real stack: scripted text in, timestamped 48 kHz frames
 out of the playout track. Reports time to first sound, time to substance, the visual's landing
 and validity, and the cost per turn. Without ``--root`` the turns are a concept lesson on PPO;
-with it they walk the fixture repo, the only tree searched. Text only on the wire. ``--soak
+with it they walk the fixture repo, the only tree searched. Text only on the wire. ``--history``
+takes one or more of stripped, head and head-tail and runs one fresh session per arm, rewriting
+the history the model sees on the retained arms; each turn's head and tail text and classes are
+appended to the capture file (``--capture``, default ``scratch/bench/replies.jsonl``). ``--soak
 MINUTES`` runs the same turns for a stated number of minutes while sampling power, thermal
 pressure, cluster frequency, process RSS and swap.
 """
@@ -9,6 +12,7 @@ pressure, cluster frequency, process RSS and swap.
 import argparse
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import statistics
@@ -28,15 +32,16 @@ sys.path.insert(0, str(REPO))
 
 from scripts.bench_llm import summarize
 from tutor.app import Models, build_loop, load_models
-from tutor.brief import BriefSplitter, VisualBrief
+from tutor.brief import BRIEF_END, BRIEF_LIMIT, BRIEF_MARKER, BriefSplitter, VisualBrief
 from tutor.chunker import Scrubber
 from tutor.config import Settings, settings
 from tutor.constants import TTS_SAMPLE_RATE, WEBRTC_FRAME_SAMPLES, WEBRTC_SAMPLE_RATE
 from tutor.cost import TurnUsage, UsageLedger, turn_cost_usd
 from tutor.input_path import EndOfTurn, InputEvent
-from tutor.prompt import TurnPrompt
+from tutor.pedagogy import TurnOutcome
+from tutor.prompt import Message, TurnPrompt
 from tutor.reasoning import ReasoningClient, TurnChunk, TurnStream
-from tutor.session import OutcomeSplitter, TurnLoop
+from tutor.session import OUTCOME_MARKER, OutcomeSplitter, TurnLoop
 from tutor.signaling import SessionRequest
 from tutor.transport import Connection
 from tutor.tts import KokoroSynthesizer
@@ -75,6 +80,22 @@ PPO_UTTERANCES = (
     "just tell me",
 )
 PUSH_TYPES = frozenset({"diagram.push", "app.push"})
+ARMS = ("stripped", "head", "head-tail")
+CAPTURE_DIR = REPO / "scratch" / "bench"
+TAIL_LIMIT = 600
+HEAD_CLASSES = ("at_start", "late", "malformed", "absent")
+TAIL_CLASSES = (
+    "ok",
+    "wrapped",
+    "signal",
+    "settling",
+    "settling_positions",
+    "not_json",
+    "no_marker",
+)
+TAIL_FAULTS = ("signal", "settling", "settling_positions")
+TAIL_FLAGS = ("prefixed", "trailing")
+SIGNALS = ("covered", "follow_up", "correct", "misconception", "told")
 
 
 def utterances_for(root: Path | None) -> tuple[str, ...]:
@@ -138,6 +159,146 @@ def floored(pcm: np.ndarray) -> np.ndarray:
     return np.where(pcm == 0, 1, pcm).astype(np.int16)
 
 
+class HeadRead(NamedTuple):
+    kind: str
+    text: str | None
+
+
+class TailRead(NamedTuple):
+    kind: str
+    flags: frozenset[str]
+    faults: frozenset[str]
+    text: str | None
+    signal: str | None
+
+
+class Retained(NamedTuple):
+    head: str | None
+    tail: str | None
+
+
+def classify_head(reply: str) -> HeadRead:
+    splitter = BriefSplitter()
+    splitter.feed(reply)
+    splitter.finish()
+    at = reply.find(BRIEF_MARKER)
+    if at < 0:
+        return HeadRead("absent", None)
+    close = reply.find(BRIEF_END, at)
+    if close >= 0:
+        text = reply[at : close + len(BRIEF_END)]
+    else:
+        body = reply[at + len(BRIEF_MARKER) :]
+        stripped = body.lstrip()
+        try:
+            _, end = json.JSONDecoder().raw_decode(stripped)
+        except json.JSONDecodeError:
+            text = reply[at : at + BRIEF_LIMIT]
+        else:
+            text = reply[at : at + len(BRIEF_MARKER) + len(body) - len(stripped) + end]
+    if not reply.lstrip().startswith(BRIEF_MARKER):
+        return HeadRead("late", text)
+    return HeadRead("at_start" if splitter.brief is not None else "malformed", text)
+
+
+def classify_tail(reply: str) -> TailRead:
+    head = BriefSplitter()
+    released = head.feed(reply) + head.finish()
+    at = released.find(OUTCOME_MARKER)
+    if at < 0:
+        return TailRead("no_marker", frozenset(), frozenset(), None, None)
+    tail = released[at + len(OUTCOME_MARKER) :].strip()
+    body: dict | None = None
+    flags: set[str] = set()
+    brace = tail.find("{")
+    if brace >= 0:
+        with contextlib.suppress(json.JSONDecodeError):
+            decoded, end = json.JSONDecoder().raw_decode(tail, brace)
+            if isinstance(decoded, dict):
+                body = decoded
+                if brace:
+                    flags.add("prefixed")
+                if end < len(tail):
+                    flags.add("trailing")
+    with contextlib.suppress(ValidationError):
+        outcome = TurnOutcome.model_validate_json(tail)
+        return TailRead("ok", frozenset(flags), frozenset(), tail, outcome.signal)
+    if body is None:
+        return TailRead("not_json", frozenset(), frozenset(), tail, None)
+    try:
+        TurnOutcome.model_validate(body)
+    except ValidationError as error:
+        faults = [str(item["loc"][0]) for item in error.errors()]
+        return TailRead(faults[0], frozenset(flags), frozenset(faults), tail, None)
+    return TailRead("wrapped", frozenset(flags), frozenset(), tail, None)
+
+
+def retained_history(
+    history: list[Message], retained: Sequence[Retained], before: int, arm: str
+) -> list[Message]:
+    if arm == "stripped":
+        return history
+    turn = before - sum(1 for message in history if message.role == "user") - 1
+    rewritten: list[Message] = []
+    for message in history:
+        if message.role == "user":
+            turn += 1
+        elif message.role == "assistant":
+            kept = retained[turn - 1]
+            parts = [kept.head, message.content, kept.tail if arm == "head-tail" else None]
+            content = "\n".join(part for part in parts if part is not None)
+            message = message.model_copy(update={"content": content})
+        rewritten.append(message)
+    return rewritten
+
+
+def heads_after_first_retained(
+    heads: Sequence[str], retained: Sequence[str | None], window: int, warmup: int
+) -> tuple[int, int]:
+    seen = 0
+    at_start = 0
+    for n in range(warmup, len(heads)):
+        if any(line is not None for line in retained[max(0, n - window) : n]):
+            seen += 1
+            at_start += heads[n] == "at_start"
+    return at_start, seen
+
+
+class Capture:
+    def __init__(self, path: Path, started: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = path.open("a", encoding="ascii")
+        self._started = started
+
+    def write(
+        self,
+        arm: str,
+        turn: int,
+        utterance: int,
+        sample: bool,
+        head: HeadRead,
+        tail: TailRead,
+        reply_chars: int,
+    ) -> None:
+        line = {
+            "started": self._started,
+            "arm": arm,
+            "turn": turn,
+            "utterance": utterance,
+            "sample": sample,
+            "head_class": head.kind,
+            "head": head.text,
+            "tail_class": tail.kind,
+            "tail_flags": sorted(tail.flags),
+            "tail_faults": sorted(tail.faults),
+            "tail": tail.text,
+            "signal": tail.signal,
+            "reply_chars": reply_chars,
+        }
+        self._file.write(json.dumps(line, ensure_ascii=True) + "\n")
+        self._file.flush()
+
+
 class Sample(BaseModel):
     first_sound_ms: int | None
     substance_ms: int | None
@@ -152,6 +313,12 @@ class Sample(BaseModel):
     audio_ms: int
     voice_usd: float | None
     visual_usd: float | None
+    utterance: int
+    head: str
+    tail: str
+    tail_flags: list[str]
+    tail_faults: list[str]
+    signal: str | None
 
 
 class Enqueued(NamedTuple):
@@ -360,6 +527,7 @@ class ScriptedSource:
 
 class TurnRecord:
     def __init__(self) -> None:
+        self.turn = 0
         self.streams: list[list[str]] = []
         self.requested: float | None = None
         self.first_spoken_ms: int | None = None
@@ -434,14 +602,17 @@ class MeteredStream:
 
 
 class MeteredReasoning:
-    def __init__(self, inner: ReasoningClient) -> None:
+    def __init__(self, inner: ReasoningClient, arm: str = "stripped") -> None:
         self._inner = inner
+        self.arm = arm
+        self.retained: list[Retained] = []
         self.ledger = UsageLedger()
         self.ledgers = {"voice": UsageLedger(), "visual": UsageLedger()}
         self.record = TurnRecord()
 
-    def begin(self) -> TurnRecord:
+    def begin(self, turn: int = 0) -> TurnRecord:
         self.record = TurnRecord()
+        self.record.turn = turn
         return self.record
 
     def start_turn(
@@ -458,6 +629,11 @@ class MeteredReasoning:
         kind = "voice" if tool_choice is None else "visual"
         if kind == "visual":
             record.visual_task = asyncio.current_task()
+        prompt = prompt.model_copy(
+            update={
+                "history": retained_history(prompt.history, self.retained, record.turn, self.arm)
+            }
+        )
         inner = self._inner.start_turn(
             prompt, tools=tools, effort=effort, max_tokens=max_tokens, tool_choice=tool_choice
         )
@@ -556,6 +732,7 @@ class Bench:
         watch: OutcomeWatch,
         loop: TurnLoop,
         visual_timeout_s: float,
+        capture: Capture | None,
     ) -> None:
         self._loop_task = loop_task
         self._drain_task = drain_task
@@ -566,17 +743,24 @@ class Bench:
         self._watch = watch
         self._loop = loop
         self._visual_timeout_s = visual_timeout_s
+        self._capture = capture
         self._dispatched = 0
 
     @classmethod
     async def boot(
-        cls, cfg: Settings, root: Path | None, subject: str, starting_from: str
+        cls,
+        cfg: Settings,
+        root: Path | None,
+        subject: str,
+        starting_from: str,
+        arm: str = "stripped",
+        capture: Capture | None = None,
     ) -> "Bench":
         request = SessionRequest(subject=subject, folder=root, starting_from=starting_from)
         loaded = await asyncio.to_thread(load_models)
         synth = TaggedSynth(loaded.synth)
         models = Models(partial=loaded.partial, final=loaded.final, synth=synth)
-        reasoning = MeteredReasoning(ReasoningClient(cfg))
+        reasoning = MeteredReasoning(ReasoningClient(cfg), arm)
         transport = BenchTransport(synth)
         source = ScriptedSource()
         loop = build_loop(cfg, models, reasoning, source, transport, request)
@@ -594,18 +778,19 @@ class Bench:
             watch,
             loop,
             cfg.visual_timeout_s,
+            capture,
         )
 
-    async def turn(self, text: str) -> Sample:
+    async def turn(self, text: str, utterance: int = 0, sample: bool = True) -> Sample:
         transport = self._transport
         transport.flush_playout()
         since = len(transport.frames)
         await transport.wait_frames(lambda: transport.idle_since(since))
         ledger_since = len(transport.ledger)
         pushes_since = len(transport.pushes)
-        record = self.reasoning.begin()
-        self._synth.last = None
         self._dispatched += 1
+        record = self.reasoning.begin(turn=self._dispatched)
+        self._synth.last = None
         turn_id = f"turn-{self._dispatched}"
 
         t0 = time.perf_counter()
@@ -625,6 +810,21 @@ class Bench:
         )
 
         await settle_visual(turn_id, self._visual_timeout_s)
+
+        reply = "\n".join("".join(deltas) for deltas in record.streams)
+        head = classify_head(reply)
+        tail = classify_tail(reply)
+        if self._capture is not None:
+            self._capture.write(
+                self.reasoning.arm, self._dispatched, utterance, sample, head, tail, len(reply)
+            )
+        head_line = None
+        if record.brief is not None:
+            head_line = BRIEF_MARKER + record.brief.model_dump_json() + BRIEF_END
+        tail_line = None
+        if tail.kind != "no_marker":
+            tail_line = OUTCOME_MARKER + tail.text[:TAIL_LIMIT]
+        self.reasoning.retained.append(Retained(head_line, tail_line))
 
         real_times = transport.real_times_since(since)
         first_sound = real_times[0] if real_times else None
@@ -659,6 +859,12 @@ class Bench:
             audio_ms=sum(entry.samples for entry in played) * 1000 // TTS_SAMPLE_RATE,
             voice_usd=None if voice is None else turn_cost_usd(voice, list_price=True),
             visual_usd=visual_usd,
+            utterance=utterance,
+            head=head.kind,
+            tail=tail.kind,
+            tail_flags=sorted(tail.flags),
+            tail_faults=sorted(tail.faults),
+            signal=tail.signal,
         )
 
     async def aclose(self) -> None:
@@ -683,6 +889,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", type=Path, default=None)
     parser.add_argument("--starting-from", default=STARTING_FROM)
     parser.add_argument("--model", default=None)
+    parser.add_argument("--history", nargs="+", choices=ARMS, default=["stripped"])
+    parser.add_argument("--capture", type=Path, default=None)
     return parser
 
 
@@ -695,7 +903,12 @@ def ledger_line(prefix: str, ledger: UsageLedger) -> str:
 
 
 def report(
-    cfg: Settings, args: argparse.Namespace, samples: list[Sample], reasoning: MeteredReasoning
+    cfg: Settings,
+    args: argparse.Namespace,
+    samples: list[Sample],
+    warmups: list[Sample],
+    reasoning: MeteredReasoning,
+    arm: str,
 ) -> None:
     print(
         "time to first sound: first 48 kHz frame carrying the first synthesized clause leaving "
@@ -726,7 +939,8 @@ def report(
         "failed before that chunk has an unknown cost and is left out of the cost lines."
     )
     print(
-        f"model={cfg.reasoning_model}  samples={len(samples)} (plus {WARMUP} discarded warm-ups)  "
+        f"model={cfg.reasoning_model}  arm={arm}  samples={len(samples)} "
+        f"(plus {WARMUP} discarded warm-ups)  "
         f"subject={subject_for(args.root, args.subject)!r}  root={args.root}  "
         f"starting_from={args.starting_from!r}  visual_timeout_s={cfg.visual_timeout_s}  "
         f"visual_max_tokens={cfg.visual_max_tokens}"
@@ -766,6 +980,36 @@ def report(
     print(f"visuals landed {len(landed)}/{len(calls)}")
     print(f"visuals valid {sum(1 for s in calls if s.visual_valid)}/{len(calls)}")
     print(f"visuals truncated {sum(1 for s in calls if s.visual_truncated)}/{len(calls)}")
+    n = len(samples)
+    heads = Counter(s.head for s in samples)
+    print(f"arm={arm} heads " + " ".join(f"{kind}={heads[kind]}/{n}" for kind in HEAD_CLASSES))
+    warm = sum(1 for s in warmups if s.head == "at_start")
+    print(f"arm={arm} heads on warm-ups {warm}/{len(warmups)}")
+    kept, saw = heads_after_first_retained(
+        [s.head for s in [*warmups, *samples]],
+        [r.head for r in reasoning.retained],
+        cfg.history_turns,
+        len(warmups),
+    )
+    print(f"arm={arm} heads after first retained head {kept}/{saw}")
+    by_utterance = " ".join(
+        f"{u}:{sum(1 for s in samples if s.utterance == u and s.head == 'at_start')}"
+        f"/{sum(1 for s in samples if s.utterance == u)}"
+        for u in range(len(utterances_for(args.root)))
+    )
+    print(f"arm={arm} heads by utterance {by_utterance}")
+    tails = Counter(s.tail for s in samples)
+    print(f"arm={arm} tails " + " ".join(f"{kind}={tails[kind]}/{n}" for kind in TAIL_CLASSES))
+    faults = Counter(fault for s in samples for fault in s.tail_faults)
+    print(f"arm={arm} tail faults " + " ".join(f"{f}={faults[f]}" for f in TAIL_FAULTS))
+    flags = Counter(flag for s in samples for flag in s.tail_flags)
+    print(f"arm={arm} tail flags " + " ".join(f"{f}={flags[f]}/{n}" for f in TAIL_FLAGS))
+    signals = Counter(s.signal for s in samples if s.tail == "ok")
+    print(
+        f"arm={arm} signals "
+        + " ".join(f"{signal}={signals[signal]}" for signal in SIGNALS)
+        + f" null={signals[None]}"
+    )
     print(ledger_line("", reasoning.ledger))
     print(ledger_line("voice ", reasoning.ledgers["voice"]))
     print(ledger_line("visual ", reasoning.ledgers["visual"]))
@@ -860,6 +1104,7 @@ def turn_line(sample: Sample) -> str:
     return (
         f"first_sound_ms={sample.first_sound_ms} substance_ms={sample.substance_ms} "
         f"stages={sample.stages} silent={sample.silent} brief={sample.brief} "
+        f"head={sample.head} tail={sample.tail} "
         f"visual_landed_ms={sample.visual_landed_ms} visual_valid={sample.visual_valid} "
         f"visual_truncated={sample.visual_truncated} audio_ms={sample.audio_ms}"
     )
@@ -884,7 +1129,7 @@ async def soak(cfg: Settings, args: argparse.Namespace) -> int:
             sampler.rebase()
             while (at := time.perf_counter() - started) < args.soak * 60:
                 n = len(turns)
-                sample = await bench.turn(utterances[n % len(utterances)])
+                sample = await bench.turn(utterances[n % len(utterances)], n % len(utterances))
                 turns.append((at, sample))
                 print(f"turn={n + 1} t={int(at)}s {turn_line(sample)}", file=sys.stderr)
             print(f"soak end {await machine_state()}", flush=True)
@@ -912,17 +1157,28 @@ async def main() -> int:
 
     root = None if args.root is None else args.root.resolve()
     utterances = utterances_for(root)
-    bench = await Bench.boot(cfg, root, subject_for(root, args.subject), args.starting_from)
-    samples: list[Sample] = []
-    try:
-        for n in range(WARMUP + args.samples):
-            sample = await bench.turn(utterances[n % len(utterances)])
-            if n >= WARMUP:
-                samples.append(sample)
-            print(f"turn={n + 1}/{WARMUP + args.samples} {turn_line(sample)}", file=sys.stderr)
-    finally:
-        await bench.aclose()
-    report(cfg, args, samples, bench.reasoning)
+    started = time.strftime("%Y-%m-%dT%H:%M:%S")
+    capture = Capture(
+        CAPTURE_DIR / "replies.jsonl" if args.capture is None else args.capture, started
+    )
+    total = WARMUP + args.samples
+    for arm in args.history:
+        bench = await Bench.boot(
+            cfg, root, subject_for(root, args.subject), args.starting_from, arm, capture
+        )
+        samples: list[Sample] = []
+        warmups: list[Sample] = []
+        try:
+            print(f"arm={arm} start {await machine_state()}", flush=True)
+            for n in range(total):
+                sample = await bench.turn(
+                    utterances[n % len(utterances)], n % len(utterances), n >= WARMUP
+                )
+                (samples if n >= WARMUP else warmups).append(sample)
+                print(f"arm={arm} turn={n + 1}/{total} {turn_line(sample)}", file=sys.stderr)
+        finally:
+            await bench.aclose()
+        report(cfg, args, samples, warmups, bench.reasoning, arm)
     return 0
 
 
