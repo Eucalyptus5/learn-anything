@@ -63,6 +63,7 @@ POWERMETRICS_FIELDS = {
     "Current pressure level": "pressure",
 }
 OUTBOUND_RATIO = WEBRTC_SAMPLE_RATE // TTS_SAMPLE_RATE
+SILENT_FRAME_SAMPLES = TTS_SAMPLE_RATE // 50
 UTTERANCES = (
     "walk me through how the http client gets a connection",
     "what happens when the pool is exhausted",
@@ -643,8 +644,13 @@ class MeteredReasoning:
         await self._inner.aclose()
 
 
+class SilentSynth:
+    def synthesize(self, text: str) -> np.ndarray:
+        return np.zeros(SILENT_FRAME_SAMPLES, dtype=np.int16)
+
+
 class TaggedSynth:
-    def __init__(self, inner: KokoroSynthesizer) -> None:
+    def __init__(self, inner: KokoroSynthesizer | SilentSynth) -> None:
         self._inner = inner
         self.last: str | None = None
 
@@ -755,10 +761,11 @@ class Bench:
         starting_from: str,
         arm: str = "stripped",
         capture: Capture | None = None,
+        silent: bool = False,
     ) -> "Bench":
         request = SessionRequest(subject=subject, folder=root, starting_from=starting_from)
         loaded = await asyncio.to_thread(load_models)
-        synth = TaggedSynth(loaded.synth)
+        synth = TaggedSynth(SilentSynth() if silent else loaded.synth)
         models = Models(partial=loaded.partial, final=loaded.final, synth=synth)
         reasoning = MeteredReasoning(ReasoningClient(cfg), arm)
         transport = BenchTransport(synth)
@@ -891,6 +898,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None)
     parser.add_argument("--history", nargs="+", choices=ARMS, default=["stripped"])
     parser.add_argument("--capture", type=Path, default=None)
+    parser.add_argument("--silent-synth", action="store_true", default=False)
     return parser
 
 
@@ -938,25 +946,33 @@ def report(
         "cost is list price from the usage chunk that ends each stream; a stream cancelled or "
         "failed before that chunk has an unknown cost and is left out of the cost lines."
     )
+    synth_field = "  synth=silent" if args.silent_synth else ""
     print(
-        f"model={cfg.reasoning_model}  arm={arm}  samples={len(samples)} "
+        f"model={cfg.reasoning_model}  arm={arm}{synth_field}  samples={len(samples)} "
         f"(plus {WARMUP} discarded warm-ups)  "
         f"subject={subject_for(args.root, args.subject)!r}  root={args.root}  "
         f"starting_from={args.starting_from!r}  visual_timeout_s={cfg.visual_timeout_s}  "
         f"visual_max_tokens={cfg.visual_max_tokens}"
     )
-    summarize(
+
+    def measured(label: str, values: list[int]) -> None:
+        if args.silent_synth:
+            print(f"{label:34s} not measured")
+        else:
+            summarize(label, values)
+
+    measured(
         "time to first sound", [s.first_sound_ms for s in samples if s.first_sound_ms is not None]
     )
-    summarize("time to substance", [s.substance_ms for s in samples if s.substance_ms is not None])
+    measured("time to substance", [s.substance_ms for s in samples if s.substance_ms is not None])
     summarize(
         "first content delta (model, from first request)",
         [s.first_content_delta_ms for s in samples if s.first_content_delta_ms is not None],
     )
     landed = [s for s in samples if s.visual_landed_ms is not None]
     summarize("visual landing", [s.visual_landed_ms for s in landed])
-    summarize("audio length, those turns", [s.audio_ms for s in landed])
-    summarize(
+    measured("audio length, those turns", [s.audio_ms for s in landed])
+    measured(
         "brief to first clause", [s.brief_gap_ms for s in samples if s.brief_gap_ms is not None]
     )
     priced = [s for s in samples if s.voice_usd is not None and s.visual_usd is not None]
@@ -1164,7 +1180,13 @@ async def main() -> int:
     total = WARMUP + args.samples
     for arm in args.history:
         bench = await Bench.boot(
-            cfg, root, subject_for(root, args.subject), args.starting_from, arm, capture
+            cfg,
+            root,
+            subject_for(root, args.subject),
+            args.starting_from,
+            arm,
+            capture,
+            args.silent_synth,
         )
         samples: list[Sample] = []
         warmups: list[Sample] = []

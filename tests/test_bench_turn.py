@@ -120,6 +120,13 @@ def test_parser_defaults() -> None:
     assert args.starting_from == bench_turn.STARTING_FROM
     assert args.history == ["stripped"]
     assert args.capture is None
+    assert args.silent_synth is False
+
+
+def test_the_silent_synth_flag_parses() -> None:
+    args = bench_turn.build_parser().parse_args(["--silent-synth"])
+
+    assert args.silent_synth is True
 
 
 def test_the_history_flag_takes_several_arms() -> None:
@@ -158,6 +165,22 @@ def test_model_text_strips_the_brief_head() -> None:
     assert "<visual>" not in model
     assert "Clipped objective" not in model
     assert model.rstrip() == "The ratio is clipped, and the objective is flat past epsilon."
+
+
+def test_silent_synth_returns_one_frame_of_int16_zeros() -> None:
+    synth = bench_turn.SilentSynth()
+
+    frame = synth.synthesize("PPO clips.")
+
+    assert isinstance(frame, np.ndarray)
+    assert frame.dtype == np.int16
+    assert bench_turn.SILENT_FRAME_SAMPLES == 480
+    assert len(frame) == bench_turn.SILENT_FRAME_SAMPLES
+    assert not frame.any()
+
+    other = synth.synthesize("PPO clips.")
+    frame[0] = 1
+    assert other[0] == 0
 
 
 class ScriptedStream:
@@ -331,6 +354,95 @@ def test_a_sample_without_a_visual_reports_none(capsys) -> None:
     assert "n=  1 median=0.000100" in cost
     assert any(line.startswith("voice turns=0") for line in lines)
     assert any(line.startswith("visual turns=0") for line in lines)
+
+
+def test_a_silent_run_reports_the_audio_lines_as_not_measured(capsys) -> None:
+    cfg = Settings(_env_file=None, reasoning_api_base="http://x", reasoning_api_key="k")
+    args = bench_turn.build_parser().parse_args(["--silent-synth"])
+    sample = bench_turn.Sample(
+        first_sound_ms=900,
+        substance_ms=900,
+        first_content_delta_ms=600,
+        stages=0,
+        silent=False,
+        brief="diagram",
+        brief_gap_ms=700,
+        visual_landed_ms=1000,
+        visual_valid=True,
+        visual_truncated=False,
+        audio_ms=4000,
+        voice_usd=0.0001,
+        visual_usd=0.0,
+        utterance=0,
+        head="at_start",
+        tail="ok",
+        tail_flags=[],
+        tail_faults=[],
+        signal="covered",
+    )
+
+    bench_turn.report(
+        cfg, args, [sample], [], bench_turn.MeteredReasoning(ScriptedReasoning([])), "stripped"
+    )
+
+    lines = capsys.readouterr().out.splitlines()
+    (model,) = [line for line in lines if line.startswith("model=")]
+    assert "synth=silent" in model
+    for label in (
+        "time to first sound",
+        "time to substance",
+        "audio length, those turns",
+        "brief to first clause",
+    ):
+        (line,) = [line for line in lines if line.startswith(f"{label:34s}")]
+        assert line.endswith("not measured")
+    (delta,) = [
+        line
+        for line in lines
+        if line.startswith(f"{'first content delta (model, from first request)':34s}")
+    ]
+    assert not delta.endswith("not measured")
+    (landing,) = [line for line in lines if line.startswith(f"{'visual landing':34s}")]
+    assert not landing.endswith("not measured")
+    assert any(line.startswith("cost per turn (list)") for line in lines)
+    assert any(line.startswith("turns with unknown cost") for line in lines)
+    assert any(line.startswith("silent turns") for line in lines)
+
+
+def test_a_kokoro_run_leaves_the_model_line_alone(capsys) -> None:
+    cfg = Settings(_env_file=None, reasoning_api_base="http://x", reasoning_api_key="k")
+    args = bench_turn.build_parser().parse_args([])
+    sample = bench_turn.Sample(
+        first_sound_ms=900,
+        substance_ms=900,
+        first_content_delta_ms=600,
+        stages=0,
+        silent=False,
+        brief="diagram",
+        brief_gap_ms=700,
+        visual_landed_ms=1000,
+        visual_valid=True,
+        visual_truncated=False,
+        audio_ms=4000,
+        voice_usd=0.0001,
+        visual_usd=0.0,
+        utterance=0,
+        head="at_start",
+        tail="ok",
+        tail_flags=[],
+        tail_faults=[],
+        signal="covered",
+    )
+
+    bench_turn.report(
+        cfg, args, [sample], [], bench_turn.MeteredReasoning(ScriptedReasoning([])), "stripped"
+    )
+
+    lines = capsys.readouterr().out.splitlines()
+    (model,) = [line for line in lines if line.startswith("model=")]
+    assert "synth=" not in model
+    (first_sound,) = [line for line in lines if line.startswith(f"{'time to first sound':34s}")]
+    assert "n=  1" in first_sound
 
 
 def test_a_visual_without_a_usage_chunk_has_an_unknown_cost(capsys) -> None:
