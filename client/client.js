@@ -1,4 +1,4 @@
-import { mount, onPayload, receive, reset, show, theme } from "/visuals.js";
+import { entries, mount, onPayload, receive, reset, show, theme } from "/visuals.js";
 
 const app = document.querySelector(".app");
 const welcome = document.querySelector(".welcome");
@@ -32,6 +32,7 @@ const dark = matchMedia("(prefers-color-scheme: dark)");
 
 const handlers = new Map();
 const openHandlers = [];
+const turns = [];
 
 const state = {
   stage: "idle",
@@ -107,6 +108,7 @@ function begin() {
   say.value = "";
   caption.classList.remove("speaking");
   thread.replaceChildren();
+  turns.length = 0;
   liveText.textContent = "listening";
   phaseText.textContent = "teach";
   phaseChip.dataset.phase = "teach";
@@ -119,6 +121,53 @@ function sendTheme() {
   const name = dark.matches ? "dark" : "light";
   sendJson({ type: "theme", theme: name });
   theme(name);
+}
+
+function download(name, type, text) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function markdown() {
+  const lines = [`# ${card.subject}`, ""];
+  turns.forEach((turn, i) => {
+    lines.push(`## turn ${i + 1} (${turn.phase})`, "");
+    lines.push(`**you:** ${turn.learner}`, "");
+    lines.push(`**tutor:** ${turn.tutor.join(" ")}`, "");
+  });
+  lines.push("## visuals", "");
+  for (const { title } of entries()) lines.push(`_visual: ${title}_`);
+  return lines.join("\n") + "\n";
+}
+
+function exportSession(format) {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const stamp =
+    `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
+    `-${pad(now.getHours())}${pad(now.getMinutes())}`;
+  const slug = card.subject.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  const name = `tutor-${slug}-${stamp}`;
+  if (format === "json") {
+    const session = {
+      version: 1,
+      subject: card.subject,
+      starting_from: card.starting_from,
+      theme: dark.matches ? "dark" : "light",
+      exported_at: now.toISOString(),
+      turns,
+      visuals: entries(),
+    };
+    download(`${name}.json`, "application/json", JSON.stringify(session, null, 2));
+  } else {
+    download(`${name}.md`, "text/markdown", markdown());
+  }
 }
 
 function gatheringComplete(peer) {
@@ -241,11 +290,16 @@ composer.addEventListener("submit", (event) => {
 document.addEventListener("keydown", (event) => {
   if (event.repeat || event.metaKey || event.ctrlKey || event.altKey) return;
   if (["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName)) return;
+  const open = channel !== null && channel.readyState === "open";
   if (event.key === "t") {
     drawer.hidden = !drawer.hidden;
     app.classList.toggle("with-drawer", !drawer.hidden);
   } else if (event.key === "d") {
     debug.hidden = !debug.hidden;
+  } else if (event.key === "e" && open) {
+    exportSession("json");
+  } else if (event.key === "m" && open) {
+    exportSession("markdown");
   }
 });
 
@@ -269,9 +323,11 @@ onPayload("state", (payload) => {
   phaseText.textContent = payload.phase;
   phaseChip.dataset.phase = payload.phase;
   caption.classList.toggle("speaking", payload.state === "speaking");
+  if (payload.state === "thinking") turns[turns.length - 1].phase = payload.phase;
 });
 
 onPayload("caption", (payload) => {
+  turns.find((turn) => turn.turn_id === payload.turn_id).tutor.push(payload.text);
   prev.textContent = cur.textContent;
   cur.textContent = payload.text;
   const last = thread.lastElementChild;
@@ -288,6 +344,7 @@ onPayload("caption", (payload) => {
 });
 
 onPayload("transcript", (payload) => {
+  turns.push({ turn_id: payload.turn_id, phase: null, learner: payload.text, tutor: [] });
   const line = document.createElement("p");
   line.className = "learner";
   line.textContent = payload.text;
@@ -295,9 +352,9 @@ onPayload("transcript", (payload) => {
   thread.scrollTop = thread.scrollHeight;
 });
 
-onPayload("history", (entries, current) => {
+onPayload("history", (items, current) => {
   historyList.replaceChildren(
-    ...entries.map(({ i, title }) => {
+    ...items.map(({ i, title }) => {
       const button = document.createElement("button");
       button.textContent = title;
       if (i === current) button.setAttribute("aria-current", "true");
@@ -305,8 +362,8 @@ onPayload("history", (entries, current) => {
       return button;
     }),
   );
-  empty.hidden = entries.length > 0;
-  canvasTitle.textContent = current >= 0 ? entries[current].title : "";
+  empty.hidden = items.length > 0;
+  canvasTitle.textContent = current >= 0 ? items[current].title : "";
 });
 
 mount(stage.querySelector(".canvas"));

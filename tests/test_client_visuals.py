@@ -204,3 +204,100 @@ def test_the_typed_line_submits_on_enter_only() -> None:
     assert 'event.key === "Enter"' in handler
     assert 'sendJson({ type: "say"' not in handler.split('event.key === "Enter"')[0]
     assert CLIENT.read_text().count("say.addEventListener(") == 1
+
+
+def export_body(text: str) -> str:
+    body = re.search(r"function exportSession\(format\) \{(.*?)\nfunction ", text, re.DOTALL)
+    assert body is not None
+    return body[1]
+
+
+def keydown_handler(text: str) -> str:
+    handler = re.search(
+        r'document\.addEventListener\("keydown",\s*\(event\)\s*=>\s*\{(.*?)\n\}\);',
+        text,
+        re.DOTALL,
+    )
+    assert handler is not None
+    return handler[1]
+
+
+def test_each_export_key_downloads_one_file() -> None:
+    client = CLIENT.read_text()
+    body = export_body(client)
+    assert body.count("download(") == 2
+    json_branch, markdown_branch = body.split("} else {")
+    assert 'if (format === "json")' in json_branch
+    assert json_branch.count("download(") == 1
+    assert '"application/json"' in json_branch
+    assert '"text/markdown"' not in json_branch
+    assert markdown_branch.count("download(") == 1
+    assert '"text/markdown"' in markdown_branch
+    assert '"application/json"' not in markdown_branch
+    assert client.count(".download =") == 1
+    assert "URL.createObjectURL(" in client
+    assert "URL.revokeObjectURL(" in client
+    handler = keydown_handler(client)
+    e_branch = re.search(r'event\.key === "e"(.*?)else if', handler, re.DOTALL)
+    m_branch = re.search(r'event\.key === "m"(.*?)$', handler, re.DOTALL)
+    assert e_branch is not None and m_branch is not None
+    assert 'exportSession("json")' in e_branch[1]
+    assert 'exportSession("markdown")' not in e_branch[1]
+    assert 'exportSession("markdown")' in m_branch[1]
+    assert 'exportSession("json")' not in m_branch[1]
+    assert handler.count("exportSession(") == 2
+    assert 'const open = channel !== null && channel.readyState === "open";' in handler
+    assert 'event.key === "e" && open' in handler
+    assert 'event.key === "m" && open' in handler
+    begin = re.search(r"function begin\(\) \{(.*?)\n\}", client, re.DOTALL)
+    assert begin is not None
+    assert "turns.length = 0" in begin[1]
+    index = INDEX.read_text()
+    keys = re.search(r'<p class="keys">(.*?)</p>', index)
+    assert keys is not None
+    for key in ("t", "d", "e", "m"):
+        assert f"<span><kbd>{key}</kbd>" in keys[1], key
+
+
+def test_export_never_renders_a_visual() -> None:
+    client = CLIENT.read_text()
+    span = re.search(
+        r"function download\(.*?function exportSession\(format\) \{.*?\n\}", client, re.DOTALL
+    )
+    assert span is not None
+    assert "function markdown()" in span[0]
+    assert "srcdoc" not in span[0]
+    assert 'createElement("iframe")' not in span[0]
+    assert "innerHTML" not in span[0]
+    assert "entries()" in export_body(client)
+    assert "export function entries()" in VISUALS.read_text()
+
+
+def test_only_the_thinking_state_sets_a_turns_phase() -> None:
+    client = CLIENT.read_text()
+    state = re.search(r'onPayload\("state", \(payload\) => \{(.*?)\n\}\);', client, re.DOTALL)
+    transcript = re.search(
+        r'onPayload\("transcript", \(payload\) => \{(.*?)\n\}\);', client, re.DOTALL
+    )
+    assert state is not None and transcript is not None
+    writes = [line for line in state[1].splitlines() if "turns" in line]
+    assert len(writes) == 1
+    assert writes[0].index('payload.state === "thinking"') < writes[0].index(".phase =")
+    assert '"speaking"' not in writes[0]
+    assert '"listening"' not in writes[0]
+    opened = re.search(r"turns\.push\(\{(.*?)\}\)", transcript[1], re.DOTALL)
+    assert opened is not None
+    assert "phase: null" in opened[1]
+    assert "turn_id: payload.turn_id" in opened[1]
+    assert "tutor: []" in opened[1]
+
+
+def test_the_markdown_lists_visuals_by_seq_after_the_turns_not_by_caption_range() -> None:
+    client = CLIENT.read_text()
+    builder = re.search(r"function markdown\(\) \{(.*?)\n\}", client, re.DOTALL)
+    assert builder is not None
+    assert "caption" not in builder[1]
+    assert "seq" not in builder[1]
+    assert builder[1].index("turns") < builder[1].index("## visuals")
+    assert builder[1].index("## visuals") < builder[1].index("entries()")
+    assert "_visual: ${" in builder[1]

@@ -161,6 +161,10 @@ export function show(i) {
   announce(i);
 }
 
+export function entries() {
+  return history.map((h) => ({ title: h.title, payload: h.payload }));
+}
+
 export function theme(name) {
   post({ seq: ++themeSeq, theme: name });
 }
