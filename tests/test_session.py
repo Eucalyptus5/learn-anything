@@ -4780,8 +4780,8 @@ async def test_a_theme_message_reaches_the_visual_prompt(theme: object) -> None:
     await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
 
     system = reasoning.prompts[1].system
-    assert ("near-black" in system) == (theme == "dark")
-    assert ("off-white" in system) == (theme != "dark")
+    assert ("The page is dark" in system) == (theme == "dark")
+    assert ("The page is light" in system) == (theme != "dark")
 
 
 async def test_an_accepted_theme_is_logged_and_a_rejected_one_is_not(

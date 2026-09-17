@@ -6,7 +6,7 @@ from tests.test_session import FakeReasoning, LoggingTransport, visual_call
 from tutor.brief import VisualBrief
 from tutor.prompt import Message, TurnPrompt
 from tutor.reasoning import TurnChunk
-from tutor.visual_call import VISUAL_SYSTEM_PROMPT, run_visual_call, visual_prompt
+from tutor.visual_call import THEMES, VISUAL_SYSTEM_PROMPT, run_visual_call, visual_prompt
 from tutor.visual_tools import VISUAL_CALL_TOOLS
 from tutor.visuals import VisualChannel
 
@@ -30,7 +30,7 @@ def test_the_visual_prompt_carries_the_snapshot_the_brief_and_the_previous_one()
     assert prompt.history == SNAPSHOT.history
     assert prompt.tool_context == SNAPSHOT.tool_context
     assert prompt.system.startswith(VISUAL_SYSTEM_PROMPT.split("{", 1)[0])
-    assert "near-black" in prompt.system and "light text" in prompt.system
+    assert "The page is dark" in prompt.system
     assert "Previous visual: diagram, PPO update loop" in prompt.system
     assert prompt.user_text == f"Brief: {BRIEF.model_dump_json()}\nThe learner just said: why clip"
     assert "under eight thousand characters" in prompt.system
@@ -41,17 +41,38 @@ def test_no_previous_visual_is_said_so() -> None:
     assert "Previous visual: none" in visual_prompt(SNAPSHOT, BRIEF, None, "light").system
 
 
-def test_the_prompt_names_every_vendored_tag_and_nothing_else() -> None:
+def test_the_prompt_names_the_helper_first_and_every_vendored_tag_and_nothing_else() -> None:
     system = visual_prompt(SNAPSHOT, BRIEF, None, "light").system
-    for tag in (
+    tags = (
+        "/lesson.js",
         "/vendor/plotly.min.js",
         "/vendor/katex/katex.min.js",
         "/vendor/katex/katex.min.css",
         "/vendor/p5.min.js",
         "/vendor/d3.min.js",
-    ):
+    )
+    for tag in tags:
         assert tag in system
+    assert system.index('<script src="/lesson.js"></script>') < system.index(
+        "/vendor/plotly.min.js"
+    )
     assert "http" not in system
+
+
+def test_the_prompt_asks_for_narrated_steps_in_the_pages_variables() -> None:
+    system = visual_prompt(SNAPSHOT, BRIEF, None, "light").system
+    assert "The page is light" in system
+    assert "lesson.steps" in system
+    assert "under seventy characters" in system
+    assert "three to five steps" in system
+    for token in ("var(--ink)", "var(--ink-3)", "var(--accent)", "var(--surface)", "var(--hair)"):
+        assert token in system
+    assert "near-black" not in system and "off-white" not in system
+    assert system.isascii()
+
+
+def test_themes_are_the_two_names() -> None:
+    assert THEMES == frozenset({"light", "dark"})
 
 
 async def test_a_tool_call_is_dispatched_and_the_result_string_returned() -> None:

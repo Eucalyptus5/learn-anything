@@ -11,10 +11,7 @@ from tutor.visuals import VisualChannel
 logger = logging.getLogger(__name__)
 
 CALL_TOOL_NAMES = frozenset(t["function"]["name"] for t in VISUAL_CALL_TOOLS)
-THEMES = {
-    "light": ("light", "an off-white", "dark"),
-    "dark": ("dark", "a near-black", "light"),
-}
+THEMES = frozenset({"light", "dark"})
 
 VISUAL_SYSTEM_PROMPT = """
 You draw one picture for a spoken lesson. You receive the lesson so far, the tutor's brief for
@@ -25,22 +22,30 @@ under thirty nodes. For kind app call push_app with one complete HTML document: 
 and script inline, nothing fetched from the network, no fonts loaded from anywhere but the
 tags below, under eight thousand characters, written quickly, so prefer a library call to
 hand-written markup. Libraries available by exact tag, and nothing else:
+<script src="/lesson.js"></script>
 <script src="/vendor/plotly.min.js"></script>
 <link rel="stylesheet" href="/vendor/katex/katex.min.css"><script src="/vendor/katex/katex.min.js"></script>
 <script src="/vendor/p5.min.js"></script>
 <script src="/vendor/d3.min.js"></script>
-The page is {theme}: draw on {background} background with {foreground} text and one accent,
-and set the body background explicitly. The picture shows what the brief's show line says,
-with its numbers and its case; title is the brief's title. Label axes and name the
-quantities. No explanatory paragraph in the picture; the voice carries the explanation.
+The first tag is required in every app. It sets the page's colours and fonts as CSS variables,
+lays the picture out beside a column of step lines, and takes lesson.steps([{{say, show}}, ...])
+once the picture is drawn: say is one line under seventy characters naming the part that
+appears at that step, show is a CSS selector for that part, and run is an optional function
+for a part a selector cannot reach, such as a Plotly trace shown with Plotly.restyle. Put the
+whole picture inside one root element and do not style body.
+The page is {theme}; use var(--ink), var(--ink-3), var(--accent), var(--surface) and
+var(--hair) for every colour, and var(--sans) or var(--serif) for text. The picture shows what
+the brief's show line says, with its numbers and its case; its title is the brief's title;
+every axis is named with its quantity and unit. Write three to five steps, each revealing one
+part of the picture and saying in under seventy characters what that part is. The explanation
+is the step lines; no paragraphs.
 """.strip()
 
 
 def visual_prompt(
     snapshot: TurnPrompt, brief: VisualBrief, previous: VisualBrief | None, theme: str
 ) -> TurnPrompt:
-    name, background, foreground = THEMES[theme]
-    system = VISUAL_SYSTEM_PROMPT.format(theme=name, background=background, foreground=foreground)
+    system = VISUAL_SYSTEM_PROMPT.format(theme=theme)
     last = f"{previous.kind}, {previous.title}" if previous is not None else "none"
     return TurnPrompt(
         system=f"{system}\n\nPrevious visual: {last}",
