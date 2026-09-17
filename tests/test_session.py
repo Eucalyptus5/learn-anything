@@ -3994,9 +3994,11 @@ def test_the_splitter_holds_everything_after_the_marker() -> None:
     assert outcome == TurnOutcome(signal="correct")
 
 
-BRIEF_JSON = json.dumps({"kind": "app", "title": "Clipped objective", "show": "surrogate vs ratio"})
+BRIEF_JSON = VisualBrief(
+    kind="app", title="Clipped objective", show="surrogate vs ratio"
+).model_dump_json()
 BRIEF_HEAD = BRIEF_MARKER + BRIEF_JSON + BRIEF_END
-NONE_HEAD = BRIEF_MARKER + json.dumps({"kind": "none", "title": "", "show": ""}) + BRIEF_END
+NONE_HEAD = BRIEF_MARKER + VisualBrief(kind="none", title="", show="").model_dump_json() + BRIEF_END
 BRIEFED_DELTAS = [BRIEF_HEAD[:12], BRIEF_HEAD[12:], "\n", *SPOKEN_DELTAS]
 APP_CALL = visual_call(
     "push_app",
@@ -4360,6 +4362,112 @@ async def test_a_mismatched_speculation_leaves_no_brief_behind(completes: bool) 
     ]
     assert [payload["title"] for payload in sent(log, "app.push")] == [APP_TITLE]
     assert speaker.utterances == [SPOKEN_CLAUSES]
+
+
+async def test_the_next_turn_sees_the_brief_head_in_its_history() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    deltas = spoken_chunks([NONE_HEAD, "\n", *SPOKEN_DELTAS])
+    reasoning = FakeReasoning(log, deltas, speaker.received, visual=[APP_CALL])
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT, SECOND_CONCEPT_TEXT]), speaker, reasoning)
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert reasoning.tool_choices == [None, None]
+    assert reasoning.prompts[1].history == [
+        Message(role="user", content=CONCEPT_TEXT),
+        Message(role="assistant", content=NONE_HEAD + "\n" + " ".join(SPOKEN_CLAUSES)),
+    ]
+
+
+async def test_the_visual_call_sees_the_kept_head_too() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(
+        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL]
+    )
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT, SECOND_CONCEPT_TEXT]), speaker, reasoning)
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert reasoning.tool_choices == [None, "required", None, "required"]
+    assert reasoning.prompts[3].history == reasoning.prompts[2].history
+    assert reasoning.prompts[3].history == [
+        Message(role="user", content=CONCEPT_TEXT),
+        Message(role="assistant", content=BRIEF_HEAD + "\n" + " ".join(SPOKEN_CLAUSES)),
+    ]
+
+
+@pytest.mark.parametrize("completes", [False, True], ids=["open", "completed"])
+async def test_a_mismatched_speculation_leaves_no_head_in_the_transcript(completes: bool) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    gate = asyncio.Event()
+    holds_at = len(BRIEFED_DELTAS) - 1 if completes else 3
+    turns = [
+        spoken_chunks(BRIEFED_DELTAS),
+        spoken_chunks(SPOKEN_DELTAS),
+        spoken_chunks(SPOKEN_DELTAS),
+    ]
+    reasoning = FakeReasoning(
+        log, [], speaker.received, gate=gate, holds_at=holds_at, turns=turns, visual=[APP_CALL]
+    )
+    endpoint = asyncio.Event()
+    source = ScriptedSource(
+        [
+            PartialTranscript(text=CONCEPT_PARTIAL),
+            endpoint,
+            EndOfTurn(text="two"),
+            speaker.finished,
+            EndOfTurn(text="three"),
+        ]
+    )
+    cfg = concept_cfg().model_copy(update={"speculative_reasoning": True})
+    loop = concept_loop(log, source, speaker, reasoning, cfg=cfg)
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+    speculation = speculation_task()
+    assert reasoning.tool_choices == [None]
+    if completes:
+        gate.set()
+        await asyncio.wait_for(asyncio.wait([speculation]), HANG_GUARD_S)
+        assert not speculation.cancelled() and speculation.exception() is None
+        assert reasoning.tool_choices == [None]
+
+    await pull_past(source, endpoint)
+    gate.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert reasoning.tool_choices == [None, None, None]
+    assert [prompt.user_text for prompt in reasoning.prompts] == [CONCEPT_PARTIAL, "two", "three"]
+    assert reasoning.prompts[2].history == [
+        Message(role="user", content="two"),
+        Message(role="assistant", content=" ".join(SPOKEN_CLAUSES)),
+    ]
+    assert sent(log, "app.push") == []
+
+
+async def test_a_missing_head_leaves_the_history_as_before() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(
+        log, spoken_chunks(SPOKEN_DELTAS), speaker.received, visual=[APP_CALL]
+    )
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT, SECOND_CONCEPT_TEXT]), speaker, reasoning)
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert reasoning.tool_choices == [None, None]
+    assert reasoning.prompts[1].history == [
+        Message(role="user", content=CONCEPT_TEXT),
+        Message(role="assistant", content=" ".join(SPOKEN_CLAUSES)),
+    ]
 
 
 async def test_the_previous_brief_reaches_the_next_visual_call() -> None:

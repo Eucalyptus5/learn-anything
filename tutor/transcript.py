@@ -7,12 +7,16 @@ class Transcript:
         self._order: list[str] = []
         self._learner: dict[str, str] = {}
         self._tutor: dict[str, list[str]] = {}
+        self._head: dict[str, str] = {}
 
     def learner(self, turn_id: str, text: str) -> None:
         if turn_id in self._learner:
             return
         self._order.append(turn_id)
         self._learner[turn_id] = text
+
+    def head(self, turn_id: str, line: str) -> None:
+        self._head[turn_id] = line
 
     def tutor(self, turn_id: str, clause: str) -> None:
         self._tutor.setdefault(turn_id, []).append(clause)
@@ -23,7 +27,8 @@ class Transcript:
         messages: list[Message] = []
         for turn_id in closed[max(len(closed) - self._turns, 0) :]:
             messages.append(Message(role="user", content=self._learner[turn_id]))
-            clauses = self._tutor.get(turn_id)
-            if clauses:
-                messages.append(Message(role="assistant", content=" ".join(clauses)))
+            parts = [self._head.get(turn_id, ""), " ".join(self._tutor.get(turn_id, []))]
+            content = "\n".join(part for part in parts if part)
+            if content:
+                messages.append(Message(role="assistant", content=content))
         return messages

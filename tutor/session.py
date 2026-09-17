@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from tutor.brief import BriefSplitter, VisualBrief
+from tutor.brief import BRIEF_END, BRIEF_MARKER, BriefSplitter, VisualBrief
 from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.input_path import EndOfTurn, InputPath, PartialTranscript, SpeechStarted
 from tutor.lead_in import lead_in_sentence, lead_in_stages
@@ -620,6 +620,7 @@ class TurnLoop:
         self._start_visual(turn_id, snapshot, brief)
 
     def _start_visual(self, turn_id: str, snapshot: TurnPrompt, brief: VisualBrief) -> None:
+        self._transcript.head(turn_id, f"{BRIEF_MARKER}{brief.model_dump_json()}{BRIEF_END}")
         if brief.kind == "none":
             return
         previous, self._last_brief = self._last_brief, brief
