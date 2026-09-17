@@ -58,6 +58,7 @@ class TurnState(BaseModel):
     type: Literal["state"] = "state"
     state: Literal["listening", "thinking", "speaking"]
     phase: Literal["teach", "concrete", "interrogate"]
+    interrupted: bool = False
 
 
 class Caption(BaseModel):
@@ -66,6 +67,7 @@ class Caption(BaseModel):
     type: Literal["caption"] = "caption"
     turn_id: str = Field(max_length=32)
     text: str = Field(max_length=2000)
+    lead_ms: int = Field(ge=0)
 
 
 class LearnerText(BaseModel):

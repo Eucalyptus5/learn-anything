@@ -6,8 +6,8 @@ const KEYS = {
   "diagram.clear": ["type", "seq"],
   "source.highlight": ["type", "seq", "path", "start_line", "end_line"],
   "app.push": ["type", "seq", "id", "html", "title"],
-  "state": ["type", "seq", "state", "phase"],
-  "caption": ["type", "seq", "turn_id", "text"],
+  "state": ["type", "seq", "state", "phase", "interrupted"],
+  "caption": ["type", "seq", "turn_id", "text", "lead_ms"],
   "transcript": ["type", "seq", "turn_id", "text"],
 };
 const CAPS = { id: 64, source: 8000, html: 64000, path: 4096, title: 80, turn_id: 32 };
@@ -71,11 +71,16 @@ export function validate(payload) {
     case "state":
       if (!STATES.has(payload.state)) return reject("unknown state");
       if (!PHASES.has(payload.phase)) return reject("unknown phase");
+      if (typeof payload.interrupted !== "boolean") return reject("bad interrupted");
       return true;
     case "caption":
+      if (!cappedString(payload, "turn_id")) return reject("bad turn_id");
+      if (!cappedString(payload, "text", TEXT_CAPS.caption)) return reject("bad text");
+      if (!Number.isInteger(payload.lead_ms) || payload.lead_ms < 0) return reject("bad lead_ms");
+      return true;
     case "transcript":
       if (!cappedString(payload, "turn_id")) return reject("bad turn_id");
-      if (!cappedString(payload, "text", TEXT_CAPS[payload.type])) return reject("bad text");
+      if (!cappedString(payload, "text", TEXT_CAPS.transcript)) return reject("bad text");
       return true;
   }
 }

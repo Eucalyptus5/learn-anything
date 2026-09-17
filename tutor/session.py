@@ -21,7 +21,7 @@ from tutor.prompt import (
     TurnPrompt,
 )
 from tutor.reasoning import ReasoningClient, TurnChunk
-from tutor.speech import Speaker
+from tutor.speech import OnPlay, Speaker
 from tutor.tools.models import SearchBudget, SearchResult
 from tutor.tools.provenance import TurnRegistry
 from tutor.transcript import Transcript
@@ -375,8 +375,16 @@ class TurnLoop:
             user_text=user_text,
         )
 
-    def _state(self, state: Literal["listening", "thinking", "speaking"]) -> TurnState:
-        return TurnState(state=state, phase=str(self._pedagogy.phase))
+    def _state(
+        self, state: Literal["listening", "thinking", "speaking"], interrupted: bool = False
+    ) -> TurnState:
+        return TurnState(state=state, phase=str(self._pedagogy.phase), interrupted=interrupted)
+
+    def _caption(self, turn_id: str) -> OnPlay:
+        async def on_play(text: str, lead_ms: int) -> None:
+            await self._visuals.push(Caption(turn_id=turn_id, text=text, lead_ms=lead_ms))
+
+        return on_play
 
     async def _turn(self, turn_id: str, user_text: str) -> None:
         start = self._clock()
@@ -393,7 +401,9 @@ class TurnLoop:
                 # A cancelled turn must not cancel the future the speculation is about to
                 # resolve, or set_result() raises inside the speculation.
                 prompt, queue = await asyncio.shield(grounded)
-            await self._speaker.speak(self._utterance(turn_id, prompt, queue))
+            await self._speaker.speak(
+                self._utterance(turn_id, prompt, queue), self._caption(turn_id)
+            )
             outcome = await self._report_drain(turn_id)
             tail = self._tails.pop(turn_id, None)
         except asyncio.CancelledError:
@@ -402,7 +412,7 @@ class TurnLoop:
             self._registry.abandon(turn_id)
             if turn_id == f"turn-{self._dispatched}":
                 try:
-                    await self._visuals.push(self._state("listening"))
+                    await self._visuals.push(self._state("listening", interrupted=True))
                 except Exception as error:
                     logger.warning(
                         "turn.state_push_failed turn_id=%s error=%s",
@@ -477,7 +487,6 @@ class TurnLoop:
                 await self._visuals.push(self._state("speaking"))
                 first = False
             self._transcript.tutor(turn_id, text)
-            await self._visuals.push(Caption(turn_id=turn_id, text=text))
             yield text
 
     def _ground(self, turn_id: str, result: SearchResult) -> None:

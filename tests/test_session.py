@@ -41,6 +41,7 @@ from tutor.session import (
     TurnLoop,
     TurnLoopConfig,
 )
+from tutor.speech import OnPlay
 from tutor.tools.models import (
     GroundingVerdict,
     Position,
@@ -398,13 +399,14 @@ class FakeSpeaker:
         self.openers.append(key)
         self._log.append(("speak_opener", key))
 
-    async def speak(self, chunks: AsyncIterator[str]) -> None:
+    async def speak(self, chunks: AsyncIterator[str], on_play: OnPlay) -> None:
         spoken: list[str] = []
         self.utterances.append(spoken)
         try:
             async for chunk in chunks:
                 spoken.append(chunk)
                 self._log.append(("speak", chunk))
+                await on_play(chunk, 0)
                 self.received.set()
                 if self._gate is not None and len(spoken) >= self._hold_at:
                     self.held.set()
@@ -3500,7 +3502,7 @@ async def test_the_state_carries_the_phase_after_it_moves() -> None:
     await loop.aclose()
 
 
-async def test_every_spoken_clause_is_captioned_before_it_is_spoken() -> None:
+async def test_every_spoken_clause_is_captioned_once_it_reaches_the_playout() -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
     search = FakeSearch(log, found())
@@ -3522,7 +3524,8 @@ async def test_every_spoken_clause_is_captioned_before_it_is_spoken() -> None:
     assert [p["text"] for p in captions] == SPOKEN_CLAUSES
     for caption in captions:
         assert caption["turn_id"] == "turn-1"
-        assert log.index(("send_json", caption)) < log.index(("speak", caption["text"]))
+        assert caption["lead_ms"] == 0
+        assert log.index(("speak", caption["text"])) < log.index(("send_json", caption))
     await loop.aclose()
 
 
@@ -3657,6 +3660,61 @@ async def test_a_cancelled_concept_turn_keeps_what_was_spoken_and_ends_listening
     assert reasoning.prompts[1].history[1].content == SPOKEN_CLAUSES[0]
     assert speaker.utterances == [[SPOKEN_CLAUSES[0]], SPOKEN_CLAUSES]
     assert states(log) == ["thinking", "speaking", "listening"] * 2
+    await loop.aclose()
+
+
+async def test_only_the_barged_listening_state_is_marked_interrupted() -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold)
+    search = FakeSearch(log, found())
+    gate = asyncio.Event()
+    deltas = spoken_chunks(SPOKEN_DELTAS)
+    reasoning = FakeReasoning(log, deltas, speaker.received, gate=gate, holds_at=3)
+    barge = asyncio.Event()
+    resume = asyncio.Event()
+    source = ScriptedSource(
+        [EndOfTurn(text=CONCEPT_TEXT), barge, SpeechStarted(), resume, EndOfTurn(text="two")]
+    )
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
+    turn = turn_task()
+
+    await pull_past(source, barge)
+    gate.set()
+    hold.set()
+    await asyncio.wait_for(asyncio.wait([turn]), HANG_GUARD_S)
+
+    assert turn.cancelled()
+    assert [(p["state"], p["interrupted"]) for p in sent(log, "state")] == [
+        ("thinking", False),
+        ("speaking", False),
+        ("listening", True),
+    ]
+
+    resume.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert [p["interrupted"] for p in sent(log, "state")] == [
+        False,
+        False,
+        True,
+        False,
+        False,
+        False,
+    ]
     await loop.aclose()
 
 
@@ -4639,12 +4697,12 @@ class ExclusiveSpeaker(FakeSpeaker):
         super().__init__(log, gate=gate, hold_at=1)
         self.in_flight = False
 
-    async def speak(self, chunks: AsyncIterator[str]) -> None:
+    async def speak(self, chunks: AsyncIterator[str], on_play: OnPlay) -> None:
         if self.in_flight:
             raise RuntimeError("an utterance is already in flight")
         self.in_flight = True
         try:
-            await super().speak(chunks)
+            await super().speak(chunks, on_play)
         finally:
             self.in_flight = False
 

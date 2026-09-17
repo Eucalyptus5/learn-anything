@@ -39,7 +39,7 @@ _VALID_SHAPES = [
     {"type": "source.highlight", "path": "src/pool.py", "start_line": 3, "end_line": 9},
     {"type": "app.push", "id": "a1", "html": "<p>hi</p>", "title": "reader"},
     {"type": "state", "state": "thinking", "phase": "teach"},
-    {"type": "caption", "turn_id": "turn-1", "text": "PPO clips."},
+    {"type": "caption", "turn_id": "turn-1", "text": "PPO clips.", "lead_ms": 0},
     {"type": "transcript", "turn_id": "turn-1", "text": "teach me ppo"},
 ]
 
@@ -99,7 +99,7 @@ def test_a_title_over_eighty_characters_is_rejected() -> None:
     ("payload", "tag"),
     [
         (TurnState(state="thinking", phase="teach"), "state"),
-        (Caption(turn_id="turn-1", text="PPO clips."), "caption"),
+        (Caption(turn_id="turn-1", text="PPO clips.", lead_ms=1200), "caption"),
         (LearnerText(turn_id="turn-1", text="teach me ppo"), "transcript"),
     ],
     ids=["state", "caption", "transcript"],
@@ -128,16 +128,16 @@ def test_an_unknown_state_or_phase_is_rejected() -> None:
 
 
 def test_caption_and_transcript_are_capped() -> None:
-    assert len(Caption(turn_id="turn-1", text="x" * 2000).text) == 2000
+    assert len(Caption(turn_id="turn-1", text="x" * 2000, lead_ms=0).text) == 2000
     assert len(LearnerText(turn_id="turn-1", text="x" * 4000).text) == 4000
-    assert len(Caption(turn_id="t" * 32, text="x").turn_id) == 32
+    assert len(Caption(turn_id="t" * 32, text="x", lead_ms=0).turn_id) == 32
 
     with pytest.raises(ValidationError):
-        Caption(turn_id="turn-1", text="x" * 2001)
+        Caption(turn_id="turn-1", text="x" * 2001, lead_ms=0)
     with pytest.raises(ValidationError):
         LearnerText(turn_id="turn-1", text="x" * 4001)
     with pytest.raises(ValidationError):
-        Caption(turn_id="t" * 33, text="x")
+        Caption(turn_id="t" * 33, text="x", lead_ms=0)
     with pytest.raises(ValidationError):
         LearnerText(turn_id="t" * 33, text="x")
 
@@ -147,14 +147,14 @@ async def test_state_pushes_carry_seq_in_order() -> None:
     channel = VisualChannel(connection)
 
     await channel.push(TurnState(state="thinking", phase="teach"))
-    await channel.push(Caption(turn_id="turn-1", text="PPO clips."))
+    await channel.push(Caption(turn_id="turn-1", text="PPO clips.", lead_ms=0))
     await channel.push(
         DiagramPush(id="d1", kind="flowchart", source="graph TD; A-->B", title="reader")
     )
 
     assert connection.sent == [
-        {"type": "state", "state": "thinking", "phase": "teach", "seq": 1},
-        {"type": "caption", "turn_id": "turn-1", "text": "PPO clips.", "seq": 2},
+        {"type": "state", "state": "thinking", "phase": "teach", "interrupted": False, "seq": 1},
+        {"type": "caption", "turn_id": "turn-1", "text": "PPO clips.", "lead_ms": 0, "seq": 2},
         {
             "type": "diagram.push",
             "id": "d1",
@@ -164,6 +164,33 @@ async def test_state_pushes_carry_seq_in_order() -> None:
             "seq": 3,
         },
     ]
+
+
+def test_a_caption_requires_a_non_negative_lead() -> None:
+    assert Caption(turn_id="turn-1", text="x", lead_ms=0).lead_ms == 0
+    assert Caption(turn_id="turn-1", text="x", lead_ms=4500).lead_ms == 4500
+
+    with pytest.raises(ValidationError):
+        Caption(turn_id="turn-1", text="x")
+    with pytest.raises(ValidationError):
+        Caption(turn_id="turn-1", text="x", lead_ms=-1)
+    with pytest.raises(ValidationError):
+        _channel_adapter.validate_python(
+            {"type": "caption", "turn_id": "turn-1", "text": "x", "lead_ms": 1.5}
+        )
+
+
+def test_a_state_is_not_interrupted_unless_said_so() -> None:
+    assert TurnState(state="listening", phase="teach").interrupted is False
+
+    dumped = TurnState(state="listening", phase="teach", interrupted=True).model_dump(mode="json")
+
+    assert dumped == {"type": "state", "state": "listening", "phase": "teach", "interrupted": True}
+    assert _channel_adapter.validate_python(dumped).interrupted is True
+    with pytest.raises(ValidationError):
+        _channel_adapter.validate_python(
+            {"type": "state", "state": "listening", "phase": "teach", "interrupted": "maybe"}
+        )
 
 
 def test_diagram_kind_outside_the_literal_is_rejected() -> None:

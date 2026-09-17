@@ -161,6 +161,34 @@ def test_the_validator_names_every_channel_payload_type() -> None:
         assert re.search(rf'"{kind}": \["type", "seq", ', keys[1]), kind
     assert '"diagram.push": ["type", "seq", "id", "kind", "source", "title"]' in keys[1]
     assert '"app.push": ["type", "seq", "id", "html", "title"]' in keys[1]
+    assert '"state": ["type", "seq", "state", "phase", "interrupted"]' in keys[1]
+    assert '"caption": ["type", "seq", "turn_id", "text", "lead_ms"]' in keys[1]
+
+
+def test_the_validator_checks_the_lead_and_the_interrupted_flag() -> None:
+    text = VISUALS.read_text()
+    validate = re.search(r"export function validate\(payload\) \{(.*?)\n\}", text, re.DOTALL)
+    assert validate is not None
+    assert "Number.isInteger(payload.lead_ms)" in validate[1]
+    assert "payload.lead_ms < 0" in validate[1]
+    assert 'typeof payload.interrupted !== "boolean"' in validate[1]
+
+
+def test_the_check_page_probes_the_lead_and_the_interrupted_flag() -> None:
+    text = VISUAL_CHECK.read_text()
+    good = re.search(r"const good = \[(.*?)\n\];", text, re.DOTALL)
+    hostile = re.search(r"const hostile = \[(.*?)\n\];", text, re.DOTALL)
+    assert good is not None and hostile is not None
+    assert "lead_ms: 1200" in good[1]
+    assert "interrupted: false" in good[1] and "interrupted: true" in good[1]
+    for name in (
+        '"lead_ms -1"',
+        '"lead_ms 1.5"',
+        '"caption missing lead_ms"',
+        '"interrupted yes"',
+        '"state missing interrupted"',
+    ):
+        assert name in hostile[1], name
 
 
 def test_every_push_on_the_check_page_carries_a_title() -> None:

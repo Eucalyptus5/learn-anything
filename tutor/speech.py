@@ -17,10 +17,6 @@ def _elapsed_ms(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
 
 
-async def _no_play(chunk: str, lead_ms: int) -> None:
-    return None
-
-
 class Speaker:
     def __init__(self, synth: KokoroSynthesizer, transport: Connection) -> None:
         self._synth = synth
@@ -47,7 +43,7 @@ class Speaker:
                 first = False
             await on_play(chunk, int(backlog * 1000))
 
-    async def speak(self, chunks: AsyncIterator[str], on_play: OnPlay = _no_play) -> None:
+    async def speak(self, chunks: AsyncIterator[str], on_play: OnPlay) -> None:
         if self._utterance is not None and not self._utterance.done():
             raise RuntimeError("an utterance is already in flight")
         utterance = asyncio.create_task(self._drain(chunks, on_play))
