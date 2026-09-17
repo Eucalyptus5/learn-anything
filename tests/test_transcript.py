@@ -1,5 +1,8 @@
+import json
+
 from tutor.brief import BRIEF_END, BRIEF_MARKER, VisualBrief
 from tutor.prompt import Message
+from tutor.session import OUTCOME_MARKER
 from tutor.transcript import Transcript
 
 HEAD = (
@@ -7,6 +10,7 @@ HEAD = (
     + VisualBrief(kind="diagram", title="Clipped objective", show="ratio vs clip").model_dump_json()
     + BRIEF_END
 )
+TAIL_LINE = OUTCOME_MARKER + json.dumps({"signal": "covered", "settling": ""})
 
 
 def test_history_is_empty_before_the_first_turn() -> None:
@@ -109,3 +113,37 @@ def test_a_second_head_for_the_same_turn_replaces_the_first() -> None:
         Message(role="user", content="teach me ppo"),
         Message(role="assistant", content=HEAD + "\nPPO clips."),
     ]
+
+
+def test_a_tail_follows_the_clauses_on_its_own_line() -> None:
+    t = Transcript(10)
+    t.learner("turn-1", "teach me ppo")
+    t.tutor("turn-1", "PPO is a policy gradient method,")
+    t.tutor("turn-1", "with a clipped objective.")
+    t.tail("turn-1", TAIL_LINE)
+    assert t.history(before="turn-2") == [
+        Message(role="user", content="teach me ppo"),
+        Message(
+            role="assistant",
+            content="PPO is a policy gradient method, with a clipped objective.\n" + TAIL_LINE,
+        ),
+    ]
+
+
+def test_head_clauses_and_tail_stack_in_that_order() -> None:
+    t = Transcript(10)
+    t.learner("turn-1", "teach me ppo")
+    t.tail("turn-1", TAIL_LINE)
+    t.tutor("turn-1", "PPO clips.")
+    t.head("turn-1", HEAD)
+    assert t.history(before="turn-2") == [
+        Message(role="user", content="teach me ppo"),
+        Message(role="assistant", content=HEAD + "\nPPO clips.\n" + TAIL_LINE),
+    ]
+
+
+def test_a_tail_for_a_turn_that_never_opens_is_never_emitted() -> None:
+    t = Transcript(10)
+    t.learner("turn-8", "eight")
+    t.tail("turn-9", TAIL_LINE)
+    assert t.history(before="turn-10") == [Message(role="user", content="eight")]

@@ -41,6 +41,7 @@ VISUAL_TOOL_NAMES = frozenset(tool["function"]["name"] for tool in VOICE_VISUAL_
 SPOKEN_DEPTH = 32
 BAD_ARGUMENTS = "search_code takes a query string and a non-empty list of glob strings"
 OUTCOME_MARKER = "<outcome>"
+TAIL_LIMIT = 600
 OUTCOME_INSTRUCTION = (
     f"End every reply with a line holding exactly {OUTCOME_MARKER} followed by one JSON object "
     'with "signal" (one of covered, follow_up, correct, misconception, told, or null), '
@@ -104,6 +105,7 @@ class OutcomeSplitter:
     def __init__(self) -> None:
         self._held = ""
         self._tail: str | None = None
+        self.tail: str | None = None
 
     def feed(self, delta: str) -> str:
         if self._tail is not None:
@@ -124,7 +126,8 @@ class OutcomeSplitter:
         if self._tail is None:
             held, self._held = self._held, ""
             return held, TurnOutcome()
-        return "", parse_outcome(self._tail.strip())
+        self.tail = self._tail.strip()
+        return "", parse_outcome(self.tail)
 
 
 class TurnLoopConfig(BaseModel):
@@ -190,6 +193,7 @@ class TurnLoop:
         self._visual_tasks: dict[str, asyncio.Task[str]] = {}
         self._results: dict[str, list[SearchResult]] = {}
         self._briefs: dict[str, VisualBrief | None] = {}
+        self._tails: dict[str, str] = {}
         self._last_brief: VisualBrief | None = None
         self._landed_turn = 0
         self._theme = "light"
@@ -225,8 +229,10 @@ class TurnLoop:
         previous = self._speculations.get(turn_id)
         if previous is not None and previous.text == text and previous.live():
             return
-        if previous is not None and not previous.task.cancelling():
-            previous.task.cancel()
+        if previous is not None:
+            if not previous.task.cancelling():
+                previous.task.cancel()
+            self._tails.pop(turn_id, None)
         speculation = Speculation(text)
         speculation.task = asyncio.create_task(
             self._speculate(turn_id, speculation, None if previous is None else previous.task),
@@ -327,6 +333,7 @@ class TurnLoop:
             if not speculation.task.cancelling():
                 speculation.task.cancel()
             await asyncio.gather(speculation.task, return_exceptions=True)
+            self._tails.pop(turn_id, None)
         self._registry.open_turn(turn_id)
         return None
 
@@ -366,6 +373,7 @@ class TurnLoop:
                 prompt, queue = await asyncio.shield(grounded)
             await self._speaker.speak(self._utterance(turn_id, prompt, queue))
             outcome = await self._report_drain(turn_id)
+            tail = self._tails.pop(turn_id, None)
         except asyncio.CancelledError:
             # The drain has to stop before the id is cleared, or a late record() finds no turn.
             await self._stop_turn(turn_id)
@@ -387,6 +395,8 @@ class TurnLoop:
         if self._cfg.root is None:
             outcome = outcome.model_copy(update={"settling_positions": []})
         phase = self._pedagogy.advance(outcome)
+        if tail is not None:
+            self._transcript.tail(turn_id, OUTCOME_MARKER + tail)
         logger.info("turn.outcome turn_id=%s signal=%s phase=%s", turn_id, outcome.signal, phase)
         await self._visuals.push(self._state("listening"))
 
@@ -407,6 +417,7 @@ class TurnLoop:
         self._staging.pop(turn_id, None)
         self._results.pop(turn_id, None)
         self._briefs.pop(turn_id, None)
+        self._tails.pop(turn_id, None)
         await self._stop(self._pumps, turn_id)
         await self._stop(self._stagers, turn_id)
         await self._stop(self._drains, turn_id)
@@ -561,6 +572,8 @@ class TurnLoop:
                 await queue.put("\n")
                 outcome = await self._follow_up(turn_id, prompt, answerable, queue)
             else:
+                if splitter.tail is not None:
+                    self._tails[turn_id] = splitter.tail[:TAIL_LIMIT]
                 self._brief(turn_id, prompt)
         except BaseException:
             # Nothing consumes the queue once the turn unwinds, so the sentinel takes a slot
@@ -603,6 +616,8 @@ class TurnLoop:
         text, outcome = splitter.finish()
         if text:
             await queue.put(text)
+        if splitter.tail is not None:
+            self._tails[turn_id] = splitter.tail[:TAIL_LIMIT]
         return outcome
 
     def _brief(self, turn_id: str, prompt: TurnPrompt) -> None:

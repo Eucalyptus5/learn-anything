@@ -36,6 +36,7 @@ from tutor.session import (
     OUTCOME_INSTRUCTION,
     OUTCOME_MARKER,
     SPOKEN_DEPTH,
+    TAIL_LIMIT,
     OutcomeSplitter,
     TurnLoop,
     TurnLoopConfig,
@@ -4635,3 +4636,343 @@ async def test_aclose_cancels_a_visual_call_in_flight() -> None:
 
     assert visual.cancelled()
     assert sent(log, "app.push") == []
+
+
+COVERED_TAIL = json.dumps({"signal": "covered", "settling": ""})
+TOLD_TAIL = json.dumps({"signal": "told", "settling": ""})
+TAILED_DELTAS = [*SPOKEN_DELTAS, "\n" + OUTCOME_MARKER, COVERED_TAIL]
+TOLD_DELTAS = [*SPOKEN_DELTAS, "\n" + OUTCOME_MARKER, TOLD_TAIL]
+SPOKEN_WITH_TAIL = " ".join(SPOKEN_CLAUSES) + "\n" + OUTCOME_MARKER
+
+
+def test_the_splitter_keeps_the_raw_tail() -> None:
+    splitter = OutcomeSplitter()
+    assert splitter.feed('x<outcome> {"signal": "covered"} ') == "x"
+    assert splitter.tail is None
+    assert splitter.finish() == ("", TurnOutcome(signal="covered"))
+    assert splitter.tail == '{"signal": "covered"}'
+    bare = OutcomeSplitter()
+    assert bare.feed("x") == "x"
+    assert bare.finish() == ("", TurnOutcome())
+    assert bare.tail is None
+
+
+async def test_the_next_turn_sees_the_outcome_tail_in_its_history() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(log, spoken_chunks(TAILED_DELTAS), speaker.received)
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT, SECOND_CONCEPT_TEXT]), speaker, reasoning)
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert speaker.utterances == [SPOKEN_CLAUSES] * 2
+    assert reasoning.prompts[1].history == [
+        Message(role="user", content=CONCEPT_TEXT),
+        Message(role="assistant", content=SPOKEN_WITH_TAIL + COVERED_TAIL),
+    ]
+    assert reasoning.prompts[1].history[1].content.endswith("\n<outcome>" + COVERED_TAIL)
+
+
+async def test_a_malformed_tail_is_kept_as_written(caplog: pytest.LogCaptureFixture) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    tail = '{"signal": "teach"}</outcome>'
+    deltas = spoken_chunks([*SPOKEN_DELTAS, "\n" + OUTCOME_MARKER, tail])
+    reasoning = FakeReasoning(log, deltas, speaker.received)
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT, SECOND_CONCEPT_TEXT]), speaker, reasoning)
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert outcome_lines(caplog)[0] == "turn.outcome turn_id=turn-1 signal=None phase=teach"
+    assert reasoning.prompts[1].history[1] == Message(
+        role="assistant", content=SPOKEN_WITH_TAIL + tail
+    )
+
+
+async def test_a_tail_is_capped_at_the_limit() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    frame = json.dumps({"signal": "covered", "settling": ""})
+    tail = json.dumps({"signal": "covered", "settling": "a" * (TAIL_LIMIT + 100 - len(frame))})
+    assert len(tail) == TAIL_LIMIT + 100
+    deltas = spoken_chunks([*SPOKEN_DELTAS, "\n" + OUTCOME_MARKER, tail])
+    reasoning = FakeReasoning(log, deltas, speaker.received)
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT, SECOND_CONCEPT_TEXT]), speaker, reasoning)
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert reasoning.prompts[1].history[1] == Message(
+        role="assistant", content=SPOKEN_WITH_TAIL + tail[:TAIL_LIMIT]
+    )
+
+
+async def test_a_cancelled_turn_keeps_no_tail() -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold, hold_at=1)
+    reasoning = FakeReasoning(log, spoken_chunks(TAILED_DELTAS), speaker.received)
+    barge = asyncio.Event()
+    resume = asyncio.Event()
+    source = ScriptedSource(
+        [EndOfTurn(text=CONCEPT_TEXT), barge, SpeechStarted(), resume, EndOfTurn(text="two")]
+    )
+    loop = concept_loop(log, source, speaker, reasoning)
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(speaker.held.wait(), HANG_GUARD_S)
+    assert ("stream_closed", 6) in log
+    assert loop._tails == {"turn-1": COVERED_TAIL}
+    assert speaker.utterances == [[SPOKEN_CLAUSES[0]]]
+    turn = turn_task()
+
+    await pull_past(source, barge)
+    hold.set()
+    await asyncio.wait_for(asyncio.wait([turn]), HANG_GUARD_S)
+
+    assert turn.cancelled()
+    assert loop._tails == {}
+
+    resume.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert reasoning.prompts[1].history == [
+        Message(role="user", content=CONCEPT_TEXT),
+        Message(role="assistant", content=SPOKEN_CLAUSES[0]),
+    ]
+
+
+@pytest.mark.parametrize("completes", [False, True], ids=["open", "completed"])
+async def test_a_mismatched_speculation_leaves_no_tail_in_the_transcript(completes: bool) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    gate = asyncio.Event()
+    holds_at = len(TAILED_DELTAS) - 1 if completes else 3
+    turns = [
+        spoken_chunks(TAILED_DELTAS),
+        spoken_chunks(SPOKEN_DELTAS),
+        spoken_chunks(SPOKEN_DELTAS),
+    ]
+    reasoning = FakeReasoning(log, [], speaker.received, gate=gate, holds_at=holds_at, turns=turns)
+    endpoint = asyncio.Event()
+    source = ScriptedSource(
+        [
+            PartialTranscript(text=CONCEPT_PARTIAL),
+            endpoint,
+            EndOfTurn(text="two"),
+            speaker.finished,
+            EndOfTurn(text="three"),
+        ]
+    )
+    cfg = concept_cfg().model_copy(update={"speculative_reasoning": True})
+    loop = concept_loop(log, source, speaker, reasoning, cfg=cfg)
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+    speculation = speculation_task()
+    if completes:
+        gate.set()
+        await asyncio.wait_for(asyncio.wait([speculation]), HANG_GUARD_S)
+        assert not speculation.cancelled() and speculation.exception() is None
+        assert loop._tails == {"turn-1": COVERED_TAIL}
+
+    await pull_past(source, endpoint)
+    gate.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert [prompt.user_text for prompt in reasoning.prompts] == [CONCEPT_PARTIAL, "two", "three"]
+    assert reasoning.prompts[2].history == [
+        Message(role="user", content="two"),
+        Message(role="assistant", content=" ".join(SPOKEN_CLAUSES)),
+    ]
+    assert loop._tails == {}
+
+
+async def test_a_superseded_speculations_tail_never_reaches_the_transcript() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    gate = asyncio.Event()
+    turns = [spoken_chunks(TOLD_DELTAS), spoken_chunks(SPOKEN_DELTAS), spoken_chunks(SPOKEN_DELTAS)]
+    reasoning = FakeReasoning(
+        log, [], speaker.received, gate=gate, holds_at=len(TOLD_DELTAS) - 1, turns=turns
+    )
+    settled = asyncio.Event()
+    primed = asyncio.Event()
+    source = ScriptedSource(
+        [
+            PartialTranscript(text="teach"),
+            settled,
+            PartialTranscript(text=CONCEPT_TEXT),
+            primed,
+            EndOfTurn(text=CONCEPT_TEXT),
+            speaker.finished,
+            EndOfTurn(text="two"),
+        ]
+    )
+    cfg = concept_cfg().model_copy(update={"speculative_reasoning": True})
+    loop = concept_loop(log, source, speaker, reasoning, cfg=cfg)
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+    first = speculation_task()
+    gate.set()
+    await asyncio.wait_for(asyncio.wait([first]), HANG_GUARD_S)
+    assert not first.cancelled() and first.exception() is None
+    assert loop._tails == {"turn-1": TOLD_TAIL}
+    reasoning.started.clear()
+
+    await pull_past(source, settled)
+    assert loop._tails == {}
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await pull_past(source, primed)
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert [prompt.user_text for prompt in reasoning.prompts] == ["teach", CONCEPT_TEXT, "two"]
+    assert speaker.utterances == [SPOKEN_CLAUSES] * 2
+    assert reasoning.prompts[2].history == [
+        Message(role="user", content=CONCEPT_TEXT),
+        Message(role="assistant", content=" ".join(SPOKEN_CLAUSES)),
+    ]
+
+
+async def test_a_completed_speculation_that_is_claimed_keeps_its_tail() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    gate = asyncio.Event()
+    turns = [spoken_chunks(TAILED_DELTAS), spoken_chunks(SPOKEN_DELTAS)]
+    reasoning = FakeReasoning(
+        log, [], speaker.received, gate=gate, holds_at=len(TAILED_DELTAS) - 1, turns=turns
+    )
+    settled = asyncio.Event()
+    source = ScriptedSource(
+        [
+            PartialTranscript(text=CONCEPT_PARTIAL),
+            settled,
+            EndOfTurn(text=CONCEPT_TEXT),
+            speaker.finished,
+            EndOfTurn(text="two"),
+        ]
+    )
+    cfg = concept_cfg().model_copy(update={"speculative_reasoning": True})
+    loop = concept_loop(log, source, speaker, reasoning, cfg=cfg)
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+    speculation = speculation_task()
+    gate.set()
+    await asyncio.wait_for(asyncio.wait([speculation]), HANG_GUARD_S)
+    assert not speculation.cancelled() and speculation.exception() is None
+    assert loop._tails == {"turn-1": COVERED_TAIL}
+
+    await pull_past(source, settled)
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert [prompt.user_text for prompt in reasoning.prompts] == [CONCEPT_PARTIAL, "two"]
+    assert speaker.utterances == [SPOKEN_CLAUSES] * 2
+    assert reasoning.prompts[1].history == [
+        Message(role="user", content=CONCEPT_TEXT),
+        Message(role="assistant", content=SPOKEN_WITH_TAIL + COVERED_TAIL),
+    ]
+    assert loop._tails == {}
+
+
+async def test_a_speculation_cancelled_by_speech_leaves_no_tail_on_the_claimed_turn() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    close_gate = asyncio.Event()
+    filled = [FILLER_DELTA] * (SPOKEN_DEPTH - 1) + ["x. \n" + OUTCOME_MARKER, TOLD_TAIL]
+    turns = [spoken_chunks(filled), spoken_chunks(SPOKEN_DELTAS), spoken_chunks(SPOKEN_DELTAS)]
+    reasoning = FakeReasoning(log, [], speaker.received, close_gate=close_gate, turns=turns)
+    barge = asyncio.Event()
+    resume = asyncio.Event()
+    primed = asyncio.Event()
+    source = ScriptedSource(
+        [
+            PartialTranscript(text=CONCEPT_PARTIAL),
+            barge,
+            SpeechStarted(),
+            resume,
+            PartialTranscript(text=CONCEPT_TEXT),
+            primed,
+            EndOfTurn(text=CONCEPT_TEXT),
+            speaker.finished,
+            EndOfTurn(text="two"),
+        ]
+    )
+    cfg = concept_cfg().model_copy(update={"speculative_reasoning": True})
+    loop = concept_loop(log, source, speaker, reasoning, cfg=cfg)
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].closing.wait(), HANG_GUARD_S)
+    speculation = speculation_task()
+    assert ("stream_closed", len(filled)) in log
+    assert loop._tails == {}
+    reasoning.started.clear()
+
+    close_gate.set()
+    await pull_past(source, barge)
+    await asyncio.wait_for(asyncio.wait([speculation]), HANG_GUARD_S)
+    assert speculation.cancelled()
+    assert loop._tails == {"turn-1": TOLD_TAIL}
+
+    await pull_past(source, resume)
+    assert loop._tails == {}
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await pull_past(source, primed)
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert [prompt.user_text for prompt in reasoning.prompts] == [
+        CONCEPT_PARTIAL,
+        CONCEPT_TEXT,
+        "two",
+    ]
+    assert speaker.utterances == [SPOKEN_CLAUSES] * 2
+    assert reasoning.prompts[2].history == [
+        Message(role="user", content=CONCEPT_TEXT),
+        Message(role="assistant", content=" ".join(SPOKEN_CLAUSES)),
+    ]
+
+
+async def test_a_tool_rounds_tail_yields_to_the_follow_up(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, found())
+    turns = [[SEARCH_CALL, *spoken_chunks(TAILED_DELTAS)], spoken_chunks(SPOKEN_DELTAS)]
+    follow_up = spoken_chunks(FOLLOW_DELTAS)
+    reasoning = FakeReasoning(log, [], speaker.received, follow_up=follow_up, turns=turns)
+    source = SerialSource([USER_TEXT, SECOND_TEXT])
+    loop = TurnLoop(
+        config(tmp_path),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert len(reasoning.prompts) == 3
+    assert outcome_lines(caplog)[0] == "turn.outcome turn_id=turn-1 signal=None phase=teach"
+    history = reasoning.prompts[2].history
+    assert [message.role for message in history] == ["user", "assistant"]
+    assert OUTCOME_MARKER not in history[1].content
+    assert history[1].content.endswith(FOLLOW_DELTAS[-1].strip())
