@@ -115,6 +115,21 @@ class FlushLoggingTransport(FakeTransport):
         super().flush_playout()
 
 
+class BackloggedTransport(FakeTransport):
+    def __init__(self, log: list[tuple[str, object]]) -> None:
+        super().__init__()
+        self._log = log
+
+    async def play(self, pcm: np.ndarray) -> None:
+        self._log.append(("play", len(pcm)))
+        await super().play(pcm)
+        self.backlog_s += 0.5
+
+
+async def no_play(chunk: str, lead_ms: int) -> None:
+    return None
+
+
 @pytest.fixture
 def release() -> Iterator[threading.Event]:
     event = threading.Event()
@@ -132,7 +147,7 @@ async def test_one_array_per_chunk_in_source_order() -> None:
     transport = FakeTransport()
     speaker = Speaker(synth, transport)
 
-    await speaker.speak(source(CHUNKS))
+    await speaker.speak(source(CHUNKS), no_play)
 
     assert synth.calls == CHUNKS
     assert [len(pcm) for pcm in transport.played] == [len(chunk) for chunk in CHUNKS]
@@ -143,7 +158,7 @@ async def test_a_chunk_is_synthesized_only_after_the_previous_one_is_enqueued() 
     log: list[tuple[str, object]] = []
     speaker = Speaker(LoggingSynthesizer(log), LoggingTransport(log))
 
-    await speaker.speak(source(CHUNKS))
+    await speaker.speak(source(CHUNKS), no_play)
 
     assert log == [
         ("synthesize", CHUNKS[0]),
@@ -155,11 +170,83 @@ async def test_a_chunk_is_synthesized_only_after_the_previous_one_is_enqueued() 
     ]
 
 
+async def test_on_play_follows_the_enqueue_with_the_backlog_measured_before_it() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = Speaker(FakeSynthesizer(), BackloggedTransport(log))
+
+    async def on_play(chunk: str, lead_ms: int) -> None:
+        log.append(("on_play", (chunk, lead_ms)))
+
+    await speaker.speak(source(CHUNKS), on_play)
+
+    assert log == [
+        ("play", len(CHUNKS[0])),
+        ("on_play", (CHUNKS[0], 0)),
+        ("play", len(CHUNKS[1])),
+        ("on_play", (CHUNKS[1], 500)),
+        ("play", len(CHUNKS[2])),
+        ("on_play", (CHUNKS[2], 1000)),
+    ]
+
+
+async def test_a_cancelled_utterance_calls_on_play_for_nothing_after_the_cancel(
+    release: threading.Event,
+) -> None:
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    synth = SignallingSynthesizer(release, started, finished, loop)
+    speaker = Speaker(synth, FakeTransport())
+    plays: list[tuple[str, int]] = []
+
+    async def on_play(chunk: str, lead_ms: int) -> None:
+        plays.append((chunk, lead_ms))
+
+    utterance = asyncio.create_task(speaker.speak(source(CHUNKS), on_play))
+    await started.wait()
+    await speaker.cancel()
+    release.set()
+    await finished.wait()
+
+    with pytest.raises(asyncio.CancelledError):
+        await utterance
+
+    assert synth.calls == [CHUNKS[0]]
+    assert plays == []
+
+
+async def test_on_play_stops_with_the_utterance_when_the_cancel_comes_between_chunks() -> None:
+    waiting = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def gated() -> AsyncIterator[str]:
+        yield CHUNKS[0]
+        waiting.set()
+        await gate.wait()
+        yield CHUNKS[1]
+
+    plays: list[tuple[str, int]] = []
+
+    async def on_play(chunk: str, lead_ms: int) -> None:
+        plays.append((chunk, lead_ms))
+
+    speaker = Speaker(FakeSynthesizer(), FakeTransport())
+    utterance = asyncio.create_task(speaker.speak(gated(), on_play))
+    await waiting.wait()
+    await speaker.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await utterance
+
+    gate.set()
+    assert plays == [(CHUNKS[0], 0)]
+
+
 async def test_speak_returns_when_the_source_is_exhausted() -> None:
     transport = FakeTransport()
     speaker = Speaker(FakeSynthesizer(), transport)
 
-    await speaker.speak(source(CHUNKS))
+    await speaker.speak(source(CHUNKS), no_play)
 
     assert len(transport.played) == len(CHUNKS)
     assert speaker._utterance is None
@@ -170,7 +257,7 @@ async def test_an_empty_source_enqueues_nothing() -> None:
     transport = FakeTransport()
     speaker = Speaker(synth, transport)
 
-    await speaker.speak(source([]))
+    await speaker.speak(source([]), no_play)
 
     assert synth.calls == []
     assert transport.played == []
@@ -185,7 +272,7 @@ async def test_synthesis_does_not_run_on_the_event_loop(release: threading.Event
     transport = FakeTransport()
     speaker = Speaker(synth, transport)
 
-    utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
+    utterance = asyncio.create_task(speaker.speak(source(CHUNKS), no_play))
     await started.wait()
     in_flight = list(synth.log)
     pending = list(transport.played)
@@ -208,11 +295,11 @@ async def test_a_second_speak_while_one_is_in_flight_is_refused(
     transport = FakeTransport()
     speaker = Speaker(synth, transport)
 
-    utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
+    utterance = asyncio.create_task(speaker.speak(source(CHUNKS), no_play))
     await started.wait()
 
     with pytest.raises(RuntimeError):
-        await speaker.speak(source(["rejected"]))
+        await speaker.speak(source(["rejected"]), no_play)
 
     assert "rejected" not in synth.calls
 
@@ -222,7 +309,7 @@ async def test_a_second_speak_while_one_is_in_flight_is_refused(
     assert synth.calls == CHUNKS
     assert len(transport.played) == len(CHUNKS)
 
-    await speaker.speak(source(["after"]))
+    await speaker.speak(source(["after"]), no_play)
 
     assert synth.calls == [*CHUNKS, "after"]
     assert [len(pcm) for pcm in transport.played] == [
@@ -243,7 +330,7 @@ async def test_cancel_drops_playout_once_before_speak_unwinds(
 
     async def unwinding() -> None:
         try:
-            await speaker.speak(source(CHUNKS))
+            await speaker.speak(source(CHUNKS), no_play)
         except asyncio.CancelledError:
             log.append("unwound")
             raise
@@ -268,7 +355,7 @@ async def test_the_caller_awaiting_speak_sees_cancelled_error(
     synth = HeldSynthesizer(release, started, loop)
     speaker = Speaker(synth, FakeTransport())
 
-    utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
+    utterance = asyncio.create_task(speaker.speak(source(CHUNKS), no_play))
     await started.wait()
     await speaker.cancel()
     release.set()
@@ -294,7 +381,7 @@ async def test_cancel_while_suspended_on_the_source_stops_the_utterance() -> Non
     transport = FakeTransport()
     speaker = Speaker(synth, transport)
 
-    utterance = asyncio.create_task(speaker.speak(gated()))
+    utterance = asyncio.create_task(speaker.speak(gated(), no_play))
     await waiting.wait()
     await speaker.cancel()
 
@@ -323,7 +410,7 @@ async def test_cancel_returns_normally_to_a_task_that_was_not_cancelled(
         log.append("continued")
         cancelling.append(asyncio.current_task().cancelling())
 
-    utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
+    utterance = asyncio.create_task(speaker.speak(source(CHUNKS), no_play))
     await started.wait()
     caller = asyncio.create_task(canceller())
     await caller
@@ -348,7 +435,7 @@ async def test_audio_already_in_the_worker_thread_is_never_enqueued(
     transport = FakeTransport()
     speaker = Speaker(synth, transport)
 
-    utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
+    utterance = asyncio.create_task(speaker.speak(source(CHUNKS), no_play))
     await started.wait()
     await speaker.cancel()
     release.set()
@@ -369,7 +456,7 @@ async def test_speak_accepts_a_new_utterance_after_cancel(release: threading.Eve
     transport = FakeTransport()
     speaker = Speaker(synth, transport)
 
-    utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
+    utterance = asyncio.create_task(speaker.speak(source(CHUNKS), no_play))
     await started.wait()
     await speaker.cancel()
     release.set()
@@ -378,7 +465,7 @@ async def test_speak_accepts_a_new_utterance_after_cancel(release: threading.Eve
     with pytest.raises(asyncio.CancelledError):
         await utterance
 
-    await speaker.speak(source(["after"]))
+    await speaker.speak(source(["after"]), no_play)
 
     assert synth.calls[-1] == "after"
     assert [len(pcm) for pcm in transport.played] == [len("after")]
@@ -393,7 +480,7 @@ async def test_cancel_on_an_idle_speaker_is_a_no_op() -> None:
 
     assert transport.flushes == 0
 
-    await speaker.speak(source(CHUNKS))
+    await speaker.speak(source(CHUNKS), no_play)
     await speaker.cancel()
 
     assert transport.flushes == 0
@@ -410,14 +497,14 @@ async def test_the_replacement_utterance_runs_while_the_abandoned_call_is_in_fli
     transport = FakeTransport()
     speaker = Speaker(synth, transport)
 
-    utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
+    utterance = asyncio.create_task(speaker.speak(source(CHUNKS), no_play))
     await started.wait()
     await speaker.cancel()
 
     with pytest.raises(asyncio.CancelledError):
         await utterance
 
-    await speaker.speak(source(["after"]))
+    await speaker.speak(source(["after"]), no_play)
     await finished.wait()
 
     assert synth.first_done_at_replacement is False
@@ -444,10 +531,10 @@ async def test_a_cut_utterance_unwinding_late_leaves_the_replacement_in_place() 
 
     speaker = Speaker(FakeSynthesizer(), FakeTransport())
 
-    first = asyncio.create_task(speaker.speak(parking()))
+    first = asyncio.create_task(speaker.speak(parking(), no_play))
     await parked.wait()
     first.cancel()
-    second = asyncio.create_task(speaker.speak(replacement()))
+    second = asyncio.create_task(speaker.speak(replacement(), no_play))
 
     with pytest.raises(asyncio.CancelledError):
         await first
@@ -474,7 +561,7 @@ async def test_one_utterance_logs_a_first_audio_span_and_one_synthesize_span_per
     speaker = Speaker(FakeSynthesizer(), FakeTransport())
 
     with caplog.at_level(logging.DEBUG, logger="tutor.speech"):
-        await speaker.speak(source(TIMING_CHUNKS))
+        await speaker.speak(source(TIMING_CHUNKS), no_play)
 
     records = tutor_speech_records(caplog)
     messages = [record.getMessage() for record in records]
@@ -498,7 +585,7 @@ async def test_no_span_carries_the_spoken_text(caplog: pytest.LogCaptureFixture)
     speaker = Speaker(FakeSynthesizer(), FakeTransport())
 
     with caplog.at_level(logging.DEBUG, logger="tutor.speech"):
-        await speaker.speak(source(TIMING_CHUNKS))
+        await speaker.speak(source(TIMING_CHUNKS), no_play)
 
     messages = [record.getMessage() for record in tutor_speech_records(caplog)]
 
@@ -510,7 +597,7 @@ async def test_an_empty_source_logs_no_spans(caplog: pytest.LogCaptureFixture) -
     speaker = Speaker(FakeSynthesizer(), FakeTransport())
 
     with caplog.at_level(logging.DEBUG, logger="tutor.speech"):
-        await speaker.speak(source([]))
+        await speaker.speak(source([]), no_play)
 
     assert tutor_speech_records(caplog) == []
 
@@ -524,7 +611,7 @@ async def test_cancel_before_first_audio_logs_no_first_audio_span(
     speaker = Speaker(synth, FakeTransport())
 
     with caplog.at_level(logging.DEBUG, logger="tutor.speech"):
-        utterance = asyncio.create_task(speaker.speak(source(CHUNKS)))
+        utterance = asyncio.create_task(speaker.speak(source(CHUNKS), no_play))
         await started.wait()
         await speaker.cancel()
         release.set()

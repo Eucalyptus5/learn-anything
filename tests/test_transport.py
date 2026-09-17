@@ -179,6 +179,18 @@ async def test_send_json_waits_for_the_channel_to_arrive() -> None:
     await connection.close()
 
 
+async def test_the_playout_backlog_is_read_through_the_connection() -> None:
+    pc = local_peer()
+    connection = Connection(pc)
+
+    assert connection.playout_backlog_s() == 0.0
+    await connection.play(np.zeros(TTS_CHUNK_SAMPLES, dtype=np.int16))
+    assert connection.playout_backlog_s() == pytest.approx(TTS_CHUNK_SAMPLES / TTS_SAMPLE_RATE)
+    connection.flush_playout()
+    assert connection.playout_backlog_s() == 0.0
+    await connection.close()
+
+
 async def test_cancelling_the_frames_consumer_unwinds_the_reader_first() -> None:
     pc = local_peer()
     connection = Connection(pc)

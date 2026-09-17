@@ -5,6 +5,7 @@ import pytest
 
 from tutor.constants import TTS_SAMPLE_RATE, WEBRTC_FRAME_SAMPLES, WEBRTC_SAMPLE_RATE
 from tutor.playout import PlayoutTrack
+from tutor.resample import OUTBOUND_STARTUP_DELAY_SAMPLES
 
 TTS_CHUNK_SAMPLES = TTS_SAMPLE_RATE * WEBRTC_FRAME_SAMPLES // WEBRTC_SAMPLE_RATE
 FRAME_SECONDS = WEBRTC_FRAME_SAMPLES / WEBRTC_SAMPLE_RATE
@@ -127,3 +128,50 @@ async def test_a_long_run_consumes_one_frame_of_time_per_frame_after_the_first()
     assert len(pace.waits) == n_frames - 1
     for wait in pace.waits:
         assert wait == pytest.approx(FRAME_SECONDS)
+
+
+async def test_the_backlog_is_zero_on_a_fresh_track() -> None:
+    track, _, _ = paced_track()
+
+    assert track.backlog_s() == 0.0
+
+
+async def test_the_backlog_grows_by_each_enqueued_chunk() -> None:
+    track, _, _ = paced_track()
+
+    for n in range(1, 4):
+        await track.enqueue(chunk(LOUD))
+        assert track.backlog_s() == pytest.approx(n * TTS_CHUNK_SAMPLES / TTS_SAMPLE_RATE)
+
+
+async def test_the_backlog_shrinks_by_one_frame_per_pull() -> None:
+    track, _, _ = paced_track()
+    await enqueue_chunks(track, LOUD, CHUNKS_PER_SIDE)
+    queued = CHUNKS_PER_SIDE * TTS_CHUNK_SAMPLES / TTS_SAMPLE_RATE
+    resampled = CHUNKS_PER_SIDE * WEBRTC_FRAME_SAMPLES
+    whole = (
+        (resampled - OUTBOUND_STARTUP_DELAY_SAMPLES) // WEBRTC_FRAME_SAMPLES * WEBRTC_FRAME_SAMPLES
+    )
+
+    await track.recv()
+    after_first = track.backlog_s()
+
+    assert after_first == pytest.approx((whole - WEBRTC_FRAME_SAMPLES) / WEBRTC_SAMPLE_RATE)
+    assert after_first < queued
+    for pulled in range(2, CHUNKS_PER_SIDE):
+        await track.recv()
+        assert track.backlog_s() == pytest.approx(after_first - (pulled - 1) * FRAME_SECONDS)
+
+
+async def test_flush_zeroes_the_backlog() -> None:
+    track, _, _ = paced_track()
+    await enqueue_chunks(track, LOUD, CHUNKS_PER_SIDE)
+    await track.recv()
+    await track.enqueue(chunk(LOUD))
+    assert track.backlog_s() > 0.0
+
+    track.flush()
+
+    assert track.backlog_s() == 0.0
+    await track.recv()
+    assert track.backlog_s() == 0.0

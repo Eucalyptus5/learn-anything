@@ -106,6 +106,9 @@ class Connection:
     def flush_playout(self) -> None:
         self._playout.flush()
 
+    def playout_backlog_s(self) -> float:
+        return self._playout.backlog_s()
+
     async def send_json(self, payload: dict[str, object]) -> None:
         await self._channel_ready.wait()
         self._channel.send(json.dumps(payload))

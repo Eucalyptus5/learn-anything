@@ -569,9 +569,16 @@ class StampingTransport:
     def flush_playout(self) -> None:
         self.flushes += 1
 
+    def playout_backlog_s(self) -> float:
+        return 0.0
+
     def reset(self) -> None:
         self.stamps.clear()
         self.lengths.clear()
+
+
+async def no_play(chunk: str, lead_ms: int) -> None:
+    return None
 
 
 # called from pool threads, so the bookkeeping stays list appends and one counter
@@ -650,7 +657,7 @@ async def bench_chunked(samples: int) -> None:
         transport.reset()
         mark = len(synth.spans)
         t = time.perf_counter()
-        await speaker.speak(clause_chunks(words(TURN_TEXT)))
+        await speaker.speak(clause_chunks(words(TURN_TEXT)), no_play)
         elapsed = time.perf_counter() - t
         spans = synth.spans[mark:]
         durations = [s.audio for s in spans]
@@ -678,7 +685,7 @@ async def bench_chunked(samples: int) -> None:
     for index in range(samples + 1):
         transport.reset()
         t = time.perf_counter()
-        await speaker.speak(whole(TURN_TEXT))
+        await speaker.speak(whole(TURN_TEXT), no_play)
         if index >= 1:
             whole_first.append(transport.stamps[0] - t)
         print(f"  whole turn {index + 1}/{samples + 1}", end="\r", file=sys.stderr)
@@ -714,12 +721,12 @@ async def bench_cancel(samples: int) -> None:
         transport.reset()
         mark = len(synth.spans)
         speak_at = time.perf_counter()
-        task = asyncio.create_task(speaker.speak(whole(ABANDONED_TEXT)))
+        task = asyncio.create_task(speaker.speak(whole(ABANDONED_TEXT), no_play))
         await asyncio.sleep(CANCEL_AFTER_S)
         cancel_at = time.perf_counter()
         await speaker.cancel()
         returned = time.perf_counter() - cancel_at
-        await speaker.speak(whole(REPLACEMENT_TEXT))
+        await speaker.speak(whole(REPLACEMENT_TEXT), no_play)
         spans = list(synth.spans[mark:])
         replacement = next(s for s in spans if s.words == replacement_words)
         still_running = in_flight_at(
@@ -743,7 +750,7 @@ async def bench_cancel(samples: int) -> None:
     for index in range(samples + 1):
         transport.reset()
         mark = len(synth.spans)
-        await speaker.speak(whole(REPLACEMENT_TEXT))
+        await speaker.speak(whole(REPLACEMENT_TEXT), no_play)
         if index >= 1:
             alone.append(synth.spans[mark].elapsed)
         print(f"  baseline {index + 1}/{samples + 1}", end="\r", file=sys.stderr)

@@ -7,7 +7,7 @@ import av
 import numpy as np
 from aiortc.mediastreams import MediaStreamTrack
 
-from tutor.constants import WEBRTC_FRAME_SAMPLES, WEBRTC_SAMPLE_RATE
+from tutor.constants import TTS_SAMPLE_RATE, WEBRTC_FRAME_SAMPLES, WEBRTC_SAMPLE_RATE
 from tutor.resample import OutboundResampler
 
 PLAYOUT_QUEUE_CHUNKS = 32
@@ -26,12 +26,14 @@ class PlayoutTrack(MediaStreamTrack):
         self._clock = clock
         self._resampler = OutboundResampler()
         self._queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=PLAYOUT_QUEUE_CHUNKS)
+        self._queued = 0
         self._start = 0.0
         self._timestamp = 0
         self._started = False
 
     async def enqueue(self, pcm: np.ndarray) -> None:
         await self._queue.put(pcm)
+        self._queued += len(pcm)
 
     def flush(self) -> None:
         while True:
@@ -39,7 +41,11 @@ class PlayoutTrack(MediaStreamTrack):
                 self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+        self._queued = 0
         self._resampler.flush()
+
+    def backlog_s(self) -> float:
+        return self._queued / TTS_SAMPLE_RATE + self._resampler.available() / WEBRTC_SAMPLE_RATE
 
     async def recv(self) -> av.AudioFrame:
         if self._started:
@@ -51,9 +57,11 @@ class PlayoutTrack(MediaStreamTrack):
 
         while True:
             try:
-                self._resampler.push(self._queue.get_nowait())
+                pcm = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            self._queued -= len(pcm)
+            self._resampler.push(pcm)
 
         pcm = self._resampler.pull(WEBRTC_FRAME_SAMPLES)
         frame = av.AudioFrame.from_ndarray(pcm.reshape(1, -1), format="s16", layout="mono")

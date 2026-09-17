@@ -85,12 +85,16 @@ class FakeTransport:
         self.sent: list[dict[str, object]] = []
         self.handlers: list[Callable[[dict[str, object]], None]] = []
         self.flushes = 0
+        self.backlog_s = 0.0
 
     async def play(self, pcm: np.ndarray) -> None:
         self.played.append(pcm)
 
     def flush_playout(self) -> None:
         self.flushes += 1
+
+    def playout_backlog_s(self) -> float:
+        return self.backlog_s
 
     async def send_json(self, payload: dict[str, object]) -> None:
         self.sent.append(payload)
