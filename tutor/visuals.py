@@ -78,8 +78,23 @@ class LearnerText(BaseModel):
     text: str = Field(max_length=4000)
 
 
+class VisualPending(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["visual.pending"] = "visual.pending"
+    turn_id: str = Field(max_length=32)
+    title: str = Field(max_length=80)
+
+
 ChannelPayload = Annotated[
-    DiagramPush | DiagramClear | SourceHighlight | AppPush | TurnState | Caption | LearnerText,
+    DiagramPush
+    | DiagramClear
+    | SourceHighlight
+    | AppPush
+    | TurnState
+    | Caption
+    | LearnerText
+    | VisualPending,
     Field(discriminator="type"),
 ]
 

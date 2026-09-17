@@ -34,6 +34,8 @@ const good = [
   ["caption", { type: "caption", seq: 7, turn_id: "turn-1", text: "PPO clips.", lead_ms: 1200 }],
   ["caption lead 0", { type: "caption", seq: 8, turn_id: "turn-1", text: "PPO clips.", lead_ms: 0 }],
   ["transcript", { type: "transcript", seq: 9, turn_id: "turn-1", text: "teach me ppo" }],
+  ["visual.pending", { type: "visual.pending", seq: 10, turn_id: "turn-1", title: "Clipped objective" }],
+  ["visual.pending cleared", { type: "visual.pending", seq: 11, turn_id: "turn-1", title: "" }],
 ];
 
 const hostile = [
@@ -53,6 +55,9 @@ const hostile = [
   ["phase review", { type: "state", seq: 5, state: "thinking", phase: "review", interrupted: false }],
   ["interrupted yes", { type: "state", seq: 5, state: "thinking", phase: "teach", interrupted: "yes" }],
   ["state missing interrupted", { type: "state", seq: 5, state: "thinking", phase: "teach" }],
+  ["visual.pending title of 81", { type: "visual.pending", seq: 5, turn_id: "turn-1", title: "t".repeat(81) }],
+  ["visual.pending missing title", { type: "visual.pending", seq: 5, turn_id: "turn-1" }],
+  ["visual.pending turn_id of 33", { type: "visual.pending", seq: 5, turn_id: "t".repeat(33), title: "t" }],
   ["path of 4097", { type: "source.highlight", seq: 5, path: "x".repeat(4097), start_line: 1, end_line: 1 }],
   ["kind pie", { type: "diagram.push", seq: 5, id: "a", kind: "pie", source: "pie", title: "t" }],
   ["start_line 0", { type: "source.highlight", seq: 5, path: "a", start_line: 0, end_line: 1 }],

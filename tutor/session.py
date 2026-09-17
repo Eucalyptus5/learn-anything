@@ -35,6 +35,7 @@ from tutor.visuals import (
     ThemeMessage,
     TurnState,
     VisualChannel,
+    VisualPending,
 )
 
 logger = logging.getLogger(__name__)
@@ -671,12 +672,16 @@ class TurnLoop:
             return
         previous, self._last_brief = self._last_brief, brief
         prompt = visual_prompt(snapshot, brief, previous, self._theme)
-        task = asyncio.create_task(self._visual(turn_id, prompt), name=f"{turn_id}-visual")
+        task = asyncio.create_task(
+            self._visual(turn_id, prompt, brief.title), name=f"{turn_id}-visual"
+        )
         self._visual_tasks[turn_id] = task
         task.add_done_callback(lambda done: self._visual_done(turn_id, done))
 
-    async def _visual(self, turn_id: str, prompt: TurnPrompt) -> str:
+    async def _visual(self, turn_id: str, prompt: TurnPrompt, title: str) -> str:
         number = int(turn_id.removeprefix("turn-"))
+        await self._visuals.push(VisualPending(turn_id=turn_id, title=title))
+        landed = False
         try:
             async with asyncio.timeout(self._cfg.visual_timeout_s):
                 result = await run_visual_call(
@@ -686,12 +691,27 @@ class TurnLoop:
                     self._cfg.visual_max_tokens,
                     lambda: number > self._landed_turn,
                 )
+            landed = result.endswith(": sent")
         except TimeoutError:
             logger.info("visual.timeout turn_id=%s", turn_id)
             return "visual: timeout"
-        if result.endswith(": sent"):
+        finally:
+            if not landed:
+                await self._settle(turn_id)
+        if landed:
             self._landed_turn = max(self._landed_turn, number)
         return result
+
+    async def _settle(self, turn_id: str) -> None:
+        try:
+            await self._visuals.push(VisualPending(turn_id=turn_id, title=""))
+        except Exception as error:
+            logger.warning(
+                "visual.pending_push_failed turn_id=%s error=%s",
+                turn_id,
+                type(error).__name__,
+                exc_info=True,
+            )
 
     def _visual_done(self, turn_id: str, task: asyncio.Task[str]) -> None:
         self._visual_tasks.pop(turn_id, None)

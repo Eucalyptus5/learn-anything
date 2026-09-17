@@ -163,6 +163,7 @@ def test_the_validator_names_every_channel_payload_type() -> None:
     assert '"app.push": ["type", "seq", "id", "html", "title"]' in keys[1]
     assert '"state": ["type", "seq", "state", "phase", "interrupted"]' in keys[1]
     assert '"caption": ["type", "seq", "turn_id", "text", "lead_ms"]' in keys[1]
+    assert '"visual.pending": ["type", "seq", "turn_id", "title"]' in keys[1]
 
 
 def test_the_validator_checks_the_lead_and_the_interrupted_flag() -> None:
@@ -187,8 +188,25 @@ def test_the_check_page_probes_the_lead_and_the_interrupted_flag() -> None:
         '"caption missing lead_ms"',
         '"interrupted yes"',
         '"state missing interrupted"',
+        '"visual.pending title of 81"',
+        '"visual.pending missing title"',
+        '"visual.pending turn_id of 33"',
     ):
         assert name in hostile[1], name
+
+
+def test_a_pending_visual_reaches_the_pending_listener() -> None:
+    text = VISUALS.read_text()
+    receive = re.search(r"export function receive\(payload\) \{(.*?)\n\}", text, re.DOTALL)
+    validate = re.search(r"export function validate\(payload\) \{(.*?)\n\}", text, re.DOTALL)
+    assert receive is not None and validate is not None
+    assert re.search(
+        r'case "visual\.pending":\s*listeners\.get\("pending"\)\?\.\(payload\);', receive[1]
+    )
+    case = re.search(r'case "visual\.pending":(.*?)return true;', validate[1], re.DOTALL)
+    assert case is not None
+    assert 'cappedString(payload, "turn_id")' in case[1]
+    assert 'cappedString(payload, "title")' in case[1]
 
 
 def test_every_push_on_the_check_page_carries_a_title() -> None:

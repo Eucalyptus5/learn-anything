@@ -9,6 +9,7 @@ const KEYS = {
   "state": ["type", "seq", "state", "phase", "interrupted"],
   "caption": ["type", "seq", "turn_id", "text", "lead_ms"],
   "transcript": ["type", "seq", "turn_id", "text"],
+  "visual.pending": ["type", "seq", "turn_id", "title"],
 };
 const CAPS = { id: 64, source: 8000, html: 64000, path: 4096, title: 80, turn_id: 32 };
 const TEXT_CAPS = { caption: 2000, transcript: 4000 };
@@ -77,6 +78,10 @@ export function validate(payload) {
       if (!cappedString(payload, "turn_id")) return reject("bad turn_id");
       if (!cappedString(payload, "text", TEXT_CAPS.caption)) return reject("bad text");
       if (!Number.isInteger(payload.lead_ms) || payload.lead_ms < 0) return reject("bad lead_ms");
+      return true;
+    case "visual.pending":
+      if (!cappedString(payload, "turn_id")) return reject("bad turn_id");
+      if (!cappedString(payload, "title")) return reject("bad title");
       return true;
     case "transcript":
       if (!cappedString(payload, "turn_id")) return reject("bad turn_id");
@@ -152,6 +157,9 @@ export function receive(payload) {
     case "source.highlight":
       highlight.textContent =
         payload.path + ":" + payload.start_line + "-" + payload.end_line;
+      break;
+    case "visual.pending":
+      listeners.get("pending")?.(payload);
       break;
     case "state":
     case "caption":

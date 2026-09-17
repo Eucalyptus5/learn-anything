@@ -20,6 +20,7 @@ from tutor.visuals import (
     UngroundedVisual,
     VisualChannel,
     VisualPayload,
+    VisualPending,
 )
 
 _adapter = TypeAdapter(VisualPayload)
@@ -41,6 +42,7 @@ _VALID_SHAPES = [
     {"type": "state", "state": "thinking", "phase": "teach"},
     {"type": "caption", "turn_id": "turn-1", "text": "PPO clips.", "lead_ms": 0},
     {"type": "transcript", "turn_id": "turn-1", "text": "teach me ppo"},
+    {"type": "visual.pending", "turn_id": "turn-1", "title": "Clipped objective"},
 ]
 
 
@@ -190,6 +192,24 @@ def test_a_state_is_not_interrupted_unless_said_so() -> None:
     with pytest.raises(ValidationError):
         _channel_adapter.validate_python(
             {"type": "state", "state": "listening", "phase": "teach", "interrupted": "maybe"}
+        )
+
+
+def test_a_pending_visual_round_trips_and_allows_an_empty_title() -> None:
+    for title in ("Clipped objective", ""):
+        payload = VisualPending(turn_id="turn-1", title=title)
+        dumped = payload.model_dump(mode="json")
+        assert dumped == {"type": "visual.pending", "turn_id": "turn-1", "title": title}
+        assert _channel_adapter.validate_python(dumped) == payload
+    assert len(VisualPending(turn_id="turn-1", title="t" * 80).title) == 80
+
+    with pytest.raises(ValidationError):
+        VisualPending(turn_id="turn-1", title="t" * 81)
+    with pytest.raises(ValidationError):
+        VisualPending(turn_id="t" * 33, title="t")
+    with pytest.raises(ValidationError):
+        _channel_adapter.validate_python(
+            {"type": "visual.pending", "turn_id": "turn-1", "title": "t", "x": 1}
         )
 
 

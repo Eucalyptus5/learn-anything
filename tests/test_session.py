@@ -4090,6 +4090,93 @@ def concept_loop(
     )
 
 
+def pending(log: list[tuple[str, object]], turn_id: str) -> list[str]:
+    return [str(p["title"]) for p in sent(log, "visual.pending") if p["turn_id"] == turn_id]
+
+
+async def test_a_validated_brief_announces_the_pending_visual_before_the_call() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(
+        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL]
+    )
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning)
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert pending(log, "turn-1") == [APP_TITLE]
+    (announced,) = sent(log, "visual.pending")
+    assert log.index(("start_turn", CONCEPT_TEXT)) < log.index(("send_json", announced))
+    assert log.index(("send_json", announced)) < log.index(
+        ("start_turn", visual_user_text(CONCEPT_TEXT))
+    )
+    assert [payload["title"] for payload in sent(log, "app.push")] == [APP_TITLE]
+
+
+async def test_kind_none_announces_no_pending_visual() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    deltas = spoken_chunks([NONE_HEAD, *SPOKEN_DELTAS])
+    reasoning = FakeReasoning(log, deltas, speaker.received, visual=[APP_CALL])
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning)
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert sent(log, "visual.pending") == []
+
+
+async def test_a_truncated_visual_clears_the_pending_title() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    cut = visual_call("push_app", APP_CALL.text[:40], "call-v")
+    reasoning = FakeReasoning(
+        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[cut], visual_finish="length"
+    )
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning)
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert pending(log, "turn-1") == [APP_TITLE, ""]
+    assert sent(log, "app.push") == []
+
+
+class ClosedSettleTransport(LoggingTransport):
+    async def send_json(self, payload: dict[str, object]) -> None:
+        if payload["type"] == "visual.pending" and payload["title"] == "":
+            raise ChannelClosed()
+        self._log.append(("send_json", payload))
+
+
+async def test_a_pending_clear_on_a_closed_channel_is_a_warning_not_a_second_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(
+        log,
+        spoken_chunks(BRIEFED_DELTAS),
+        speaker.received,
+        fails=visual_user_text(CONCEPT_TEXT),
+        visual=[APP_CALL],
+    )
+    loop = concept_loop(
+        log, SerialSource([CONCEPT_TEXT]), speaker, reasoning, transport=ClosedSettleTransport(log)
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert pending(log, "turn-1") == [APP_TITLE]
+    messages = session_messages(caplog)
+    assert "visual.pending_push_failed turn_id=turn-1 error=ChannelClosed" in messages
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors == ["visual.failed turn_id=turn-1 error=RateLimited"]
+
+
 async def test_a_brief_head_starts_the_visual_call_and_is_never_spoken() -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
@@ -4167,6 +4254,7 @@ async def test_the_visual_call_lands_after_the_turn_has_ended() -> None:
     await asyncio.wait_for(visual, HANG_GUARD_S)
 
     assert [payload["title"] for payload in sent(log, "app.push")] == [APP_TITLE]
+    assert pending(log, "turn-1") == [APP_TITLE]
     await loop.aclose()
 
 
@@ -4194,6 +4282,8 @@ async def test_a_visual_that_finishes_after_a_newer_one_has_landed_is_dropped(
     (push,) = sent(log, "app.push")
     assert log.index(("send_json", push)) < log.index(("release", None))
     assert "visual.superseded turn_id=turn-1" in session_messages(caplog)
+    assert pending(log, "turn-1") == [APP_TITLE, ""]
+    assert pending(log, "turn-2") == [APP_TITLE]
 
 
 async def test_an_older_visual_lands_while_the_newer_one_is_still_drawing() -> None:
@@ -4227,6 +4317,8 @@ async def test_an_older_visual_lands_while_the_newer_one_is_still_drawing() -> N
     pushes = sent(log, "app.push")
     assert [payload["title"] for payload in pushes] == [APP_TITLE, APP_TITLE]
     assert pushes[0]["seq"] < pushes[1]["seq"]
+    assert pending(log, "turn-1") == [APP_TITLE]
+    assert pending(log, "turn-2") == [APP_TITLE]
 
 
 async def test_a_visual_call_error_is_one_log_line_and_the_voice_is_untouched(
@@ -4251,6 +4343,7 @@ async def test_a_visual_call_error_is_one_log_line_and_the_voice_is_untouched(
     errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
     assert errors == ["visual.failed turn_id=turn-1 error=RateLimited"]
     assert sent(log, "app.push") == []
+    assert pending(log, "turn-1") == [APP_TITLE, ""]
 
 
 async def test_a_visual_call_past_the_timeout_is_cancelled(
@@ -4284,6 +4377,8 @@ async def test_a_visual_call_past_the_timeout_is_cancelled(
     assert ("open_turn", "turn-2") in log
     assert speaker.utterances == [SPOKEN_CLAUSES, SPOKEN_CLAUSES]
     assert [payload["title"] for payload in sent(log, "app.push")] == [APP_TITLE]
+    assert pending(log, "turn-1") == [APP_TITLE, ""]
+    assert pending(log, "turn-2") == [APP_TITLE]
 
 
 async def test_a_barge_in_cancels_the_interrupted_turns_visual_call() -> None:
@@ -4321,6 +4416,7 @@ async def test_a_barge_in_cancels_the_interrupted_turns_visual_call() -> None:
     assert turn.cancelled()
     assert drain.cancelled()
     assert visual.cancelled()
+    assert pending(log, "turn-1") == [APP_TITLE, ""]
     assert sent(log, "app.push") == []
     assert ("abandon", "turn-1") in log
 
@@ -4891,6 +4987,7 @@ async def test_aclose_cancels_a_visual_call_in_flight() -> None:
     await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
 
     assert visual.cancelled()
+    assert pending(log, "turn-1") == [APP_TITLE, ""]
     assert sent(log, "app.push") == []
 
 
