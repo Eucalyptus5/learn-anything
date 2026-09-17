@@ -1,6 +1,6 @@
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from tutor.tools.models import Position
 from tutor.tools.provenance import TurnRegistry
@@ -80,6 +80,29 @@ ChannelPayload = Annotated[
     DiagramPush | DiagramClear | SourceHighlight | AppPush | TurnState | Caption | LearnerText,
     Field(discriminator="type"),
 ]
+
+
+class ThemeMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["theme"] = "theme"
+    theme: Literal["light", "dark"]
+
+
+class SayMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["say"] = "say"
+    text: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def _strip(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
+
+
+ClientMessage = Annotated[ThemeMessage | SayMessage, Field(discriminator="type")]
+CLIENT_MESSAGE = TypeAdapter(ClientMessage)
 
 
 class UngroundedVisual(Exception):

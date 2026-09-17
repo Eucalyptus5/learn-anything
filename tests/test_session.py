@@ -871,9 +871,7 @@ async def test_a_failing_search_in_the_model_round_is_reported_and_the_loop_keep
     reasoning = FakeReasoning(
         log, [], speaker.received, follow_up=spoken_chunks(SPOKEN_DELTAS), turns=turns
     )
-    source = ScriptedSource(
-        [EndOfTurn(text=USER_TEXT), EndOfTurn(text=SECOND_TEXT), speaker.finished]
-    )
+    source = SerialSource([USER_TEXT, SECOND_TEXT])
     loop = TurnLoop(
         config(tmp_path),
         source,
@@ -1170,8 +1168,8 @@ async def test_each_reasoning_stream_is_iterated_once(tmp_path: Path) -> None:
     await loop.aclose()
 
 
-def turn_task() -> asyncio.Task[None]:
-    turns = [task for task in asyncio.all_tasks() if task.get_name() == TURN_TASK]
+def turn_task(name: str = TURN_TASK) -> asyncio.Task[None]:
+    turns = [task for task in asyncio.all_tasks() if task.get_name() == name]
     assert len(turns) == 1
     return turns[0]
 
@@ -4617,8 +4615,208 @@ async def test_an_accepted_theme_is_logged_and_a_rejected_one_is_not(
     await asyncio.wait_for(loop.run(), HANG_GUARD_S)
     await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
 
-    themes = [line for line in session_messages(caplog) if line.startswith("session.theme")]
-    assert themes == ["session.theme theme=dark"]
+    messages = session_messages(caplog)
+    assert [line for line in messages if line.startswith("session.theme")] == [
+        "session.theme theme=dark"
+    ]
+    assert [line for line in messages if line.startswith("client.message_rejected")] == [
+        "client.message_rejected type=theme"
+    ]
+    assert all("sepia" not in line for line in messages)
+
+
+TYPED_TEXT = "why clip"
+BAD_CLIENT_MESSAGES: list[dict[str, object]] = [
+    {"type": "say", "text": ""},
+    {"type": "say"},
+    {"type": "shout", "text": "x"},
+    {"type": "say", "text": "x" * 4001},
+]
+
+
+class ExclusiveSpeaker(FakeSpeaker):
+    def __init__(self, log: list[tuple[str, object]], gate: asyncio.Event) -> None:
+        super().__init__(log, gate=gate, hold_at=1)
+        self.in_flight = False
+
+    async def speak(self, chunks: AsyncIterator[str]) -> None:
+        if self.in_flight:
+            raise RuntimeError("an utterance is already in flight")
+        self.in_flight = True
+        try:
+            await super().speak(chunks)
+        finally:
+            self.in_flight = False
+
+
+async def test_a_typed_say_dispatches_a_turn_like_an_end_of_turn() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    transport = LoggingTransport(log)
+    hold = asyncio.Event()
+    source = ScriptedSource([hold])
+    loop = concept_loop(log, source, speaker, reasoning, transport=transport)
+    running = asyncio.create_task(loop.run())
+    await asyncio.wait_for(source.blocked.wait(), HANG_GUARD_S)
+
+    transport.handlers[0]({"type": "say", "text": CONCEPT_TEXT})
+    await asyncio.wait_for(speaker.finished.wait(), HANG_GUARD_S)
+    hold.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert ("start_turn", CONCEPT_TEXT) in log
+    assert speaker.utterances == [SPOKEN_CLAUSES]
+    assert [without_seq(p) for p in sent(log, "transcript")] == [
+        {"type": "transcript", "turn_id": "turn-1", "text": CONCEPT_TEXT}
+    ]
+    assert states(log) == ["thinking", "speaking", "listening"]
+    await loop.aclose()
+
+
+async def test_a_typed_say_while_speaking_interrupts_first() -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold, hold_at=1)
+    gate = asyncio.Event()
+    reasoning = FakeReasoning(
+        log, spoken_chunks(SPOKEN_DELTAS), speaker.received, gate=gate, holds_at=3
+    )
+    transport = LoggingTransport(log)
+    end = asyncio.Event()
+    source = ScriptedSource([EndOfTurn(text=CONCEPT_TEXT), end])
+    loop = concept_loop(log, source, speaker, reasoning, transport=transport)
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(speaker.held.wait(), HANG_GUARD_S)
+    turn = turn_task()
+    assert speaker.utterances == [[SPOKEN_CLAUSES[0]]]
+
+    transport.handlers[0]({"type": "say", "text": SECOND_TEXT})
+    second = turn_task("turn-2")
+    gate.set()
+    hold.set()
+    await asyncio.wait_for(asyncio.wait([turn, second]), HANG_GUARD_S)
+
+    assert turn.cancelled()
+    assert log.index(("flush_playout", None)) < log.index(("abandon", "turn-1"))
+    assert speaker.utterances == [[SPOKEN_CLAUSES[0]], SPOKEN_CLAUSES]
+    assert [prompt.user_text for prompt in reasoning.prompts] == [CONCEPT_TEXT, SECOND_TEXT]
+    end.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await loop.aclose()
+
+
+async def test_a_say_between_speech_start_and_end_of_turn_never_overlaps_the_spoken_turn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = ExclusiveSpeaker(log, hold)
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    transport = LoggingTransport(log)
+    barge = asyncio.Event()
+    typed = asyncio.Event()
+    end = asyncio.Event()
+    source = ScriptedSource(
+        [
+            EndOfTurn(text=CONCEPT_TEXT),
+            barge,
+            SpeechStarted(),
+            typed,
+            EndOfTurn(text=SECOND_TEXT),
+            end,
+        ]
+    )
+    loop = concept_loop(log, source, speaker, reasoning, transport=transport)
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(speaker.held.wait(), HANG_GUARD_S)
+        first = turn_task()
+        speaker.held.clear()
+        await pull_past(source, barge)
+        await asyncio.wait_for(asyncio.wait([first]), HANG_GUARD_S)
+        assert first.cancelled()
+
+        transport.handlers[0]({"type": "say", "text": TYPED_TEXT})
+        second = turn_task("turn-2")
+        await asyncio.wait_for(speaker.held.wait(), HANG_GUARD_S)
+        speaker.held.clear()
+        await pull_past(source, typed)
+        third = turn_task("turn-3")
+        await asyncio.wait_for(asyncio.wait([second]), HANG_GUARD_S)
+        hold.set()
+        await asyncio.wait_for(asyncio.wait([third]), HANG_GUARD_S)
+        end.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert second.cancelled()
+    assert ("abandon", "turn-2") in log
+    assert speaker.utterances == [[SPOKEN_CLAUSES[0]], [SPOKEN_CLAUSES[0]], SPOKEN_CLAUSES]
+    assert not [line for line in session_messages(caplog) if line.startswith("turn.failed")]
+    assert [prompt.user_text for prompt in reasoning.prompts] == [
+        CONCEPT_TEXT,
+        TYPED_TEXT,
+        SECOND_TEXT,
+    ]
+    await loop.aclose()
+
+
+async def test_an_invalid_client_message_is_logged_and_ignored(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    transport = LoggingTransport(log)
+    loop = concept_loop(log, ScriptedSource([]), speaker, reasoning, transport=transport)
+
+    with caplog.at_level(logging.WARNING, logger="tutor.session"):
+        for payload in BAD_CLIENT_MESSAGES:
+            transport.handlers[0](payload)
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert session_messages(caplog) == [
+        "client.message_rejected type=say",
+        "client.message_rejected type=say",
+        "client.message_rejected type=shout",
+        "client.message_rejected type=say",
+    ]
+    assert reasoning.prompts == []
+    assert sent(log, "transcript") == []
+    assert ("flush_playout", None) not in log
+    await loop.aclose()
+
+
+async def test_a_typed_turn_and_a_spoken_turn_share_the_id_sequence() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    transport = LoggingTransport(log)
+    typed = asyncio.Event()
+    source = ScriptedSource([typed, EndOfTurn(text=SECOND_TEXT)])
+    loop = concept_loop(log, source, speaker, reasoning, transport=transport)
+    running = asyncio.create_task(loop.run())
+    await asyncio.wait_for(source.blocked.wait(), HANG_GUARD_S)
+
+    transport.handlers[0]({"type": "say", "text": CONCEPT_TEXT})
+    first = turn_task()
+    await asyncio.wait_for(asyncio.wait([first]), HANG_GUARD_S)
+    typed.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert [(p["turn_id"], p["text"]) for p in sent(log, "transcript")] == [
+        ("turn-1", CONCEPT_TEXT),
+        ("turn-2", SECOND_TEXT),
+    ]
+    assert speaker.utterances == [SPOKEN_CLAUSES, SPOKEN_CLAUSES]
+    assert reasoning.prompts[1].history == [
+        Message(role="user", content=CONCEPT_TEXT),
+        Message(role="assistant", content=" ".join(SPOKEN_CLAUSES)),
+    ]
+    await loop.aclose()
 
 
 async def test_aclose_cancels_a_visual_call_in_flight() -> None:

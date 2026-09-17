@@ -289,7 +289,7 @@
   .caption {
     width: 100%;
     max-width: 880px;
-    margin: 20px auto 24px;
+    margin: 20px auto 12px;
     padding: 20px 28px;
     border-radius: 20px;
     background: var(--raised);
@@ -300,6 +300,19 @@
   }
   .caption.speaking { box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent), var(--lift); }
   .caption .prev { color: var(--ink-3); }
+  #say {
+    display: block;
+    width: 100%;
+    max-width: 880px;
+    margin: 0 auto 24px;
+    padding: 9px 12px;
+    border: 0;
+    border-radius: 10px;
+    background: var(--tint);
+    color: var(--ink);
+    font-size: 14px;
+  }
+  #say::placeholder { color: var(--ink-3); }
 
   .welcome {
     flex: 1;
@@ -474,6 +487,7 @@
         <span class="prev"></span>
         <span class="cur"></span>
       </p>
+      <input id="say" type="text" placeholder="type instead of speaking" maxlength="4000" aria-label="Type a line to the tutor" autocomplete="off">
     </div>
   </main>
   <aside class="drawer" hidden>

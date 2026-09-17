@@ -426,6 +426,44 @@ async def test_the_replacement_utterance_runs_while_the_abandoned_call_is_in_fli
     assert transport.flushes == 1
 
 
+async def test_a_cut_utterance_unwinding_late_leaves_the_replacement_in_place() -> None:
+    parked = asyncio.Event()
+    gate = asyncio.Event()
+    replacement_parked = asyncio.Event()
+    replacement_gate = asyncio.Event()
+
+    async def parking() -> AsyncIterator[str]:
+        yield CHUNKS[0]
+        parked.set()
+        await gate.wait()
+
+    async def replacement() -> AsyncIterator[str]:
+        yield CHUNKS[1]
+        replacement_parked.set()
+        await replacement_gate.wait()
+
+    speaker = Speaker(FakeSynthesizer(), FakeTransport())
+
+    first = asyncio.create_task(speaker.speak(parking()))
+    await parked.wait()
+    first.cancel()
+    second = asyncio.create_task(speaker.speak(replacement()))
+
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await replacement_parked.wait()
+
+    assert first.cancelled()
+    assert not second.done()
+    assert speaker._utterance is not None
+    assert not speaker._utterance.done()
+
+    replacement_gate.set()
+    await second
+
+    assert speaker._utterance is None
+
+
 def tutor_speech_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     return [record for record in caplog.records if record.name == "tutor.speech"]
 

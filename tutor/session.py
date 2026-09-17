@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from tutor.brief import BRIEF_END, BRIEF_MARKER, BriefSplitter, VisualBrief
 from tutor.chunker import Scrubber, clause_chunks, spoken_text
@@ -26,9 +26,16 @@ from tutor.tools.models import SearchBudget, SearchResult
 from tutor.tools.provenance import TurnRegistry
 from tutor.transcript import Transcript
 from tutor.transport import Connection
-from tutor.visual_call import THEMES, run_visual_call, visual_prompt
+from tutor.visual_call import run_visual_call, visual_prompt
 from tutor.visual_tools import VOICE_VISUAL_TOOLS, dispatch_visual_tool
-from tutor.visuals import Caption, LearnerText, TurnState, VisualChannel
+from tutor.visuals import (
+    CLIENT_MESSAGE,
+    Caption,
+    LearnerText,
+    ThemeMessage,
+    TurnState,
+    VisualChannel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -201,10 +208,20 @@ class TurnLoop:
         transport.on_json(self._on_json)
 
     def _on_json(self, payload: dict[str, object]) -> None:
-        theme = payload.get("theme")
-        if payload.get("type") == "theme" and isinstance(theme, str) and theme in THEMES:
-            self._theme = theme
-            logger.debug("session.theme theme=%s", theme)
+        try:
+            message = CLIENT_MESSAGE.validate_python(payload)
+        except ValidationError:
+            kind = payload.get("type")
+            logger.warning(
+                "client.message_rejected type=%s", kind if isinstance(kind, str) else "unknown"
+            )
+            return
+        if isinstance(message, ThemeMessage):
+            self._theme = message.theme
+            logger.debug("session.theme theme=%s", message.theme)
+            return
+        self._interrupt()
+        self._dispatch(message.text)
 
     async def run(self) -> None:
         async for event in self._source.events():
@@ -214,15 +231,20 @@ class TurnLoop:
                 if self._cfg.speculative_reasoning and event.text:
                     self._prime(event.text)
             elif isinstance(event, EndOfTurn):
-                self._dispatched += 1
-                turn_id = f"turn-{self._dispatched}"
-                turn = asyncio.create_task(self._turn(turn_id, event.text), name=turn_id)
-                self._turns.add(turn)
-                turn.add_done_callback(self._turn_done)
+                if any(not turn.cancelling() for turn in self._turns):
+                    self._interrupt()
+                self._dispatch(event.text)
         speculations = [speculation.task for speculation in self._speculations.values()]
         for task in speculations:
             task.cancel()
         await asyncio.gather(*self._turns, *speculations, return_exceptions=True)
+
+    def _dispatch(self, text: str) -> None:
+        self._dispatched += 1
+        turn_id = f"turn-{self._dispatched}"
+        turn = asyncio.create_task(self._turn(turn_id, text), name=turn_id)
+        self._turns.add(turn)
+        turn.add_done_callback(self._turn_done)
 
     def _prime(self, text: str) -> None:
         turn_id = f"turn-{self._dispatched + 1}"

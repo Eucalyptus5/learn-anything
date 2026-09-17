@@ -176,3 +176,31 @@ def test_every_push_on_the_check_page_carries_a_title() -> None:
         assert "title:" in literal, literal
     for name in ('"title of 81"', '"app.push missing title"', '"diagram.push missing title"'):
         assert name in hostile[1], name
+
+
+def say_handler(text: str) -> str:
+    handler = re.search(
+        r'say\.addEventListener\("keydown",\s*\(event\)\s*=>\s*\{(.*?)\n\}\);', text, re.DOTALL
+    )
+    assert handler is not None
+    return handler[1]
+
+
+def test_the_typed_line_is_sent_as_a_say_and_cleared() -> None:
+    client = CLIENT.read_text()
+    assert 'getElementById("say")' in client
+    handler = say_handler(client)
+    assert 'sendJson({ type: "say", text' in handler
+    assert '.value = ""' in handler
+    assert 'readyState === "open"' in handler
+    index = INDEX.read_text()
+    assert '<input id="say"' in index
+    assert 'placeholder="type instead of speaking"' in index
+    assert 'maxlength="4000"' in index
+
+
+def test_the_typed_line_submits_on_enter_only() -> None:
+    handler = say_handler(CLIENT.read_text())
+    assert 'event.key === "Enter"' in handler
+    assert 'sendJson({ type: "say"' not in handler.split('event.key === "Enter"')[0]
+    assert CLIENT.read_text().count("say.addEventListener(") == 1

@@ -17,6 +17,7 @@ const debug = document.querySelector(".debug");
 const stage = document.querySelector(".stage");
 const canvasTitle = stage.querySelector(".canvas .title");
 const caption = stage.querySelector(".caption");
+const say = document.getElementById("say");
 const prev = caption.querySelector(".prev");
 const cur = caption.querySelector(".cur");
 const empty = document.querySelector(".side .empty");
@@ -103,6 +104,7 @@ function begin() {
   sessionLine.hidden = false;
   prev.textContent = "";
   cur.textContent = "";
+  say.value = "";
   caption.classList.remove("speaking");
   thread.replaceChildren();
   liveText.textContent = "listening";
@@ -244,6 +246,17 @@ document.addEventListener("keydown", (event) => {
     app.classList.toggle("with-drawer", !drawer.hidden);
   } else if (event.key === "d") {
     debug.hidden = !debug.hidden;
+  }
+});
+
+say.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.isComposing) {
+    event.preventDefault();
+    const text = say.value.trim();
+    if (text !== "" && channel !== null && channel.readyState === "open") {
+      sendJson({ type: "say", text });
+      say.value = "";
+    }
   }
 });
 

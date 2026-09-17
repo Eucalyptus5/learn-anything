@@ -9,10 +9,13 @@ from tutor.visuals import (
     AppPush,
     Caption,
     ChannelPayload,
+    ClientMessage,
     DiagramClear,
     DiagramPush,
     LearnerText,
+    SayMessage,
     SourceHighlight,
+    ThemeMessage,
     TurnState,
     UngroundedVisual,
     VisualChannel,
@@ -21,6 +24,7 @@ from tutor.visuals import (
 
 _adapter = TypeAdapter(VisualPayload)
 _channel_adapter = TypeAdapter(ChannelPayload)
+_client_adapter = TypeAdapter(ClientMessage)
 
 
 _VALID_SHAPES = [
@@ -462,3 +466,41 @@ async def test_laxly_coerced_lines_are_gated_as_ints() -> None:
             "seq": 1,
         }
     ]
+
+
+def test_client_messages_validate_by_type() -> None:
+    say = _client_adapter.validate_python({"type": "say", "text": "why clip"})
+    theme = _client_adapter.validate_python({"type": "theme", "theme": "dark"})
+
+    assert isinstance(say, SayMessage)
+    assert say.text == "why clip"
+    assert isinstance(theme, ThemeMessage)
+    assert theme.theme == "dark"
+
+
+def test_a_say_is_stripped_and_a_blank_one_is_rejected() -> None:
+    say = _client_adapter.validate_python({"type": "say", "text": "  why clip  "})
+
+    assert say.text == "why clip"
+    with pytest.raises(ValidationError):
+        _client_adapter.validate_python({"type": "say", "text": "   "})
+
+
+def test_a_say_over_the_cap_is_rejected() -> None:
+    assert len(_client_adapter.validate_python({"type": "say", "text": "x" * 4000}).text) == 4000
+    with pytest.raises(ValidationError):
+        _client_adapter.validate_python({"type": "say", "text": "x" * 4001})
+
+
+def test_an_unknown_client_message_type_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _client_adapter.validate_python({"type": "shout", "text": "x"})
+    with pytest.raises(ValidationError):
+        _client_adapter.validate_python({"text": "x"})
+
+
+def test_extra_keys_on_a_client_message_are_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _client_adapter.validate_python({"type": "say", "text": "x", "turn_id": "turn-1"})
+    with pytest.raises(ValidationError):
+        _client_adapter.validate_python({"type": "theme", "theme": "dark", "text": "x"})

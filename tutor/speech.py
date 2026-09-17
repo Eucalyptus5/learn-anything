@@ -42,11 +42,13 @@ class Speaker:
     async def speak(self, chunks: AsyncIterator[str]) -> None:
         if self._utterance is not None and not self._utterance.done():
             raise RuntimeError("an utterance is already in flight")
-        self._utterance = asyncio.create_task(self._drain(chunks))
+        utterance = asyncio.create_task(self._drain(chunks))
+        self._utterance = utterance
         try:
-            await self._utterance
+            await utterance
         finally:
-            self._utterance = None
+            if self._utterance is utterance:
+                self._utterance = None
 
     async def cancel(self) -> None:
         utterance = self._utterance
