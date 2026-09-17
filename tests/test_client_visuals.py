@@ -5,9 +5,10 @@ from tutor.signaling import CLIENT_ROOT
 CLIENT = CLIENT_ROOT / "client.js"
 VISUALS = CLIENT_ROOT / "visuals.js"
 FRAME = CLIENT_ROOT / "frame.html"
+LESSON = CLIENT_ROOT / "lesson.js"
 INDEX = CLIENT_ROOT / "index.html"
 VISUAL_CHECK = CLIENT_ROOT / "visual_check.html"
-GUARDED = [CLIENT, VISUALS, FRAME]
+GUARDED = [CLIENT, VISUALS, FRAME, LESSON]
 HOST_POLICY = {
     "default-src": ["'none'"],
     "script-src": ["'self'", "'unsafe-inline'"],
@@ -58,7 +59,7 @@ def test_frame_creation_never_sets_allow_same_origin() -> None:
 
 
 def test_no_innerhtml_assignment() -> None:
-    for path in (CLIENT, VISUALS):
+    for path in (CLIENT, VISUALS, LESSON):
         assert not re.search(r"\.innerHTML\s*=", path.read_text()), path.name
 
 
@@ -86,7 +87,7 @@ def test_the_theme_is_sent_on_open_and_on_change() -> None:
 
 
 def test_captions_and_transcript_use_text_content_only() -> None:
-    for path in (CLIENT, VISUALS):
+    for path in (CLIENT, VISUALS, LESSON):
         for sink in HTML_SINKS:
             assert not sink.search(path.read_text()), (path.name, sink.pattern)
     client = CLIENT.read_text()
@@ -217,11 +218,38 @@ def test_every_push_on_the_check_page_carries_a_title() -> None:
     pushes = re.findall(r'\{ type: "(?:diagram|app)\.push"[^}]*\}', good[1])
     receives = re.findall(r'receive\(\{ type: "(?:diagram|app)\.push"[^}]*\}\)', text)
     assert len(pushes) == 2
-    assert len(receives) == 4
+    assert len(receives) == 5
     for literal in pushes + receives:
         assert "title:" in literal, literal
     for name in ('"title of 81"', '"app.push missing title"', '"diagram.push missing title"'):
         assert name in hostile[1], name
+
+
+def test_the_lesson_helper_reaches_nothing_outside_its_frame() -> None:
+    text = LESSON.read_text()
+    for pattern in (
+        r"\bparent\b",
+        r"\btop\.",
+        r"postMessage",
+        r"fetch\(",
+        r"XMLHttpRequest",
+        r"WebSocket",
+        r"import\(",
+        r"document\.cookie",
+        r"localStorage",
+    ):
+        assert not re.search(pattern, text), pattern
+    assert "window.lesson = Object.freeze({ steps })" in text
+    assert "grid-template-columns: 1fr 220px" in text
+    assert "prefers-reduced-motion" in text
+    assert len(text.splitlines()) < 200
+
+
+def test_the_check_page_narrates_one_app_through_the_helper() -> None:
+    text = VISUAL_CHECK.read_text()
+    assert '<script src="/lesson.js">' in text
+    assert "lesson.steps([" in text
+    assert '"lesson: ok"' in text
 
 
 def say_handler(text: str) -> str:

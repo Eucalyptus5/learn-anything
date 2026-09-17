@@ -139,6 +139,32 @@ document.fonts.ready.then(() => setTimeout(() => {
 }, 800));
 <\/script>`;
 
+const lessonHtml = `<!doctype html><meta charset="utf-8">
+<script src="/lesson.js"><\/script>
+<div id="picture">
+  <svg viewBox="0 0 200 120" width="200" height="120">
+    <line id="axis" x1="10" y1="110" x2="190" y2="110" stroke="var(--ink)" stroke-width="2" fill="none"></line>
+    <path id="curve" d="M10 100 C 60 100, 120 20, 190 20" stroke="var(--accent)" stroke-width="2" fill="none"></path>
+    <text id="label" x="120" y="60" fill="var(--ink-3)" font-size="10">objective</text>
+  </svg>
+</div>
+<script>
+lesson.steps([
+  { say: "The ratio axis", show: "#axis" },
+  { say: "The clipped objective", show: "#curve" },
+  { say: "Its name", show: "#label" },
+]);
+setTimeout(() => {
+  const lines = [...document.querySelectorAll(".lesson-steps p")];
+  const targets = [...document.querySelectorAll("#axis, #curve, #label")];
+  parent.postMessage({ lesson: {
+    lines: lines.length,
+    lit: lines.length > 0 && lines[lines.length - 1].classList.contains("now"),
+    cleared: targets.every((el) => el.style.opacity === "" && el.style.strokeDashoffset === ""),
+  } }, "*");
+}, 6000);
+<\/script>`;
+
 let hostFrameSrcViolations = 0;
 document.addEventListener("securitypolicyviolation", (event) => {
   log("host csp " + event.violatedDirective + " " + event.blockedURI);
@@ -212,6 +238,18 @@ window.addEventListener("message", (event) => {
   log("katex: " + katex);
   log("plotly: " + plotly);
   log(katex && plotly ? "libs: ok" : "libs: FAIL");
+  receive({ type: "app.push", seq: 104, id: "lesson", html: lessonHtml, title: "lesson" });
+  const narrated = canvas.querySelectorAll("iframe");
+  appFrame = narrated[narrated.length - 1];
+});
+
+window.addEventListener("message", (event) => {
+  if (event.source !== appFrame.contentWindow) return;
+  if (typeof event.data !== "object" || event.data === null) return;
+  if (typeof event.data.lesson !== "object" || event.data.lesson === null) return;
+  const { lines, lit, cleared } = event.data.lesson;
+  log("lesson lines: " + lines + " last lit: " + lit + " inline cleared: " + cleared);
+  log(lines === 3 && lit === true && cleared === true ? "lesson: ok" : "lesson: FAIL");
   log("done");
 });
 </script>

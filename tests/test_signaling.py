@@ -17,6 +17,7 @@ INDEX = "<!doctype html><title>tutor</title>"
 SCRIPT = "export const ready = true;\n"
 FRAME = "<!doctype html><title>frame</title><div id=d></div>"
 VISUALS = "export const visuals = true;\n"
+LESSON = "window.lesson = {};\n"
 VISUAL_CHECK = "<!doctype html><title>visual check</title><div id=canvas></div>"
 BENCH_MERMAID = "<!doctype html><title>mermaid bench</title><div id=canvas></div>"
 VENDOR = "globalThis.mermaid = {};\n"
@@ -57,6 +58,7 @@ async def client(tmp_path: Path) -> AsyncIterator[TestClient]:
     (tmp_path / "client.js").write_text(SCRIPT)
     (tmp_path / "frame.html").write_text(FRAME)
     (tmp_path / "visuals.js").write_text(VISUALS)
+    (tmp_path / "lesson.js").write_text(LESSON)
     (tmp_path / "visual_check.html").write_text(VISUAL_CHECK)
     (tmp_path / "bench_mermaid.html").write_text(BENCH_MERMAID)
     (tmp_path / "vendor").mkdir()
@@ -138,6 +140,14 @@ async def test_the_visual_check_harness_is_served(client: TestClient) -> None:
 
     assert harness.status == 200
     assert await harness.text() == VISUAL_CHECK
+
+
+async def test_the_lesson_helper_is_served(client: TestClient) -> None:
+    helper = await client.get("/lesson.js")
+
+    assert helper.status == 200
+    assert await helper.text() == LESSON
+    assert "Content-Security-Policy" not in helper.headers
 
 
 async def test_the_mermaid_benchmark_is_served(client: TestClient) -> None:
