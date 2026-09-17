@@ -15,11 +15,12 @@ const phaseText = phaseChip.lastElementChild;
 const liveText = bar.querySelector(".chip.live").lastElementChild;
 const debug = document.querySelector(".debug");
 const stage = document.querySelector(".stage");
-const canvasTitle = stage.querySelector(".canvas .title");
-const caption = stage.querySelector(".caption");
+const canvas = stage.querySelector(".canvas");
+const canvasTitle = canvas.querySelector(".title");
+const reply = stage.querySelector(".reply");
+const you = reply.querySelector(".you");
+const said = reply.querySelector(".said");
 const say = document.getElementById("say");
-const prev = caption.querySelector(".prev");
-const cur = caption.querySelector(".cur");
 const empty = document.querySelector(".side .empty");
 const historyList = document.querySelector(".history");
 const sessionLine = document.querySelector(".session");
@@ -33,6 +34,7 @@ const dark = matchMedia("(prefers-color-scheme: dark)");
 const handlers = new Map();
 const openHandlers = [];
 const turns = [];
+const held = new Set();
 
 const state = {
   stage: "idle",
@@ -49,6 +51,11 @@ let channel = null;
 let statsTimer = null;
 let mic = null;
 let card = null;
+let replyTurn = "";
+let pendingTurn = "";
+let currentTitle = "";
+let historyCount = 0;
+let pendingState = null;
 
 function render() {
   debug.textContent = [
@@ -76,10 +83,31 @@ export function sendJson(obj) {
   channel.send(JSON.stringify(obj));
 }
 
+function dropHeld() {
+  for (const timer of held) clearTimeout(timer);
+  held.clear();
+  pendingState = null;
+}
+
+function applyState(payload) {
+  liveText.textContent = payload.state;
+  phaseText.textContent = payload.phase;
+  phaseChip.dataset.phase = payload.phase;
+  reply.classList.toggle("speaking", payload.state === "speaking");
+}
+
+function startTurn(turnId) {
+  dropHeld();
+  replyTurn = turnId;
+  you.textContent = "";
+  said.replaceChildren();
+}
+
 function release(reason) {
   state.stage = reason;
   clearInterval(statsTimer);
   statsTimer = null;
+  dropHeld();
   if (mic !== null) {
     mic.getTracks().forEach((track) => track.stop());
     mic = null;
@@ -103,10 +131,13 @@ function begin() {
   sessionSubject.textContent = card.subject;
   sessionFolder.textContent = card.folder || "No folder";
   sessionLine.hidden = false;
-  prev.textContent = "";
-  cur.textContent = "";
+  startTurn("");
   say.value = "";
-  caption.classList.remove("speaking");
+  reply.classList.remove("speaking");
+  canvas.classList.remove("drawing");
+  pendingTurn = "";
+  currentTitle = "";
+  historyCount = 0;
   thread.replaceChildren();
   turns.length = 0;
   liveText.textContent = "listening";
@@ -319,17 +350,30 @@ dark.addEventListener("change", () => {
 });
 
 onPayload("state", (payload) => {
-  liveText.textContent = payload.state;
-  phaseText.textContent = payload.phase;
-  phaseChip.dataset.phase = payload.phase;
-  caption.classList.toggle("speaking", payload.state === "speaking");
   if (payload.state === "thinking") turns[turns.length - 1].phase = payload.phase;
+  if (payload.interrupted) dropHeld();
+  pendingState = null;
+  if (payload.state === "listening" && !payload.interrupted && held.size > 0) {
+    pendingState = payload;
+    return;
+  }
+  applyState(payload);
 });
 
 onPayload("caption", (payload) => {
   turns.find((turn) => turn.turn_id === payload.turn_id).tutor.push(payload.text);
-  prev.textContent = cur.textContent;
-  cur.textContent = payload.text;
+  if (payload.turn_id !== replyTurn) startTurn(payload.turn_id);
+  const timer = setTimeout(() => {
+    held.delete(timer);
+    const span = document.createElement("span");
+    span.className = "now";
+    span.textContent = payload.text;
+    said.querySelector(".now")?.classList.remove("now");
+    said.append(" ", span);
+    said.scrollTop = said.scrollHeight;
+    if (held.size === 0 && pendingState !== null) applyState(pendingState);
+  }, payload.lead_ms);
+  held.add(timer);
   const last = thread.lastElementChild;
   if (last !== null && last.classList.contains("tutor") && last.dataset.turn === payload.turn_id) {
     last.textContent += " " + payload.text;
@@ -345,11 +389,26 @@ onPayload("caption", (payload) => {
 
 onPayload("transcript", (payload) => {
   turns.push({ turn_id: payload.turn_id, phase: null, learner: payload.text, tutor: [] });
+  startTurn(payload.turn_id);
+  you.textContent = payload.text;
   const line = document.createElement("p");
   line.className = "learner";
   line.textContent = payload.text;
   thread.append(line);
   thread.scrollTop = thread.scrollHeight;
+});
+
+onPayload("pending", (payload) => {
+  if (payload.title !== "") {
+    pendingTurn = payload.turn_id;
+    canvasTitle.textContent = payload.title;
+    canvas.classList.add("drawing");
+    return;
+  }
+  if (payload.turn_id !== pendingTurn) return;
+  pendingTurn = "";
+  canvas.classList.remove("drawing");
+  canvasTitle.textContent = currentTitle;
 });
 
 onPayload("history", (items, current) => {
@@ -363,10 +422,16 @@ onPayload("history", (items, current) => {
     }),
   );
   empty.hidden = items.length > 0;
-  canvasTitle.textContent = current >= 0 ? items[current].title : "";
+  if (items.length > historyCount || current < 0) {
+    pendingTurn = "";
+    canvas.classList.remove("drawing");
+  }
+  historyCount = items.length;
+  currentTitle = current >= 0 ? items[current].title : "";
+  if (pendingTurn === "") canvasTitle.textContent = currentTitle;
 });
 
-mount(stage.querySelector(".canvas"));
+mount(canvas);
 onJson("diagram.push", receive);
 onJson("diagram.clear", receive);
 onJson("source.highlight", receive);
@@ -374,6 +439,7 @@ onJson("app.push", receive);
 onJson("state", receive);
 onJson("caption", receive);
 onJson("transcript", receive);
+onJson("visual.pending", receive);
 onOpen(reset);
 onOpen(begin);
 onOpen(sendTheme);

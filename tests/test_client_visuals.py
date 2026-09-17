@@ -212,6 +212,96 @@ def test_a_pending_visual_reaches_the_pending_listener() -> None:
     assert 'cappedString(payload, "title")' in case[1]
 
 
+def test_the_caption_handler_holds_each_clause_for_its_lead() -> None:
+    client = CLIENT.read_text()
+    handler = re.search(r'onPayload\("caption", \(payload\) => \{(.*?)\n\}\);', client, re.DOTALL)
+    assert handler is not None
+    assert "setTimeout(" in handler[1]
+    assert "payload.lead_ms)" in handler[1]
+    assert "startTurn(payload.turn_id)" in handler[1]
+    assert "said.scrollTop = said.scrollHeight" in handler[1]
+
+
+def test_held_captions_drop_only_on_an_interrupted_state() -> None:
+    client = CLIENT.read_text()
+    state = re.search(r'onPayload\("state", \(payload\) => \{(.*?)\n\}\);', client, re.DOTALL)
+    assert state is not None
+    assert re.search(r"if \(payload\.interrupted\) dropHeld\(\);", state[1])
+    assert state[1].count("dropHeld()") == 1
+    transcript = re.search(
+        r'onPayload\("transcript", \(payload\) => \{(.*?)\n\}\);', client, re.DOTALL
+    )
+    assert transcript is not None
+    assert "startTurn(payload.turn_id)" in transcript[1]
+
+
+def test_a_natural_listening_state_waits_for_the_held_captions() -> None:
+    client = CLIENT.read_text()
+    state = re.search(r'onPayload\("state", \(payload\) => \{(.*?)\n\}\);', client, re.DOTALL)
+    caption = re.search(r'onPayload\("caption", \(payload\) => \{(.*?)\n\}\);', client, re.DOTALL)
+    drop = re.search(r"function dropHeld\(\) \{(.*?)\n\}", client, re.DOTALL)
+    assert state is not None and caption is not None and drop is not None
+    assert 'payload.state === "listening" && !payload.interrupted && held.size > 0' in state[1]
+    assert "pendingState = payload" in state[1]
+    stash = state[1].index("pendingState = payload")
+    assert state[1].index("if (payload.interrupted) dropHeld();") < stash
+    assert state[1].count("applyState(payload)") == 1
+    assert "liveText.textContent" not in state[1]
+    assert "held.size === 0 && pendingState !== null" in caption[1]
+    assert "applyState(pendingState)" in caption[1]
+    assert "pendingState = null" in drop[1]
+
+
+def test_the_reply_card_replaces_the_caption_line() -> None:
+    index = INDEX.read_text()
+    client = CLIENT.read_text()
+    assert 'class="reply"' in index and 'class="you"' in index and 'class="said"' in index
+    assert 'class="caption"' not in index
+    assert ".caption" not in index and ".caption" not in client
+    assert "max-height: 4.5em" in index
+    assert ".canvas iframe.landing" in index and ".canvas.drawing" in index
+
+
+def test_the_reduced_motion_block_closes_the_stylesheet() -> None:
+    index = INDEX.read_text()
+    sheet = re.search(r"<style>(.*?)</style>", index, re.DOTALL)
+    assert sheet is not None
+    reduced = re.search(
+        r"@media \(prefers-reduced-motion: reduce\) \{(.*?)\n  \}", sheet[1], re.DOTALL
+    )
+    assert reduced is not None
+    assert ".canvas iframe { transition: none; }" in reduced[1]
+    assert ".canvas iframe.landing { opacity: 1; transform: none; }" in reduced[1]
+    assert ".canvas.drawing { animation: none;" in reduced[1]
+    assert sheet[1][reduced.end() :].strip() == ""
+    for selector in (".canvas iframe {", ".canvas iframe.landing {", ".canvas.drawing {"):
+        assert sheet[1].index(selector) < reduced.start(), selector
+
+
+def test_the_drawing_state_clears_on_a_landing_and_a_matching_clear_only() -> None:
+    client = CLIENT.read_text()
+    pending = re.search(r'onPayload\("pending", \(payload\) => \{(.*?)\n\}\);', client, re.DOTALL)
+    history = re.search(
+        r'onPayload\("history", \(items, current\) => \{(.*?)\n\}\);', client, re.DOTALL
+    )
+    assert pending is not None and history is not None
+    assert "payload.turn_id !== pendingTurn" in pending[1]
+    assert "items.length > historyCount || current < 0" in history[1]
+    assert 'canvas.classList.remove("drawing")' in pending[1]
+    assert 'canvas.classList.remove("drawing")' in history[1]
+    assert 'onJson("visual.pending", receive)' in client
+
+
+def test_a_new_frame_lands_with_the_landing_class_until_it_loads() -> None:
+    text = VISUALS.read_text()
+    frame = re.search(r"function sandboxedFrame\(\) \{(.*?)\n\}", text, re.DOTALL)
+    assert frame is not None
+    assert 'classList.add("landing")' in frame[1]
+    assert re.search(
+        r'addEventListener\("load", \(\) => element\.classList\.remove\("landing"\)', frame[1]
+    )
+
+
 def test_every_push_on_the_check_page_carries_a_title() -> None:
     text = VISUAL_CHECK.read_text()
     good = re.search(r"const good = \[(.*?)\n\];", text, re.DOTALL)

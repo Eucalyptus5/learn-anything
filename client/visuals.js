@@ -99,6 +99,8 @@ function sandboxedFrame() {
   element.setAttribute("sandbox", "allow-scripts");
   element.setAttribute("allow", "");
   element.setAttribute("referrerpolicy", "no-referrer");
+  element.classList.add("landing");
+  element.addEventListener("load", () => element.classList.remove("landing"), { once: true });
   return element;
 }
 
