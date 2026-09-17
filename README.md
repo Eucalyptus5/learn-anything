@@ -103,8 +103,8 @@ The browser libraries are vendored the same way:
 uv run python scripts/fetch_client_assets.py
 ```
 
-downloads sha256-pinned tarballs from the npm registry into `client/vendor/`. ripgrep has to be
-on `PATH`. Then:
+downloads sha256-pinned tarballs from the npm registry into `client/vendor/`. ripgrep and node
+have to be on `PATH`. Then:
 
 ```
 uv run tutor
@@ -121,8 +121,9 @@ uv run ruff format && uv run ruff check
 ```
 
 875 tests in about six seconds. Every model is a fake in the suite; ripgrep is real and runs
-against `tests/data/fixture_repo`. No test sleeps or asserts a wall-clock latency. Timing lives
-in `scripts/bench_*.py`, run on purpose, and each prints its sample count.
+against `tests/data/fixture_repo`, and one test runs the diagram frame's id parsing under node.
+No test sleeps or asserts a wall-clock latency. Timing lives in `scripts/bench_*.py`, run on
+purpose, and each prints its sample count.
 
 ## Layout
 

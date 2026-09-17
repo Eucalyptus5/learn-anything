@@ -1,4 +1,6 @@
+import json
 import re
+import subprocess
 
 from tutor.signaling import CLIENT_ROOT
 
@@ -375,3 +377,51 @@ def test_the_markdown_lists_visuals_by_seq_after_the_turns_not_by_caption_range(
     assert builder[1].index("turns") < builder[1].index("## visuals")
     assert builder[1].index("## visuals") < builder[1].index("entries()")
     assert "_visual: ${" in builder[1]
+
+
+def test_the_frame_answers_before_the_staged_reveal_and_restarts_it_per_render() -> None:
+    text = FRAME.read_text()
+    render = re.search(r"async function render\(m\) \{(.*?)\n\}", text, re.DOTALL)
+    clear = re.search(r"async function clear\(\) \{(.*?)\n\}", text, re.DOTALL)
+    stage = re.search(r"function stage\(svg, kind, token\) \{(.*?)\n\}", text, re.DOTALL)
+    assert render is not None and clear is not None and stage is not None
+    assert "reveal += 1" in render[1] and "reveal += 1" in clear[1]
+    assert "postMessage" not in render[1] and "postMessage" not in stage[1]
+    assert "setTimeout(" in stage[1] and "token !== reveal" in stage[1]
+    assert "source.postMessage({ seq: m.seq, ok }, origin)" in text
+    assert "prefers-reduced-motion" in text
+    assert "transform" not in text
+
+
+def test_edge_ends_resolve_under_the_render_id_prefix_mermaid_writes() -> None:
+    text = FRAME.read_text()
+    functions = re.findall(
+        r"^function (?:nodeName|edgeId|edgeEnds)\(.*?\n\}", text, re.MULTILINE | re.DOTALL
+    )
+    assert len(functions) == 3
+    probe = (
+        "\n".join(functions)
+        + """
+const ids = ["flowchart-a-0", "flowchart-b-1", "flowchart-x_1-2", "flowchart-y_2-3"];
+const names = new Set(ids.map(nodeName));
+process.stdout.write(JSON.stringify({
+  a_b: edgeEnds(edgeId("m1-L_a_b_0"), names),
+  a_b_10: edgeEnds(edgeId("m12-L_a_b_10"), names),
+  underscored: edgeEnds(edgeId("m1-L_x_1_y_2_0"), names),
+  bare: edgeEnds(edgeId("L_b_a_0"), names),
+  label: edgeId("m1-L_a_b_0"),
+}));
+"""
+    )
+    run = subprocess.run(["node", "-e", probe], capture_output=True, text=True, check=True)
+    assert json.loads(run.stdout) == {
+        "a_b": ["a", "b"],
+        "a_b_10": ["a", "b"],
+        "underscored": ["x_1", "y_2"],
+        "bare": ["b", "a"],
+        "label": "L_a_b_0",
+    }
+    flowchart = re.search(r"function flowchartSteps\(svg\) \{(.*?)\n\}", text, re.DOTALL)
+    assert flowchart is not None
+    assert "edgeEnds(edgeId(path.id), names)" in flowchart[1]
+    assert "labels.get(edgeId(path.id))" in flowchart[1]

@@ -20,16 +20,100 @@ const INIT = {
   htmlLabels: false,
   suppressErrorRendering: true,
 };
+const FADE_MS = 450;
+const STEP_MS = 500;
+const PART_MS = 350;
+const EASE = "cubic-bezier(.2,.7,.2,1)";
+const still = matchMedia("(prefers-reduced-motion: reduce)");
 const d = document.getElementById("d");
 let chain = Promise.resolve();
+let reveal = 0;
 
 mermaid.initialize(INIT);
 
+function nodeName(id) {
+  return id.replace(/^.*?flowchart-/, "").replace(/-\d+$/, "");
+}
+
+function edgeId(id) {
+  return id.replace(/^.*?(?=L_)/, "");
+}
+
+function edgeEnds(id, names) {
+  const rest = id.replace(/^L_/, "").replace(/_\d+$/, "");
+  for (const from of names) {
+    const to = rest.slice(from.length + 1);
+    if (rest.startsWith(from + "_") && names.has(to)) return [from, to];
+  }
+  return null;
+}
+
+function flowchartSteps(svg) {
+  const nodes = [...svg.querySelectorAll("g.node")];
+  const names = new Set(nodes.map((node) => nodeName(node.id)));
+  const labels = new Map();
+  for (const label of svg.querySelectorAll("g.edgeLabel [data-id]")) {
+    labels.set(label.dataset.id, label.closest("g.edgeLabel"));
+  }
+  const edges = [...svg.querySelectorAll("g.edgePaths path")].map((path) => ({
+    parts: labels.has(edgeId(path.id)) ? [path, labels.get(edgeId(path.id))] : [path],
+    ends: edgeEnds(edgeId(path.id), names),
+    shown: false,
+  }));
+  const seen = new Set();
+  const steps = [];
+  for (const node of nodes) {
+    seen.add(nodeName(node.id));
+    const step = [node];
+    for (const edge of edges) {
+      if (edge.shown || edge.ends === null || !edge.ends.every((name) => seen.has(name))) continue;
+      edge.shown = true;
+      step.push(...edge.parts);
+    }
+    steps.push(step);
+  }
+  const rest = edges.filter((edge) => !edge.shown).flatMap((edge) => edge.parts);
+  if (rest.length > 0) steps.push(rest);
+  return steps;
+}
+
+function sequenceSteps(svg) {
+  return [...svg.querySelectorAll(".messageLine0, .messageLine1")].map((line) => {
+    const text = line.previousElementSibling;
+    return text !== null && text.matches("text.messageText") ? [line, text] : [line];
+  });
+}
+
+function show(el) {
+  el.style.opacity = "";
+  const anim = el.animate([{ opacity: 0 }, { opacity: 1 }], {
+    duration: PART_MS,
+    easing: "ease-out",
+    fill: "forwards",
+  });
+  anim.onfinish = () => anim.cancel();
+}
+
+function stage(svg, kind, token) {
+  if (still.matches) return;
+  const steps = kind === "flowchart" ? flowchartSteps(svg) : sequenceSteps(svg);
+  for (const step of steps) for (const el of step) el.style.opacity = "0";
+  d.animate([{ opacity: 0 }, { opacity: 1 }], { duration: FADE_MS, easing: EASE });
+  steps.forEach((step, i) => {
+    setTimeout(() => {
+      if (token !== reveal) return;
+      for (const el of step) show(el);
+    }, FADE_MS + i * STEP_MS);
+  });
+}
+
 async function render(m) {
+  reveal += 1;
   try {
     const { svg } = await mermaid.render("m" + m.seq, m.source);
     d.innerHTML = svg;
     for (const a of d.querySelectorAll("a")) a.replaceWith(...a.childNodes);
+    stage(d.querySelector("svg"), m.kind, reveal);
     return true;
   } catch (err) {
     d.textContent = (err instanceof Error ? err.message : String(err)).split("\n")[0];
@@ -38,6 +122,7 @@ async function render(m) {
 }
 
 async function clear() {
+  reveal += 1;
   d.replaceChildren();
   return true;
 }

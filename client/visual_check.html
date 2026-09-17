@@ -215,7 +215,7 @@ window.addEventListener("message", (event) => {
     if (hostFrameSrcViolations === 0) log("egress: navigation ESCAPED");
     const blocked = connect + img + (hostFrameSrcViolations > 0 ? 1 : 0);
     log("egress: " + blocked + " of " + EGRESS + " blocked" + (blocked === EGRESS ? "" : ", FAIL"));
-    receive({ type: "diagram.push", seq: 102, id: "check", kind: "flowchart", source: "graph TD; a-->b", title: "a to b" });
+    receive({ type: "diagram.push", seq: 102, id: "check", kind: "flowchart", source: "flowchart TD; a[collect rollouts] -->|batches| b[estimate advantages]; b --> c[clipped update]; c --> a", title: "PPO update loop" });
   }, 500);
 });
 
