@@ -56,12 +56,13 @@ async def run_visual_call(
     channel: VisualChannel,
     max_tokens: int,
     may_land: Callable[[], bool],
+    model: str | None = None,
 ) -> str:
     start = time.perf_counter()
     prose = 0
     call = None
     stream = reasoning.start_turn(
-        prompt, tools=VISUAL_CALL_TOOLS, max_tokens=max_tokens, tool_choice="required"
+        prompt, tools=VISUAL_CALL_TOOLS, max_tokens=max_tokens, tool_choice="required", model=model
     )
     async for chunk in stream:
         if chunk.kind == "spoken":

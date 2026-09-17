@@ -63,6 +63,7 @@ def build_loop(
         history_turns=cfg.history_turns,
         visual_timeout_s=cfg.visual_timeout_s,
         visual_max_tokens=cfg.visual_max_tokens,
+        visual_model=cfg.visual_model,
     )
     return TurnLoop(loop_cfg, source, search, speaker, transport, reasoning, TurnRegistry())
 

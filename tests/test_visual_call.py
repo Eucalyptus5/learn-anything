@@ -135,3 +135,17 @@ async def test_a_call_cut_by_max_tokens_is_reported_as_truncated(caplog) -> None
     assert result == "visual: error: truncated at 3000 tokens"
     assert not [p for name, p in log if name == "send_json"]
     assert any(m.startswith("visual.truncated tool=push_app chars=") for m in caplog.messages)
+
+
+async def test_the_visual_model_reaches_the_call_only_when_given() -> None:
+    log: list[tuple[str, object]] = []
+    reasoning = FakeReasoning(
+        log, [], asyncio.Event(), visual=[visual_call("push_app", APP_ARGUMENTS, "call-v")]
+    )
+    channel = VisualChannel(LoggingTransport(log))
+    prompt = visual_prompt(SNAPSHOT, BRIEF, None, "light")
+
+    await run_visual_call(reasoning, prompt, channel, 3000, lambda: True)
+    await run_visual_call(reasoning, prompt, channel, 3000, lambda: True, model="draw-1")
+
+    assert reasoning.models == [None, "draw-1"]

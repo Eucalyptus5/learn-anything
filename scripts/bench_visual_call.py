@@ -107,7 +107,9 @@ class CallSample(BaseModel):
     result: str
 
 
-async def one_call(reasoning: MeteredReasoning, kind: str, max_tokens: int) -> CallSample:
+async def one_call(
+    reasoning: MeteredReasoning, kind: str, max_tokens: int, model: str | None = None
+) -> CallSample:
     record = reasoning.begin()
     channel = RecordingChannel()
     t0 = time.perf_counter()
@@ -117,6 +119,7 @@ async def one_call(reasoning: MeteredReasoning, kind: str, max_tokens: int) -> C
         channel,
         max_tokens,
         lambda: True,
+        model=model,
     )
     result_ms = int((time.perf_counter() - t0) * 1000)
     usage = record.visual_usage
@@ -164,8 +167,9 @@ def report(cfg: Settings, args: argparse.Namespace, samples: dict[str, list[Call
         "without that chunk has an unknown cost and is left out of the cost line."
     )
     print(
-        f"model={cfg.reasoning_model}  samples={args.samples} (plus {WARMUP} discarded "
-        f"warm-ups)  visual_max_tokens={cfg.visual_max_tokens}  theme=light  previous=none"
+        f"model={cfg.reasoning_model}  visual_model={cfg.visual_model or cfg.reasoning_model}  "
+        f"samples={args.samples} (plus {WARMUP} discarded warm-ups)  "
+        f"visual_max_tokens={cfg.visual_max_tokens}  theme=light  previous=none"
     )
     for kind in args.kinds:
         calls = samples[kind]
@@ -202,7 +206,9 @@ async def main() -> int:
     try:
         for kind in args.kinds:
             for n in range(total):
-                sample = await one_call(reasoning, kind, cfg.visual_max_tokens)
+                sample = await one_call(
+                    reasoning, kind, cfg.visual_max_tokens, cfg.visual_model or None
+                )
                 if n >= WARMUP:
                     samples[kind].append(sample)
                 print(

@@ -623,6 +623,7 @@ class MeteredReasoning:
         effort: str | None = None,
         max_tokens: int | None = None,
         tool_choice: str | None = None,
+        model: str | None = None,
     ) -> MeteredStream:
         record = self.record
         if record.requested is None:
@@ -636,7 +637,12 @@ class MeteredReasoning:
             }
         )
         inner = self._inner.start_turn(
-            prompt, tools=tools, effort=effort, max_tokens=max_tokens, tool_choice=tool_choice
+            prompt,
+            tools=tools,
+            effort=effort,
+            max_tokens=max_tokens,
+            tool_choice=tool_choice,
+            model=model,
         )
         return MeteredStream(inner, record, (self.ledger, self.ledgers[kind]), kind)
 

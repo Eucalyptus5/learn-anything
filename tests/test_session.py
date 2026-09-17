@@ -574,6 +574,7 @@ class FakeReasoning:
         self.tools: list[list[dict] | None] = []
         self.max_tokens: list[int | None] = []
         self.tool_choices: list[str | None] = []
+        self.models: list[str | None] = []
         self.streams: list[FakeStream] = []
         self.started = asyncio.Event()
         self.visual_started = asyncio.Event()
@@ -585,11 +586,13 @@ class FakeReasoning:
         tools: Sequence[dict] | None = None,
         max_tokens: int | None = None,
         tool_choice: str | None = None,
+        model: str | None = None,
     ) -> FakeStream:
         self.prompts.append(prompt)
         self.tools.append(list(tools) if tools is not None else None)
         self.max_tokens.append(max_tokens)
         self.tool_choices.append(tool_choice)
+        self.models.append(model)
         self._log.append(("start_turn", prompt.user_text))
         if prompt.user_text == self._fails:
             raise RateLimited(RATE_LIMIT_DETAIL)
@@ -4112,6 +4115,37 @@ async def test_a_validated_brief_announces_the_pending_visual_before_the_call() 
         ("start_turn", visual_user_text(CONCEPT_TEXT))
     )
     assert [payload["title"] for payload in sent(log, "app.push")] == [APP_TITLE]
+
+
+async def test_the_visual_call_uses_the_configured_visual_model_and_the_voice_call_does_not() -> (
+    None
+):
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(
+        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL]
+    )
+    cfg = concept_cfg().model_copy(update={"visual_model": "draw-1"})
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning, cfg=cfg)
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert reasoning.models == [None, "draw-1"]
+
+
+async def test_an_empty_visual_model_leaves_the_visual_call_on_the_reasoning_model() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(
+        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL]
+    )
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning)
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert reasoning.models == [None, None]
 
 
 async def test_kind_none_announces_no_pending_visual() -> None:

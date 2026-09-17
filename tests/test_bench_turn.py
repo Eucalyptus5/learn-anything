@@ -214,6 +214,7 @@ class ScriptedReasoning:
         effort: str | None = None,
         max_tokens: int | None = None,
         tool_choice: str | None = None,
+        model: str | None = None,
     ) -> ScriptedStream:
         self.prompts.append(prompt)
         return self._streams.pop(0)

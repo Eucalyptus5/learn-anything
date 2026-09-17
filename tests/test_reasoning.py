@@ -391,6 +391,19 @@ async def test_tool_choice_reaches_the_request() -> None:
     assert bodies[1]["tool_choice"] == "required"
 
 
+async def test_the_model_keyword_replaces_the_settings_model() -> None:
+    bodies: list[dict[str, object]] = []
+    client = ReasoningClient(_settings(), http_client=_mock_client(TWO_THEN_THREE, bodies))
+
+    assert [chunk async for chunk in client.start_turn(PROMPT)]
+    assert [chunk async for chunk in client.start_turn(PROMPT, model="draw-1")]
+
+    await client.aclose()
+
+    assert bodies[0]["model"] == "glm-5.3-flash"
+    assert bodies[1]["model"] == "draw-1"
+
+
 class _ParkedBody(httpx2.AsyncByteStream):
     def __init__(self, head: list[str], release: asyncio.Event, tail: list[str]) -> None:
         self._head = head

@@ -211,9 +211,10 @@ class ReasoningClient:
         effort: str | None = None,
         max_tokens: int | None = None,
         tool_choice: str | None = None,
+        model: str | None = None,
     ) -> TurnStream:
         request: dict[str, object] = {
-            "model": self._cfg.reasoning_model,
+            "model": model if model is not None else self._cfg.reasoning_model,
             "messages": prompt.messages(),
             "reasoning_effort": effort if effort is not None else self._cfg.reasoning_effort,
             "max_tokens": max_tokens if max_tokens is not None else self._cfg.reasoning_max_tokens,

@@ -94,6 +94,7 @@ def test_filled_template_yields_defaults(tmp_path: Path) -> None:
     assert cfg.history_turns == 10
     assert cfg.visual_timeout_s == 90.0
     assert cfg.visual_max_tokens == 3000
+    assert cfg.visual_model == ""
     assert cfg.signaling_port == 8080
 
 

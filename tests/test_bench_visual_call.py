@@ -46,6 +46,7 @@ class ScriptedReasoning:
     def __init__(self, stream: ScriptedStream) -> None:
         self._stream = stream
         self.tool_choices: list[str | None] = []
+        self.models: list[str | None] = []
 
     def start_turn(
         self,
@@ -54,8 +55,10 @@ class ScriptedReasoning:
         effort: str | None = None,
         max_tokens: int | None = None,
         tool_choice: str | None = None,
+        model: str | None = None,
     ) -> ScriptedStream:
         self.tool_choices.append(tool_choice)
+        self.models.append(model)
         return self._stream
 
     async def aclose(self) -> None:
@@ -120,6 +123,7 @@ async def test_a_scripted_push_lands_as_a_valid_sample() -> None:
     sample = await bench_visual_call.one_call(reasoning, "diagram", 3000)
 
     assert scripted.tool_choices == ["required"]
+    assert scripted.models == [None]
     assert sample.valid is True
     assert sample.truncated is False
     assert sample.landing_ms is not None
@@ -210,3 +214,34 @@ def test_the_report_prints_a_verdict_per_kind(capsys) -> None:
     assert "truncated 1/1" in lines
     assert "unknown cost 1/2" in lines
     assert "unknown cost 0/1" in lines
+
+
+async def test_the_visual_model_is_forwarded_to_the_call() -> None:
+    push = TurnChunk(
+        kind="tool_call", text=DIAGRAM_ARGUMENTS, tool_call_id="call-1", tool_name="push_diagram"
+    )
+    stream = ScriptedStream(
+        [push], TurnUsage(prompt_tokens=10, completion_tokens=20), "tool_calls", 5
+    )
+    scripted = ScriptedReasoning(stream)
+    reasoning = bench_visual_call.MeteredReasoning(scripted)
+
+    sample = await bench_visual_call.one_call(reasoning, "diagram", 3000, "draw-1")
+
+    assert scripted.models == ["draw-1"]
+    assert sample.valid is True
+
+
+def test_the_report_names_the_model_that_drew(capsys) -> None:
+    cfg = Settings(_env_file=None, reasoning_api_base="http://x", reasoning_api_key="k")
+    args = bench_visual_call.build_parser().parse_args([])
+
+    bench_visual_call.report(cfg, args, {"diagram": [], "app": []})
+    default = capsys.readouterr().out
+    bench_visual_call.report(
+        cfg.model_copy(update={"visual_model": "draw-1"}), args, {"diagram": [], "app": []}
+    )
+    chosen = capsys.readouterr().out
+
+    assert "model=glm-5.3-flash  visual_model=glm-5.3-flash  " in default
+    assert "model=glm-5.3-flash  visual_model=draw-1  " in chosen

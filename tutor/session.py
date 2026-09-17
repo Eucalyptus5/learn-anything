@@ -149,6 +149,7 @@ class TurnLoopConfig(BaseModel):
     history_turns: int = Field(default=10, ge=0)
     visual_timeout_s: float = Field(default=90.0, gt=0)
     visual_max_tokens: int = Field(default=3000, gt=0)
+    visual_model: str = ""
     speculative_reasoning: bool = False
 
 
@@ -690,6 +691,7 @@ class TurnLoop:
                     self._visuals,
                     self._cfg.visual_max_tokens,
                     lambda: number > self._landed_turn,
+                    model=self._cfg.visual_model or None,
                 )
             landed = result.endswith(": sent")
         except TimeoutError:

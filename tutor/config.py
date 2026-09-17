@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     history_turns: int = Field(default=10, ge=0)
     visual_timeout_s: float = Field(default=90.0, gt=0)
     visual_max_tokens: int = Field(default=3000, gt=0)
+    visual_model: str = ""
     signaling_port: int = 8080
 
 

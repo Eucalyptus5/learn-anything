@@ -12,7 +12,14 @@ import pytest
 
 from tests.fakes import FakeSynthesizer, FakeTransport
 from tests.test_input_path import CANONICAL, FakeVad, scripted_frames
-from tests.test_session import SPOKEN_DELTAS, STARTING_FROM, FakeReasoning, spoken_chunks
+from tests.test_session import (
+    APP_CALL,
+    BRIEFED_DELTAS,
+    SPOKEN_DELTAS,
+    STARTING_FROM,
+    FakeReasoning,
+    spoken_chunks,
+)
 from tutor import app
 from tutor.app import Models, Sessions, build_loop
 from tutor.config import Settings
@@ -215,6 +222,27 @@ async def test_build_loop_runs_a_concept_turn_from_the_session_request(tmp_path:
         "text": USER_TEXT,
         "seq": 1,
     }
+
+
+async def test_build_loop_hands_the_visual_model_to_the_visual_call_only(tmp_path: Path) -> None:
+    cfg = settings_for(tmp_path, VISUAL_MODEL="draw-1")
+    log: list[tuple[str, object]] = []
+    transport = FakeTransport()
+    reasoning = FakeReasoning(
+        log, spoken_chunks(BRIEFED_DELTAS), asyncio.Event(), visual=[APP_CALL]
+    )
+    request = SessionRequest(subject="PPO", starting_from=STARTING_FROM)
+
+    loop = build_loop(
+        cfg, fake_models(), reasoning, EndOfTurnSource([USER_TEXT]), transport, request
+    )
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    visuals = [task for task in asyncio.all_tasks() if task.get_name() == "turn-1-visual"]
+    await asyncio.wait_for(asyncio.gather(*visuals), HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert reasoning.models == [None, "draw-1"]
+    assert [p["title"] for p in transport.sent if p["type"] == "app.push"] == ["Clipped objective"]
 
 
 async def test_session_ends_on_its_own_when_the_frames_end(
