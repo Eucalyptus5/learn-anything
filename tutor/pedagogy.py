@@ -1,3 +1,4 @@
+import json
 import logging
 from enum import StrEnum, auto
 from typing import Literal
@@ -62,9 +63,20 @@ DIRECTIVES: dict[Phase, str] = {
 }
 
 
+def outcome_object(text: str) -> str:
+    start = text.find("{")
+    if start < 0:
+        return text
+    try:
+        _, end = json.JSONDecoder().raw_decode(text, start)
+    except json.JSONDecodeError:
+        return text
+    return text[start:end]
+
+
 def parse_outcome(text: str) -> TurnOutcome:
     try:
-        return TurnOutcome.model_validate_json(text)
+        return TurnOutcome.model_validate_json(outcome_object(text))
     except ValidationError:
         logger.info("turn_outcome_unparsed chars=%d", len(text))
         return TurnOutcome()

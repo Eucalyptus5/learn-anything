@@ -3,7 +3,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from tutor.pedagogy import PedagogyState, Phase, TurnOutcome, parse_outcome
+from tutor.pedagogy import PedagogyState, Phase, TurnOutcome, outcome_object, parse_outcome
 from tutor.prompt import MAX_GLOBS
 from tutor.tools.models import Position
 
@@ -130,6 +130,33 @@ def test_extra_model_fields_do_not_defeat_the_parse() -> None:
     state = questioning()
 
     assert state.advance(parse_outcome('{"signal": "correct", "confidence": 0.9}')) is Phase.TEACH
+
+
+def test_a_close_tag_after_the_object_is_ignored() -> None:
+    assert parse_outcome('{"signal": "covered", "settling": ""}</outcome>').signal == "covered"
+
+
+def test_a_fence_around_the_object_is_ignored() -> None:
+    text = '```json\n{"signal": "covered", "settling": ""}\n```'
+
+    assert parse_outcome(text).signal == "covered"
+
+
+def test_prose_before_the_object_is_ignored() -> None:
+    assert parse_outcome('sure. {"signal": "told", "settling": ""}').signal == "told"
+
+
+def test_a_tail_with_no_object_is_neutral() -> None:
+    assert parse_outcome("covered, no misconception") == TurnOutcome()
+
+
+def test_a_wrong_signal_inside_a_wrapped_object_is_still_neutral() -> None:
+    assert parse_outcome('{"signal": "teach", "settling": ""}</outcome>') == TurnOutcome()
+
+
+def test_outcome_object_returns_the_text_unchanged_when_nothing_decodes() -> None:
+    assert outcome_object("{not json") == "{not json"
+    assert outcome_object("") == ""
 
 
 @pytest.mark.parametrize("phase", list(Phase))

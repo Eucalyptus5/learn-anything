@@ -11,6 +11,7 @@ from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.config import Settings
 from tutor.cost import TurnUsage, UsageLedger
 from tutor.input_path import EndOfTurn, SpeechStarted
+from tutor.pedagogy import parse_outcome
 from tutor.prompt import Message, TurnPrompt
 from tutor.reasoning import TurnChunk
 from tutor.session import OutcomeSplitter
@@ -730,20 +731,29 @@ def test_classify_tail_ok() -> None:
 def test_classify_tail_wrapped_by_a_close_tag() -> None:
     tail = bench_turn.classify_tail("PPO clips.\n<outcome>" + TAIL + "</outcome>")
 
-    assert tail.kind == "wrapped"
+    assert tail.kind == "ok"
     assert tail.flags == frozenset({"trailing"})
     assert tail.faults == frozenset()
     assert tail.text == TAIL + "</outcome>"
-    assert tail.signal is None
+    assert tail.signal == "covered"
 
 
 def test_classify_tail_wrapped_by_a_fence() -> None:
     tail = bench_turn.classify_tail("PPO clips.\n<outcome>```json\n" + TAIL + "\n```")
 
-    assert tail.kind == "wrapped"
+    assert tail.kind == "ok"
     assert tail.flags == frozenset({"prefixed", "trailing"})
     assert tail.faults == frozenset()
-    assert tail.signal is None
+    assert tail.signal == "covered"
+
+
+def test_a_wrapped_tail_is_ok_once_the_parser_unwraps_it() -> None:
+    reply = "PPO clips.\n<outcome>" + TAIL + "</outcome>"
+
+    tail = bench_turn.classify_tail(reply)
+
+    assert tail.kind == "ok"
+    assert parse_outcome(TAIL + "</outcome>").signal == "covered" == tail.signal
 
 
 def test_classify_tail_signal() -> None:
@@ -806,7 +816,7 @@ def test_classify_tail_keeps_only_the_first_marker() -> None:
 
     tail = bench_turn.classify_tail("PPO clips.\n<outcome>" + TAIL + "\n" + second)
 
-    assert tail.kind == "wrapped"
+    assert tail.kind == "ok"
     assert tail.flags == frozenset({"trailing"})
     assert tail.text == TAIL + "\n" + second
 

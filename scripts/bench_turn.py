@@ -38,7 +38,7 @@ from tutor.config import Settings, settings
 from tutor.constants import TTS_SAMPLE_RATE, WEBRTC_FRAME_SAMPLES, WEBRTC_SAMPLE_RATE
 from tutor.cost import TurnUsage, UsageLedger, turn_cost_usd
 from tutor.input_path import EndOfTurn, InputEvent
-from tutor.pedagogy import TurnOutcome
+from tutor.pedagogy import TurnOutcome, outcome_object
 from tutor.prompt import Message, TurnPrompt
 from tutor.reasoning import ReasoningClient, TurnChunk, TurnStream
 from tutor.session import OUTCOME_MARKER, OutcomeSplitter, TurnLoop
@@ -222,7 +222,7 @@ def classify_tail(reply: str) -> TailRead:
                 if end < len(tail):
                     flags.add("trailing")
     with contextlib.suppress(ValidationError):
-        outcome = TurnOutcome.model_validate_json(tail)
+        outcome = TurnOutcome.model_validate_json(outcome_object(tail))
         return TailRead("ok", frozenset(flags), frozenset(), tail, outcome.signal)
     if body is None:
         return TailRead("not_json", frozenset(), frozenset(), tail, None)
