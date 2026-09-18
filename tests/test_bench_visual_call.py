@@ -3,11 +3,13 @@ import json
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
-from tutor.brief import VisualBrief
+from tutor.brief import BRIEF_END, BRIEF_MARKER, VisualBrief
 from tutor.config import Settings
 from tutor.cost import TurnUsage
+from tutor.pedagogy import parse_outcome
 from tutor.prompt import TurnPrompt
 from tutor.reasoning import TurnChunk
+from tutor.session import OUTCOME_MARKER, TurnLoopConfig
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "bench_visual_call.py"
 _spec = importlib.util.spec_from_file_location("bench_visual_call", SCRIPT)
@@ -45,6 +47,7 @@ class ScriptedStream:
 class ScriptedReasoning:
     def __init__(self, stream: ScriptedStream) -> None:
         self._stream = stream
+        self.prompts: list[TurnPrompt] = []
         self.tool_choices: list[str | None] = []
         self.models: list[str | None] = []
 
@@ -57,6 +60,7 @@ class ScriptedReasoning:
         tool_choice: str | None = None,
         model: str | None = None,
     ) -> ScriptedStream:
+        self.prompts.append(prompt)
         self.tool_choices.append(tool_choice)
         self.models.append(model)
         return self._stream
@@ -93,14 +97,16 @@ def test_the_verdict_fails_under_the_validity_floor() -> None:
     app_budget = bench_visual_call.APP_BUDGET_MS
     diagram_budget = bench_visual_call.DIAGRAM_BUDGET_MS
 
-    assert verdict("app", 50000, valid=26, n=30).endswith(", FAIL")
-    assert not verdict("app", 50000, valid=27, n=30).endswith(", FAIL")
-    assert verdict("app", app_budget + 1, 30, 30).endswith(", FAIL")
-    assert not verdict("app", app_budget, 30, 30).endswith(", FAIL")
-    assert verdict("diagram", diagram_budget + 1, 30, 30).endswith(", FAIL")
-    assert not verdict("diagram", diagram_budget, 30, 30).endswith(", FAIL")
-    assert verdict("diagram", None, 30, 30).endswith(", FAIL")
-    assert "median landing none against" in verdict("diagram", None, 30, 30)
+    assert verdict("app", 50000, valid=26, n=30, prose_only=0).endswith(", FAIL")
+    assert not verdict("app", 50000, valid=27, n=30, prose_only=0).endswith(", FAIL")
+    assert verdict("app", app_budget + 1, 30, 30, 0).endswith(", FAIL")
+    assert not verdict("app", app_budget, 30, 30, 0).endswith(", FAIL")
+    assert verdict("diagram", diagram_budget + 1, 30, 30, 0).endswith(", FAIL")
+    assert not verdict("diagram", diagram_budget, 30, 30, 0).endswith(", FAIL")
+    assert verdict("diagram", None, 30, 30, 0).endswith(", FAIL")
+    assert "median landing none against" in verdict("diagram", None, 30, 30, 0)
+    assert verdict("app", 50000, 28, 30, 2).endswith(", prose only 2/30")
+    assert verdict("app", 50000, 26, 30, 4).endswith(", prose only 4/30, FAIL")
 
 
 def test_parser_defaults() -> None:
@@ -108,6 +114,7 @@ def test_parser_defaults() -> None:
 
     assert args.samples == 30
     assert args.kinds == ["diagram", "app"]
+    assert args.history == "fixed"
 
 
 async def test_a_scripted_push_lands_as_a_valid_sample() -> None:
@@ -132,6 +139,9 @@ async def test_a_scripted_push_lands_as_a_valid_sample() -> None:
     assert sample.first_chunk_ms == 5
     assert sample.cost_usd is not None and sample.cost_usd > 0
     assert sample.result == "push_diagram: sent"
+    assert sample.uses_helper is None
+    assert sample.steps is None
+    assert sample.prose_only is False
 
     prose = ScriptedStream(
         [TurnChunk(kind="spoken", text="here is a picture")],
@@ -147,6 +157,7 @@ async def test_a_scripted_push_lands_as_a_valid_sample() -> None:
     assert sample.landing_ms is None
     assert isinstance(sample.result_ms, int)
     assert sample.result == "visual: error: no tool call"
+    assert sample.prose_only is True
 
 
 async def test_a_stream_without_a_usage_chunk_has_an_unknown_cost() -> None:
@@ -172,6 +183,9 @@ def test_the_report_prints_a_verdict_per_kind(capsys) -> None:
         output_tokens=250,
         cost_usd=0.0002,
         result="push_diagram: sent",
+        uses_helper=None,
+        steps=None,
+        prose_only=False,
     )
     prose = sent.model_copy(
         update={
@@ -180,6 +194,7 @@ def test_the_report_prints_a_verdict_per_kind(capsys) -> None:
             "valid": False,
             "cost_usd": None,
             "result": "visual: error: no tool call",
+            "prose_only": True,
         }
     )
     truncated = sent.model_copy(
@@ -214,6 +229,10 @@ def test_the_report_prints_a_verdict_per_kind(capsys) -> None:
     assert "truncated 1/1" in lines
     assert "unknown cost 1/2" in lines
     assert "unknown cost 0/1" in lines
+    assert "prose only 1/2" in lines
+    assert "prose only 0/1" in lines
+    assert ", prose only 1/2, FAIL" in verdicts[0]
+    assert ", prose only 0/1, FAIL" in verdicts[1]
 
 
 async def test_the_visual_model_is_forwarded_to_the_call() -> None:
@@ -245,3 +264,132 @@ def test_the_report_names_the_model_that_drew(capsys) -> None:
 
     assert "model=glm-5.3-flash  visual_model=glm-5.3-flash  " in default
     assert "model=glm-5.3-flash  visual_model=draw-1  " in chosen
+
+
+def app_push(html: str) -> TurnChunk:
+    arguments = json.dumps({"id": "clip", "title": "Clipped objective", "html": html})
+    return TurnChunk(kind="tool_call", text=arguments, tool_call_id="call-1", tool_name="push_app")
+
+
+async def test_an_app_sample_counts_the_helper_tag_and_its_steps() -> None:
+    narrated = (
+        '<!doctype html><script src="/lesson.js"></script><div id="p"></div>'
+        '<script>lesson.steps([{ say: "a", show: "#p" }, { say: "b" }, { "say": "c" }]);</script>'
+    )
+    usage = TurnUsage(prompt_tokens=10, completion_tokens=20)
+    stream = ScriptedStream([app_push(narrated)], usage, "tool_calls", 5)
+    reasoning = bench_visual_call.MeteredReasoning(ScriptedReasoning(stream))
+
+    sample = await bench_visual_call.one_call(reasoning, "app", 3000)
+
+    assert sample.valid is True
+    assert sample.uses_helper is True
+    assert sample.steps == 3
+
+    stream = ScriptedStream([app_push("<!doctype html><p>x</p>")], usage, "tool_calls", 5)
+    reasoning = bench_visual_call.MeteredReasoning(ScriptedReasoning(stream))
+
+    sample = await bench_visual_call.one_call(reasoning, "app", 3000)
+
+    assert sample.uses_helper is False
+    assert sample.steps == 0
+
+
+def test_the_report_counts_helper_adoption_and_steps(capsys) -> None:
+    cfg = Settings(_env_file=None, reasoning_api_base="http://x", reasoning_api_key="k")
+    args = bench_visual_call.build_parser().parse_args(["--kinds", "app"])
+    drawn = bench_visual_call.CallSample(
+        first_chunk_ms=400,
+        landing_ms=12000,
+        result_ms=12010,
+        valid=True,
+        truncated=False,
+        output_tokens=600,
+        cost_usd=0.0004,
+        result="push_app: sent",
+        uses_helper=True,
+        steps=4,
+        prose_only=False,
+    )
+    plain = drawn.model_copy(update={"uses_helper": False, "steps": 0})
+    truncated = drawn.model_copy(
+        update={
+            "landing_ms": None,
+            "valid": False,
+            "truncated": True,
+            "result": "visual: error: truncated at 3000 tokens",
+            "uses_helper": None,
+            "steps": None,
+        }
+    )
+
+    bench_visual_call.report(cfg, args, {"app": [drawn, plain, truncated]})
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "helper 1/2" in lines
+    (steps,) = [line for line in lines if line.startswith("steps ")]
+    assert "n=  2 min=     0 median=     2 max=     4" in steps
+
+
+def test_the_session_history_flag_parses() -> None:
+    args = bench_visual_call.build_parser().parse_args(["--history", "session"])
+
+    assert args.history == "session"
+
+
+def test_the_session_history_is_shaped_as_the_transcript_sends_it() -> None:
+    snapshot = bench_visual_call.SESSION_SNAPSHOT
+    fixed = bench_visual_call.SNAPSHOT
+    turns = bench_visual_call.HISTORY_TURNS
+    utterances = bench_visual_call.PPO_UTTERANCES
+
+    assert turns == TurnLoopConfig.model_fields["history_turns"].default
+    assert snapshot.system == fixed.system
+    assert snapshot.user_text == fixed.user_text
+    assert [m.role for m in snapshot.history] == ["user", "assistant"] * turns
+    assert [m.content for m in snapshot.history[0::2]] == [
+        utterances[n % len(utterances)] for n in range(turns)
+    ]
+    kinds = []
+    signals = []
+    for message in snapshot.history[1::2]:
+        head, said, tail = message.content.split("\n")
+        assert head.startswith(BRIEF_MARKER) and head.endswith(BRIEF_END)
+        brief = VisualBrief.model_validate_json(head[len(BRIEF_MARKER) : -len(BRIEF_END)])
+        kinds.append(brief.kind)
+        assert said
+        assert tail.startswith(OUTCOME_MARKER) and tail.endswith(bench_visual_call.OUTCOME_END)
+        signals.append(parse_outcome(tail[len(OUTCOME_MARKER) :]).signal)
+    assert "none" in kinds and "diagram" in kinds and "app" in kinds
+    assert None not in signals
+
+
+async def test_the_chosen_history_reaches_the_call() -> None:
+    push = TurnChunk(
+        kind="tool_call", text=DIAGRAM_ARGUMENTS, tool_call_id="call-1", tool_name="push_diagram"
+    )
+    usage = TurnUsage(prompt_tokens=10, completion_tokens=20)
+    scripted = ScriptedReasoning(ScriptedStream([push], usage, "tool_calls", 5))
+    reasoning = bench_visual_call.MeteredReasoning(scripted)
+
+    await bench_visual_call.one_call(reasoning, "diagram", 3000)
+    await bench_visual_call.one_call(reasoning, "diagram", 3000, None, "session")
+
+    fixed, session = scripted.prompts
+    assert fixed.history == bench_visual_call.SNAPSHOT.history
+    assert session.history == bench_visual_call.SESSION_SNAPSHOT.history
+
+
+def test_the_report_names_the_history(capsys) -> None:
+    cfg = Settings(_env_file=None, reasoning_api_base="http://x", reasoning_api_key="k")
+    parser = bench_visual_call.build_parser()
+
+    bench_visual_call.report(cfg, parser.parse_args([]), {"diagram": [], "app": []})
+    default = capsys.readouterr().out
+    bench_visual_call.report(
+        cfg, parser.parse_args(["--history", "session"]), {"diagram": [], "app": []}
+    )
+    chosen = capsys.readouterr().out
+
+    assert "previous=none  history=fixed" in default
+    assert "previous=none  history=session" in chosen
