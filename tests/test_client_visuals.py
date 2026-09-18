@@ -317,31 +317,90 @@ def test_every_push_on_the_check_page_carries_a_title() -> None:
         assert name in hostile[1], name
 
 
-def test_the_lesson_helper_reaches_nothing_outside_its_frame() -> None:
+def test_the_lesson_helper_reaches_nothing_outside_its_frame_but_its_one_report() -> None:
     text = LESSON.read_text()
     for pattern in (
-        r"\bparent\b",
         r"\btop\.",
-        r"postMessage",
         r"fetch\(",
         r"XMLHttpRequest",
         r"WebSocket",
         r"import\(",
         r"document\.cookie",
         r"localStorage",
+        r"\.srcdoc",
+        r"opener",
     ):
         assert not re.search(pattern, text), pattern
-    assert "window.lesson = Object.freeze({ steps })" in text
+    assert text.count("postMessage(") == 1
+    assert len(re.findall(r"\bparent\b", text)) == 1
+    report = re.search(r"function report\(steps, root\) \{(.*?)\n  \}", text, re.DOTALL)
+    assert report is not None
+    assert "if (reported) return;" in report[1]
+    assert (
+        'window.parent.postMessage(\n      { type: "scene.ready", steps, width: box.width, '
+        'height: box.height, error },\n      "*",\n    );'
+    ) in report[1]
+    assert "window.lesson = Object.freeze({ scene })" in text
     assert "grid-template-columns: 1fr 220px" in text
     assert "prefers-reduced-motion" in text
-    assert len(text.splitlines()) < 200
+    assert "REPORT_MS = 5000" in text
+    assert "error.slice(0, 500)" in text or "String(message).slice(0, 500)" in text
+    assert "setTimeout" in text and "requestAnimationFrame" in text
+    for gone in ("FIRST_MS", "BEAT_MS", "BEAT_PER_CHAR_MS", "BEAT_CAP_MS", "FADE_MS", "DRAW_MS"):
+        assert gone not in text, gone
+    assert "lesson.steps" not in text and "function steps(" not in text
+    assert len(text.splitlines()) < 170
 
 
-def test_the_check_page_narrates_one_app_through_the_helper() -> None:
+def test_the_lesson_helper_takes_only_an_integer_step_in_range() -> None:
+    text = LESSON.read_text()
+    listener = re.search(
+        r'window\.addEventListener\("message", \(event\) => \{(.*?)\n  \}\);', text, re.DOTALL
+    )
+    assert listener is not None
+    assert "Number.isInteger(m.step)" in listener[1]
+    assert "m.step < 1 || m.step > current.steps.length" in listener[1]
+    assert "go(m.step)" in listener[1]
+    assert "event.source" not in listener[1] and "origin" not in listener[1]
+    assert text.count('addEventListener("message"') == 1
+
+
+def test_the_lesson_helper_demands_a_label_per_step() -> None:
+    text = LESSON.read_text()
+    register = re.search(r"function register\(spec\) \{(.*?)\n  \}", text, re.DOTALL)
+    assert register is not None
+    assert 'throw new Error("lesson.scene was called twice")' in register[1]
+    assert 'typeof timeline.tweenTo !== "function"' in register[1]
+    assert "timeline.labels" in register[1]
+    assert "timeline.pause().seek(label(1))" in register[1]
+    assert "mark(1)" in register[1]
+
+
+def test_the_lesson_helper_never_reports_while_the_page_is_hidden() -> None:
+    text = LESSON.read_text()
+    fallback = re.search(r"function fallback\(\) \{(.*?)\n  \}", text, re.DOTALL)
+    assert fallback is not None
+    assert 'if (document.visibilityState === "hidden") {' in fallback[1]
+    assert (
+        'document.addEventListener("visibilitychange", () => setTimeout(fallback, REPORT_MS), '
+        "{ once: true });"
+    ) in fallback[1]
+    assert fallback[1].index('visibilityState === "hidden"') < fallback[1].index("report(")
+    assert "setTimeout(fallback, REPORT_MS);" in text
+    assert text.count("visibilitychange") == 1
+
+
+def test_the_check_page_narrates_one_scene_through_the_helper() -> None:
     text = VISUAL_CHECK.read_text()
-    assert '<script src="/lesson.js">' in text
-    assert "lesson.steps([" in text
-    assert '"lesson: ok"' in text
+    scene = re.search(r"const sceneHtml = `(.*?)`;", text, re.DOTALL)
+    assert scene is not None
+    assert '<script src="/lesson.js"><\\/script>' in scene[1]
+    assert '<script src="/vendor/gsap.min.js"><\\/script>' in scene[1]
+    assert "gsap.timeline({ paused: true })" in scene[1]
+    for n in (1, 2, 3):
+        assert f'addLabel("step-{n}")' in scene[1]
+    assert "lesson.scene({" in scene[1]
+    assert '"scene: ok"' in text
 
 
 def test_the_check_page_loads_gsap_in_the_sandbox() -> None:

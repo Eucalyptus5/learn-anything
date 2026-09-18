@@ -11,9 +11,10 @@
 <h2>Visual payload check</h2>
 
 <p>Runs <code>validate()</code> over good and hostile payloads, then pushes a mini app whose
-script tries to escape its sandbox and reports what each attempt threw. A last app loads the
-vendored KaTeX and Plotly bundles and reports whether each rendered with its fonts. Load this
-page from the tutor server, not from a file URL.</p>
+script tries to escape its sandbox and reports what each attempt threw, an app that loads the
+vendored KaTeX, Plotly and GSAP bundles, and a scene that registers a timeline through the
+lesson helper and is stepped to its last label. Load this page from the tutor server, not from
+a file URL.</p>
 
 <div id="log">starting</div>
 <div id="canvas"></div>
@@ -141,30 +142,40 @@ document.fonts.ready.then(() => setTimeout(() => {
 }, 800));
 <\/script>`;
 
-const lessonHtml = `<!doctype html><meta charset="utf-8">
+const sceneHtml = `<!doctype html><meta charset="utf-8">
 <script src="/lesson.js"><\/script>
+<script src="/vendor/gsap.min.js"><\/script>
 <div id="picture">
-  <svg viewBox="0 0 200 120" width="200" height="120">
-    <line id="axis" x1="10" y1="110" x2="190" y2="110" stroke="var(--ink)" stroke-width="2" fill="none"></line>
-    <path id="curve" d="M10 100 C 60 100, 120 20, 190 20" stroke="var(--accent)" stroke-width="2" fill="none"></path>
-    <text id="label" x="120" y="60" fill="var(--ink-3)" font-size="10">objective</text>
+  <svg viewBox="0 0 200 60" width="200" height="60">
+    <line id="track" x1="10" y1="30" x2="190" y2="30" stroke="var(--hair)" stroke-width="2" fill="none"></line>
+    <circle id="ratio" cx="10" cy="30" r="6" fill="var(--accent)"></circle>
+    <text id="clip" x="150" y="20" fill="var(--ink-3)" font-size="10" opacity="0">clip</text>
   </svg>
 </div>
 <script>
-lesson.steps([
-  { say: "The ratio axis", show: "#axis" },
-  { say: "The clipped objective", show: "#curve" },
-  { say: "Its name", show: "#label" },
-]);
-setTimeout(() => {
-  const lines = [...document.querySelectorAll(".lesson-steps p")];
-  const targets = [...document.querySelectorAll("#axis, #curve, #label")];
-  parent.postMessage({ lesson: {
-    lines: lines.length,
-    lit: lines.length > 0 && lines[lines.length - 1].classList.contains("now"),
-    cleared: targets.every((el) => el.style.opacity === "" && el.style.strokeDashoffset === ""),
-  } }, "*");
-}, 6000);
+const tl = gsap.timeline({ paused: true });
+tl.addLabel("step-1")
+  .to("#ratio", { attr: { cx: 100 }, duration: 0.4 })
+  .addLabel("step-2")
+  .to("#ratio", { attr: { cx: 150 }, duration: 0.4 })
+  .to("#clip", { opacity: 1, duration: 0.3 })
+  .addLabel("step-3");
+lesson.scene({
+  root: "#picture",
+  timeline: tl,
+  steps: ["The ratio starts at one", "It climbs toward the clip", "Past epsilon it is clipped"],
+});
+window.addEventListener("message", (event) => {
+  if (event.data === null || typeof event.data !== "object" || event.data.step !== 3) return;
+  setTimeout(() => {
+    const lines = [...document.querySelectorAll(".lesson-steps p")];
+    parent.postMessage({ motion: {
+      lines: lines.length,
+      now: lines.findIndex((p) => p.classList.contains("now")),
+      cx: document.getElementById("ratio").getAttribute("cx"),
+    } }, "*");
+  }, 1200);
+});
 <\/script>`;
 
 let hostFrameSrcViolations = 0;
@@ -242,7 +253,7 @@ window.addEventListener("message", (event) => {
   log("plotly: " + plotly);
   log("gsap: " + gsap);
   log(katex && plotly && gsap ? "libs: ok" : "libs: FAIL");
-  receive({ type: "app.push", seq: 104, id: "lesson", html: lessonHtml, title: "lesson" });
+  receive({ type: "app.push", seq: 104, id: "scene", html: sceneHtml, title: "scene" });
   const narrated = canvas.querySelectorAll("iframe");
   appFrame = narrated[narrated.length - 1];
 });
@@ -250,10 +261,21 @@ window.addEventListener("message", (event) => {
 window.addEventListener("message", (event) => {
   if (event.source !== appFrame.contentWindow) return;
   if (typeof event.data !== "object" || event.data === null) return;
-  if (typeof event.data.lesson !== "object" || event.data.lesson === null) return;
-  const { lines, lit, cleared } = event.data.lesson;
-  log("lesson lines: " + lines + " last lit: " + lit + " inline cleared: " + cleared);
-  log(lines === 3 && lit === true && cleared === true ? "lesson: ok" : "lesson: FAIL");
+  if (event.data.type !== "scene.ready") return;
+  const { steps, width, height, error } = event.data;
+  log("scene ready: steps=" + steps + " size=" + Math.round(width) + "x" + Math.round(height) + " error=" + JSON.stringify(error));
+  log(steps === 3 && width > 0 && height > 0 && error === "" ? "scene: ok" : "scene: FAIL");
+  appFrame.contentWindow.postMessage({ step: 2 }, "*");
+  setTimeout(() => appFrame.contentWindow.postMessage({ step: 3 }, "*"), 800);
+});
+
+window.addEventListener("message", (event) => {
+  if (event.source !== appFrame.contentWindow) return;
+  if (typeof event.data !== "object" || event.data === null) return;
+  if (typeof event.data.motion !== "object" || event.data.motion === null) return;
+  const { lines, now, cx } = event.data.motion;
+  log("motion lines: " + lines + " now: " + now + " cx: " + cx);
+  log(lines === 3 && now === 2 && cx === "150" ? "motion: ok" : "motion: FAIL");
   log("done");
 });
 </script>

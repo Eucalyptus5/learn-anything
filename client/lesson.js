@@ -23,159 +23,124 @@ body {
   grid-column: 2; grid-row: 1; align-self: start; margin: 0; padding-left: 16px;
   border-left: 1px solid var(--hair);
 }
-.lesson-steps p { margin: 0 0 10px; opacity: 0; color: var(--ink-3); }
+.lesson-steps p { margin: 0 0 10px; opacity: 0; color: var(--ink-3); transition: opacity 350ms ease-out; }
 .lesson-steps p.shown { opacity: 1; }
 .lesson-steps p.now { color: var(--ink); }
+@media (prefers-reduced-motion: reduce) { .lesson-steps p { transition: none; } }
 `;
-  const STROKED = new Set(["path", "line", "polyline", "polygon", "circle", "ellipse", "rect"]);
-  const FIRST_MS = 400;
-  const BEAT_MS = 1600;
-  const BEAT_PER_CHAR_MS = 40;
-  const BEAT_CAP_MS = 5000;
-  const FADE_MS = 350;
-  const DRAW_MS = 700;
-  const EASE = "ease-out";
+  const REPORT_MS = 5000;
   const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
-  const hidden = new Map();
-  let played = false;
+  let current = null;
+  let lines = [];
+  let error = "";
+  let reported = false;
 
   const style = document.createElement("style");
   style.textContent = STYLE;
   document.head.append(style);
 
-  function beat(say) {
-    return Math.min(BEAT_CAP_MS, BEAT_MS + BEAT_PER_CHAR_MS * say.length);
+  function note(message) {
+    if (error === "") error = String(message).slice(0, 500);
   }
 
-  function matched(selector) {
-    if (typeof selector !== "string") return [];
-    try {
-      return [...document.querySelectorAll(selector)];
-    } catch (error) {
-      console.error("lesson: bad selector " + selector, error);
-      return [];
-    }
+  window.addEventListener("error", (event) => note(event.message));
+  window.addEventListener("unhandledrejection", (event) => note(event.reason));
+
+  function report(steps, root) {
+    if (reported) return;
+    reported = true;
+    const box = root === null ? { width: 0, height: 0 } : root.getBoundingClientRect();
+    window.parent.postMessage(
+      { type: "scene.ready", steps, width: box.width, height: box.height, error },
+      "*",
+    );
   }
 
-  function targets(step) {
-    return new Set([...step.targets, ...matched(step.show)]);
+  function label(n) {
+    return "step-" + n;
   }
 
-  function hide(el) {
-    if (hidden.has(el)) return;
-    hidden.set(el, {
-      opacity: el.style.opacity,
-      dasharray: el.style.strokeDasharray,
-      dashoffset: el.style.strokeDashoffset,
+  function mark(n) {
+    lines.forEach((p, i) => {
+      p.classList.toggle("shown", i < n);
+      p.classList.toggle("now", i === n - 1);
     });
-    el.style.opacity = "0";
   }
 
-  function restore(el, own) {
-    el.style.opacity = own.opacity;
-    el.style.strokeDasharray = own.dasharray;
-    el.style.strokeDashoffset = own.dashoffset;
+  function go(n) {
+    mark(n);
+    if (still) current.timeline.seek(label(n));
+    else current.timeline.tweenTo(label(n));
   }
 
-  function stroked(el) {
-    return (
-      STROKED.has(el.tagName.toLowerCase()) &&
-      getComputedStyle(el).fill === "none" &&
-      typeof el.getTotalLength === "function"
-    );
-  }
-
-  function settle(anim, el, own) {
-    anim.onfinish = () => {
-      anim.cancel();
-      restore(el, own);
-    };
-  }
-
-  function reveal(el) {
-    const own = hidden.get(el);
-    if (own === undefined) return;
-    hidden.delete(el);
-    if (still) {
-      restore(el, own);
-      return;
+  function register(spec) {
+    if (current !== null) throw new Error("lesson.scene was called twice");
+    if (typeof spec !== "object" || spec === null) throw new Error("lesson.scene takes an object");
+    const root = typeof spec.root === "string" ? document.querySelector(spec.root) : spec.root;
+    if (!(root instanceof Element)) throw new Error("root is not an element in the document");
+    const timeline = spec.timeline;
+    if (
+      typeof timeline !== "object" ||
+      timeline === null ||
+      typeof timeline.tweenTo !== "function" ||
+      typeof timeline.labels !== "object"
+    ) {
+      throw new Error("timeline is not a gsap timeline");
     }
-    el.style.opacity = own.opacity;
-    if (stroked(el)) {
-      const length = el.getTotalLength();
-      el.style.strokeDasharray = String(length);
-      el.style.strokeDashoffset = String(length);
-      const anim = el.animate([{ strokeDashoffset: length }, { strokeDashoffset: 0 }], {
-        duration: DRAW_MS,
-        easing: EASE,
-        fill: "forwards",
-      });
-      settle(anim, el, own);
-      return;
+    const steps = Array.isArray(spec.steps) ? spec.steps : [];
+    if (steps.length === 0 || !steps.every((say) => typeof say === "string" && say !== "")) {
+      throw new Error("steps is not a list of non-empty strings");
     }
-    const frames =
-      el instanceof SVGElement
-        ? [{ opacity: 0 }, { opacity: 1 }]
-        : [{ opacity: 0, transform: "translateY(4px)" }, { opacity: 1, transform: "none" }];
-    settle(el.animate(frames, { duration: FADE_MS, easing: EASE, fill: "forwards" }), el, own);
-  }
-
-  function run(step) {
-    if (typeof step.run !== "function") return;
-    try {
-      step.run();
-    } catch (error) {
-      console.error("lesson: step run failed", error);
-    }
-  }
-
-  function line(p, column) {
-    column.querySelector("p.now")?.classList.remove("now");
-    p.classList.add("shown", "now");
-    if (still) return;
-    const anim = p.animate(
-      [{ opacity: 0, transform: "translateY(4px)" }, { opacity: 1, transform: "none" }],
-      { duration: FADE_MS, easing: EASE, fill: "forwards" },
-    );
-    anim.onfinish = () => anim.cancel();
-  }
-
-  function play(step, p, column) {
-    line(p, column);
-    run(step);
-    for (const el of targets(step)) reveal(el);
-  }
-
-  function steps(list) {
-    if (played || !Array.isArray(list)) return;
-    played = true;
-    const plan = list
-      .filter((step) => step !== null && typeof step === "object" && typeof step.say === "string")
-      .map((step) => ({ say: step.say, show: step.show, run: step.run, targets: matched(step.show) }));
+    const missing = steps.map((_, i) => label(i + 1)).filter((name) => !(name in timeline.labels));
+    if (missing.length > 0) throw new Error("timeline lacks labels " + missing.join(" "));
     const column = document.createElement("aside");
     column.className = "lesson-steps";
-    const lines = plan.map((step) => {
+    lines = steps.map((say) => {
       const p = document.createElement("p");
-      p.textContent = step.say;
+      p.textContent = say;
       column.append(p);
       return p;
     });
     document.body.append(column);
-    for (const step of plan) for (const el of step.targets) hide(el);
-    if (still) {
-      plan.forEach((step, i) => {
-        lines[i].classList.add("shown", "now");
-        run(step);
-        for (const el of targets(step)) reveal(el);
-      });
-      return;
+    current = { root, timeline, steps };
+    timeline.pause().seek(label(1));
+    mark(1);
+  }
+
+  function scene(spec) {
+    try {
+      register(spec);
+    } catch (failure) {
+      note(failure.message);
     }
-    let at = FIRST_MS;
-    plan.forEach((step, i) => {
-      setTimeout(() => play(step, lines[i], column), at);
-      at += beat(step.say);
+    requestAnimationFrame(function settle() {
+      if (reported) return;
+      if (current !== null && current.root.getBoundingClientRect().width === 0) {
+        requestAnimationFrame(settle);
+        return;
+      }
+      report(current === null ? 0 : current.steps.length, current === null ? null : current.root);
     });
   }
 
-  window.lesson = Object.freeze({ steps });
+  window.addEventListener("message", (event) => {
+    const m = event.data;
+    if (current === null || typeof m !== "object" || m === null || !Number.isInteger(m.step)) return;
+    if (m.step < 1 || m.step > current.steps.length) return;
+    go(m.step);
+  });
+
+  function fallback() {
+    if (reported) return;
+    if (document.visibilityState === "hidden") {
+      document.addEventListener("visibilitychange", () => setTimeout(fallback, REPORT_MS), { once: true });
+      return;
+    }
+    if (current === null) note("lesson.scene was not called within " + REPORT_MS + " ms");
+    report(current === null ? 0 : current.steps.length, current === null ? null : current.root);
+  }
+
+  setTimeout(fallback, REPORT_MS);
+
+  window.lesson = Object.freeze({ scene });
 })();
