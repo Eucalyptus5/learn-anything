@@ -575,6 +575,7 @@ class FakeReasoning:
         self.max_tokens: list[int | None] = []
         self.tool_choices: list[str | None] = []
         self.models: list[str | None] = []
+        self.efforts: list[str | None] = []
         self.streams: list[FakeStream] = []
         self.started = asyncio.Event()
         self.visual_started = asyncio.Event()
@@ -584,6 +585,7 @@ class FakeReasoning:
         self,
         prompt: TurnPrompt,
         tools: Sequence[dict] | None = None,
+        effort: str | None = None,
         max_tokens: int | None = None,
         tool_choice: str | None = None,
         model: str | None = None,
@@ -593,6 +595,7 @@ class FakeReasoning:
         self.max_tokens.append(max_tokens)
         self.tool_choices.append(tool_choice)
         self.models.append(model)
+        self.efforts.append(effort)
         self._log.append(("start_turn", prompt.user_text))
         if prompt.user_text == self._fails:
             raise RateLimited(RATE_LIMIT_DETAIL)

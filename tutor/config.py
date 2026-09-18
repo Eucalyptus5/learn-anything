@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     visual_timeout_s: float = Field(default=90.0, gt=0)
     visual_max_tokens: int = Field(default=3000, gt=0)
     visual_model: str = ""
+    scene_model: str = ""
+    scene_effort: str = "high"
+    scene_max_tokens: int = Field(default=32000, gt=0)
+    scene_timeout_s: float = Field(default=600.0, gt=0)
     signaling_port: int = 8080
 
 

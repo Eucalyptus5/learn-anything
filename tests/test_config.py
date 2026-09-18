@@ -95,6 +95,10 @@ def test_filled_template_yields_defaults(tmp_path: Path) -> None:
     assert cfg.visual_timeout_s == 90.0
     assert cfg.visual_max_tokens == 3000
     assert cfg.visual_model == ""
+    assert cfg.scene_model == ""
+    assert cfg.scene_effort == "high"
+    assert cfg.scene_max_tokens == 32000
+    assert cfg.scene_timeout_s == 600.0
     assert cfg.signaling_port == 8080
 
 
