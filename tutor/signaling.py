@@ -90,6 +90,9 @@ def create_app(
     async def visual_check(request: web.Request) -> web.FileResponse:
         return web.FileResponse(client_root / "visual_check.html")
 
+    async def scene_review(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(client_root / "scene_review.html")
+
     async def bench_mermaid(request: web.Request) -> web.FileResponse:
         return web.FileResponse(client_root / "bench_mermaid.html")
 
@@ -148,6 +151,7 @@ def create_app(
     app.router.add_get("/visuals.js", visuals)
     app.router.add_get("/lesson.js", lesson)
     app.router.add_get("/visual_check.html", visual_check)
+    app.router.add_get("/scene_review.html", scene_review)
     app.router.add_get("/bench_mermaid.html", bench_mermaid)
     app.router.add_get("/vendor/{path:.+}", vendor)
     app.router.add_post("/offer", offer)

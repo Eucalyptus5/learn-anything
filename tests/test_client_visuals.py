@@ -10,6 +10,7 @@ FRAME = CLIENT_ROOT / "frame.html"
 LESSON = CLIENT_ROOT / "lesson.js"
 INDEX = CLIENT_ROOT / "index.html"
 VISUAL_CHECK = CLIENT_ROOT / "visual_check.html"
+SCENE_REVIEW = CLIENT_ROOT / "scene_review.html"
 GUARDED = [CLIENT, VISUALS, FRAME, LESSON]
 HOST_POLICY = {
     "default-src": ["'none'"],
@@ -142,12 +143,12 @@ def test_a_second_connect_reopens_the_channel_for_seq_reset() -> None:
 
 
 def test_the_host_policy_is_exactly_the_pinned_directive_set() -> None:
-    for path in (INDEX, VISUAL_CHECK):
+    for path in (INDEX, VISUAL_CHECK, SCENE_REVIEW):
         assert host_policy(path.read_text()) == HOST_POLICY, path.name
 
 
 def test_the_host_policy_precedes_every_script_and_style() -> None:
-    for path in (INDEX, VISUAL_CHECK):
+    for path in (INDEX, VISUAL_CHECK, SCENE_REVIEW):
         text = path.read_text()
         at = text.index('http-equiv="Content-Security-Policy"')
         assert at < text.index("<style"), path.name
@@ -721,3 +722,32 @@ def test_the_check_page_probes_the_scene_payloads_and_a_broken_scene() -> None:
     assert '"scene: ok"' in text and '"broken scene: reported"' in text
     assert "const brokenHtml" in text
     assert re.search(r"#log \{[^}]*max-height: 10rem; overflow: auto; \}", text)
+
+
+def test_the_review_page_reads_files_locally_and_checks_them_through_the_host() -> None:
+    text = SCENE_REVIEW.read_text()
+    assert (
+        'import { mount, onPayload, receive, reset, show, stepScene } from "/visuals.js";' in text
+    )
+    assert '<input id="files" type="file" multiple accept=".html,.json">' in text
+    assert "new FileReader()" in text or ".text()" in text
+    for banned in ("fetch(", "XMLHttpRequest", "WebSocket", "srcdoc", "innerHTML", "eval("):
+        assert banned not in text, banned
+    assert 'receive({ type: "scene.push"' in text
+    assert 'receive({ type: "scene.show"' in text
+    assert 'onPayload("ready", (report) => {' in text
+    assert 'onPayload("history", (items, currentIndex) => {' in text
+    assert "stepScene(n)" in text
+    assert "passed " in text and "of " in text
+    assert "const REPORT_WAIT_MS = 20000;" in text
+    advance = re.search(r"function next\(\) \{(.*?)\n\}", text, re.DOTALL)
+    ready = re.search(r'onPayload\("ready", \(report\) => \{(.*?)\n\}\);', text, re.DOTALL)
+    assert advance is not None and ready is not None
+    assert "timer = setTimeout(" in advance[1] and "REPORT_WAIT_MS)" in advance[1]
+    assert '": no report, skipped"' in advance[1] and "next();" in advance[1]
+    assert "clearTimeout(timer)" in ready[1]
+    change = re.search(
+        r'addEventListener\("change", async \(event\) => \{(.*?)\n\}\);', text, re.DOTALL
+    )
+    assert change is not None
+    assert "clearTimeout(timer)" in change[1] and "reset();" in change[1]

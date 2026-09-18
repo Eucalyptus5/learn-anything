@@ -1,0 +1,136 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; font-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'none'">
+<title>scene review</title>
+<style>
+  body { font: 14px ui-monospace, Menlo, monospace; margin: 2rem; max-width: 60rem; }
+  #log { white-space: pre-wrap; background: #f4f4f4; padding: .8rem; max-height: 14rem; overflow: auto; }
+  #canvas { position: relative; height: 32rem; margin: 1rem 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
+  #canvas iframe { grid-row: 2; grid-column: 1; width: 100%; height: 100%; border: 1px solid #999; }
+  #canvas iframe.checking { opacity: 0; pointer-events: none; }
+  #canvas iframe.leaving { display: none; }
+  #canvas iframe[hidden] { display: none; }
+  .row { display: flex; flex-wrap: wrap; gap: .4rem; margin: .5rem 0; }
+  button[aria-current="true"] { font-weight: bold; }
+  @media (prefers-color-scheme: dark) { body { background: #1a1b1f; color: #ebeae6; } #log { background: #26272c; } }
+</style>
+
+<h2>Scene review</h2>
+
+<p>Pick the files of one <code>bench_scene</code> run, the <code>NN.html</code> and
+<code>NN.json</code> pairs together. Each scene is pushed through the stage's own validator and
+checked in a hidden frame exactly as a session would check it; the ones that pass are listed
+below and can be shown and stepped. Load this page from the tutor server, not from a file
+URL, so the helper and the vendored libraries resolve.</p>
+
+<input id="files" type="file" multiple accept=".html,.json">
+<div id="tally">passed 0 of 0</div>
+<div id="log">waiting for files</div>
+<div id="canvas"></div>
+<div id="scenes" class="row"></div>
+<div id="steps" class="row"></div>
+
+<script type="module">
+import { mount, onPayload, receive, reset, show, stepScene } from "/visuals.js";
+
+const logEl = document.getElementById("log");
+const tallyEl = document.getElementById("tally");
+const scenesEl = document.getElementById("scenes");
+const stepsEl = document.getElementById("steps");
+const canvas = document.getElementById("canvas");
+const log = (line) => { logEl.textContent += "\n" + line; logEl.scrollTop = logEl.scrollHeight; };
+
+const REPORT_WAIT_MS = 20000;
+let seq = 0;
+let queue = [];
+let current = null;
+let checked = 0;
+let passed = 0;
+let stepCounts = new Map();
+let timer = null;
+
+function next() {
+  current = queue.shift() ?? null;
+  if (current === null) {
+    log("review done: passed " + passed + " of " + checked);
+    return;
+  }
+  timer = setTimeout(() => {
+    checked += 1;
+    log(current.name + ": no report, skipped");
+    tallyEl.textContent = "passed " + passed + " of " + checked;
+    next();
+  }, REPORT_WAIT_MS);
+  receive({ type: "scene.push", seq: ++seq, scene_id: current.id, title: current.name, html: current.html, steps: current.steps });
+}
+
+onPayload("ready", (report) => {
+  if (current === null || report.scene_id !== current.id) return;
+  clearTimeout(timer);
+  checked += 1;
+  log(current.name + ": ok=" + report.ok + " steps=" + report.steps + " error=" + JSON.stringify(report.error));
+  if (report.ok) {
+    passed += 1;
+    stepCounts.set(current.name, current.steps.length);
+    receive({ type: "scene.show", seq: ++seq, scene_id: current.id, at: 1 });
+  }
+  tallyEl.textContent = "passed " + passed + " of " + checked;
+  next();
+});
+
+onPayload("history", (items, currentIndex) => {
+  scenesEl.replaceChildren(
+    ...items.map(({ i, title }) => {
+      const button = document.createElement("button");
+      button.textContent = title;
+      if (i === currentIndex) button.setAttribute("aria-current", "true");
+      button.addEventListener("click", () => show(i));
+      return button;
+    }),
+  );
+  const shown = currentIndex >= 0 ? items[currentIndex].title : null;
+  const count = shown === null ? 0 : stepCounts.get(shown) ?? 0;
+  stepsEl.replaceChildren(
+    ...Array.from({ length: count }, (_, k) => {
+      const n = k + 1;
+      const button = document.createElement("button");
+      button.textContent = "step " + n;
+      button.addEventListener("click", () => stepScene(n));
+      return button;
+    }),
+  );
+});
+
+document.getElementById("files").addEventListener("change", async (event) => {
+  const files = [...event.target.files];
+  clearTimeout(timer);
+  reset();
+  const bodies = new Map();
+  for (const file of files) bodies.set(file.name, await file.text());
+  queue = [];
+  for (const file of files) {
+    if (!file.name.endsWith(".html")) continue;
+    const stem = file.name.slice(0, -5);
+    const sidecar = bodies.get(stem + ".json");
+    if (sidecar === undefined) {
+      log(file.name + ": no steps file, skipped");
+      continue;
+    }
+    let steps;
+    try {
+      steps = JSON.parse(sidecar).steps;
+    } catch (error) {
+      log(file.name + ": steps file is not JSON, skipped");
+      continue;
+    }
+    queue.push({ id: "review-" + stem.toLowerCase().replace(/[^a-z0-9-]/g, "-"), name: file.name, html: bodies.get(file.name), steps });
+  }
+  log("queued " + queue.length + " scenes");
+  checked = 0;
+  passed = 0;
+  stepCounts = new Map();
+  next();
+});
+
+mount(canvas);
+</script>
