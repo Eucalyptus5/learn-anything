@@ -4978,6 +4978,28 @@ async def test_an_invalid_client_message_is_logged_and_ignored(
     await loop.aclose()
 
 
+async def test_a_scene_ready_with_no_scene_waiting_is_logged_and_ignored(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    transport = LoggingTransport(log)
+    loop = concept_loop(log, ScriptedSource([]), speaker, reasoning, transport=transport)
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        transport.handlers[0](
+            {"type": "scene.ready", "scene_id": "turn-4", "ok": True, "steps": 3, "error": ""}
+        )
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert "scene.ready_unexpected scene_id=turn-4" in session_messages(caplog)
+    assert reasoning.prompts == []
+    assert sent(log, "transcript") == []
+    assert ("flush_playout", None) not in log
+    await loop.aclose()
+
+
 async def test_a_typed_turn_and_a_spoken_turn_share_the_id_sequence() -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)

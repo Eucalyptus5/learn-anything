@@ -32,6 +32,7 @@ from tutor.visuals import (
     CLIENT_MESSAGE,
     Caption,
     LearnerText,
+    SceneReady,
     ThemeMessage,
     TurnState,
     VisualChannel,
@@ -221,6 +222,9 @@ class TurnLoop:
         if isinstance(message, ThemeMessage):
             self._theme = message.theme
             logger.debug("session.theme theme=%s", message.theme)
+            return
+        if isinstance(message, SceneReady):
+            logger.info("scene.ready_unexpected scene_id=%s", message.scene_id)
             return
         self._interrupt()
         self._dispatch(message.text)

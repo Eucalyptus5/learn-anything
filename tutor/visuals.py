@@ -86,6 +86,37 @@ class VisualPending(BaseModel):
     title: str = Field(max_length=80)
 
 
+SCENE_ID = r"^[a-z][a-z0-9-]{0,31}$"
+StepLine = Annotated[str, Field(min_length=1, max_length=120)]
+
+
+class ScenePush(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["scene.push"] = "scene.push"
+    scene_id: str = Field(pattern=SCENE_ID)
+    title: str = Field(max_length=80)
+    html: str = Field(min_length=1, max_length=200000)
+    steps: list[StepLine] = Field(min_length=1, max_length=8)
+
+
+class SceneShow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["scene.show"] = "scene.show"
+    scene_id: str = Field(pattern=SCENE_ID)
+    at: int = Field(ge=1)
+
+
+class SceneStep(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["scene.step"] = "scene.step"
+    scene_id: str = Field(pattern=SCENE_ID)
+    n: int = Field(ge=1)
+    lead_ms: int = Field(ge=0)
+
+
 ChannelPayload = Annotated[
     DiagramPush
     | DiagramClear
@@ -94,7 +125,10 @@ ChannelPayload = Annotated[
     | TurnState
     | Caption
     | LearnerText
-    | VisualPending,
+    | VisualPending
+    | ScenePush
+    | SceneShow
+    | SceneStep,
     Field(discriminator="type"),
 ]
 
@@ -118,7 +152,17 @@ class SayMessage(BaseModel):
         return value.strip() if isinstance(value, str) else value
 
 
-ClientMessage = Annotated[ThemeMessage | SayMessage, Field(discriminator="type")]
+class SceneReady(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["scene.ready"] = "scene.ready"
+    scene_id: str = Field(pattern=SCENE_ID)
+    ok: bool
+    steps: int = Field(ge=0, le=8)
+    error: str = Field(max_length=500)
+
+
+ClientMessage = Annotated[ThemeMessage | SayMessage | SceneReady, Field(discriminator="type")]
 CLIENT_MESSAGE = TypeAdapter(ClientMessage)
 
 

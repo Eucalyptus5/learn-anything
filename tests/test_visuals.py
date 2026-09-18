@@ -14,6 +14,10 @@ from tutor.visuals import (
     DiagramPush,
     LearnerText,
     SayMessage,
+    ScenePush,
+    SceneReady,
+    SceneShow,
+    SceneStep,
     SourceHighlight,
     ThemeMessage,
     TurnState,
@@ -43,6 +47,15 @@ _VALID_SHAPES = [
     {"type": "caption", "turn_id": "turn-1", "text": "PPO clips.", "lead_ms": 0},
     {"type": "transcript", "turn_id": "turn-1", "text": "teach me ppo"},
     {"type": "visual.pending", "turn_id": "turn-1", "title": "Clipped objective"},
+    {
+        "type": "scene.push",
+        "scene_id": "turn-4",
+        "title": "Clipped objective",
+        "html": "<!doctype html><p>x</p>",
+        "steps": ["The ratio axis", "The clip band", "The flat region"],
+    },
+    {"type": "scene.show", "scene_id": "turn-4", "at": 1},
+    {"type": "scene.step", "scene_id": "turn-4", "n": 2, "lead_ms": 1200},
 ]
 
 
@@ -551,3 +564,100 @@ def test_extra_keys_on_a_client_message_are_rejected() -> None:
         _client_adapter.validate_python({"type": "say", "text": "x", "turn_id": "turn-1"})
     with pytest.raises(ValidationError):
         _client_adapter.validate_python({"type": "theme", "theme": "dark", "text": "x"})
+
+
+def test_scene_payloads_round_trip_through_json() -> None:
+    push = ScenePush(
+        scene_id="turn-4", title="Clipped objective", html="<p>x</p>", steps=["a", "b", "c"]
+    )
+    show = SceneShow(scene_id="turn-4", at=1)
+    step = SceneStep(scene_id="turn-4", n=2, lead_ms=1200)
+    for payload in (push, show, step):
+        dumped = payload.model_dump(mode="json")
+        json.dumps(dumped)
+        assert _channel_adapter.validate_python(dumped) == payload
+    assert push.model_dump(mode="json")["type"] == "scene.push"
+    assert show.model_dump(mode="json") == {"type": "scene.show", "scene_id": "turn-4", "at": 1}
+    assert step.model_dump(mode="json") == {
+        "type": "scene.step",
+        "scene_id": "turn-4",
+        "n": 2,
+        "lead_ms": 1200,
+    }
+
+
+@pytest.mark.parametrize(
+    "scene_id", ["", "Turn-4", "4turn", "a" * 33, "turn 4", "turn_4", "t<b>"], ids=repr
+)
+def test_a_scene_id_is_a_short_lowercase_token(scene_id: str) -> None:
+    with pytest.raises(ValidationError):
+        SceneShow(scene_id=scene_id, at=1)
+    assert SceneShow(scene_id="a" * 32, at=1).scene_id == "a" * 32
+    assert SceneShow(scene_id="turn-4", at=1).scene_id == "turn-4"
+
+
+def test_a_scene_push_caps_its_document_and_its_steps() -> None:
+    assert len(ScenePush(scene_id="s", title="t", html="x" * 200000, steps=["a"]).html) == 200000
+    assert len(ScenePush(scene_id="s", title="t", html="x", steps=["a"] * 8).steps) == 8
+    assert len(ScenePush(scene_id="s", title="t", html="x", steps=["a" * 120]).steps[0]) == 120
+    for html, steps in (
+        ("x" * 200001, ["a"]),
+        ("", ["a"]),
+        ("x", []),
+        ("x", ["a"] * 9),
+        ("x", ["a" * 121]),
+        ("x", [""]),
+        ("x", ["a", 1]),
+    ):
+        with pytest.raises(ValidationError):
+            ScenePush(scene_id="s", title="t", html=html, steps=steps)
+    with pytest.raises(ValidationError):
+        ScenePush(scene_id="s", title="t" * 81, html="x", steps=["a"])
+    with pytest.raises(ValidationError):
+        _channel_adapter.validate_python(
+            {
+                "type": "scene.push",
+                "scene_id": "s",
+                "title": "t",
+                "html": "x",
+                "steps": ["a"],
+                "x": 1,
+            }
+        )
+
+
+def test_show_and_step_count_from_one_and_the_lead_is_non_negative() -> None:
+    assert SceneShow(scene_id="s", at=1).at == 1
+    assert SceneStep(scene_id="s", n=1, lead_ms=0).lead_ms == 0
+    for at in (0, -1):
+        with pytest.raises(ValidationError):
+            SceneShow(scene_id="s", at=at)
+    for n, lead in ((0, 0), (1, -1)):
+        with pytest.raises(ValidationError):
+            SceneStep(scene_id="s", n=n, lead_ms=lead)
+    with pytest.raises(ValidationError):
+        _channel_adapter.validate_python({"type": "scene.step", "scene_id": "s", "n": 1})
+
+
+def test_a_scene_ready_message_validates_as_a_client_message() -> None:
+    ready = _client_adapter.validate_python(
+        {"type": "scene.ready", "scene_id": "turn-4", "ok": True, "steps": 3, "error": ""}
+    )
+
+    assert isinstance(ready, SceneReady)
+    assert ready.ok is True and ready.steps == 3 and ready.error == ""
+    failed = _client_adapter.validate_python(
+        {"type": "scene.ready", "scene_id": "turn-4", "ok": False, "steps": 0, "error": "e" * 500}
+    )
+    assert failed.ok is False and len(failed.error) == 500
+    for body in (
+        {"type": "scene.ready", "scene_id": "turn-4", "ok": "maybe", "steps": 3, "error": ""},
+        {"type": "scene.ready", "scene_id": "turn-4", "ok": True, "steps": 9, "error": ""},
+        {"type": "scene.ready", "scene_id": "turn-4", "ok": True, "steps": -1, "error": ""},
+        {"type": "scene.ready", "scene_id": "turn-4", "ok": True, "steps": 3, "error": "e" * 501},
+        {"type": "scene.ready", "scene_id": "Turn", "ok": True, "steps": 3, "error": ""},
+        {"type": "scene.ready", "scene_id": "turn-4", "ok": True, "steps": 3},
+        {"type": "scene.ready", "scene_id": "turn-4", "ok": True, "steps": 3, "error": "", "x": 1},
+    ):
+        with pytest.raises(ValidationError):
+            _client_adapter.validate_python(body)
