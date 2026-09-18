@@ -487,11 +487,11 @@ def test_a_visual_without_a_usage_chunk_has_an_unknown_cost(capsys) -> None:
 
 
 def test_the_visual_predicates_read_the_result_string() -> None:
-    assert bench_turn.is_valid("push_app: sent")
-    assert not bench_turn.is_valid("push_app: error: html: too long")
-    assert not bench_turn.is_valid("visual: timeout")
-    assert bench_turn.is_truncated("visual: error: truncated at 3000 tokens")
-    assert not bench_turn.is_truncated("push_diagram: sent")
+    assert bench_turn.is_valid("scene: sent")
+    assert not bench_turn.is_valid("scene: error: check failed twice")
+    assert not bench_turn.is_valid("scene: timeout")
+    assert bench_turn.is_truncated("scene: error: truncated at 32000 tokens")
+    assert not bench_turn.is_truncated("scene: sent")
 
 
 POWERMETRICS_BLOCKS = """Machine model: Mac14,2

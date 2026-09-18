@@ -80,7 +80,7 @@ PPO_UTTERANCES = (
     "the clip makes the gradient larger past epsilon",
     "just tell me",
 )
-PUSH_TYPES = frozenset({"diagram.push", "app.push"})
+PUSH_TYPES = frozenset({"scene.show"})
 ARMS = ("stripped", "head", "head-tail")
 CAPTURE_DIR = REPO / "scratch" / "bench"
 TAIL_LIMIT = 600
@@ -153,7 +153,7 @@ def is_valid(result: str) -> bool:
 
 
 def is_truncated(result: str) -> bool:
-    return result.startswith("visual: error: truncated")
+    return result.startswith("scene: error: truncated")
 
 
 def floored(pcm: np.ndarray) -> np.ndarray:
@@ -682,9 +682,20 @@ class BenchTransport(Connection):
         await super().play(floored(pcm))
 
     async def send_json(self, payload: dict[str, object]) -> None:
+        if payload["type"] == "scene.push":
+            report = {
+                "type": "scene.ready",
+                "scene_id": payload["scene_id"],
+                "ok": True,
+                "steps": len(payload["steps"]),
+                "error": "",
+            }
+            for handler in self._handlers:
+                handler(report)
+            return
         if payload["type"] in PUSH_TYPES:
             at = time.perf_counter()
-            self.pushes.append(Push(at, str(payload["type"]), str(payload["title"])))
+            self.pushes.append(Push(at, str(payload["type"]), str(payload["scene_id"])))
 
     async def drain(self) -> None:
         while True:
@@ -743,7 +754,7 @@ class Bench:
         synth: TaggedSynth,
         watch: OutcomeWatch,
         loop: TurnLoop,
-        visual_timeout_s: float,
+        scene_timeout_s: float,
         capture: Capture | None,
     ) -> None:
         self._loop_task = loop_task
@@ -754,7 +765,7 @@ class Bench:
         self._synth = synth
         self._watch = watch
         self._loop = loop
-        self._visual_timeout_s = visual_timeout_s
+        self._scene_timeout_s = scene_timeout_s
         self._capture = capture
         self._dispatched = 0
 
@@ -790,7 +801,7 @@ class Bench:
             synth,
             watch,
             loop,
-            cfg.visual_timeout_s,
+            cfg.scene_timeout_s,
             capture,
         )
 
@@ -822,7 +833,7 @@ class Bench:
             )
         )
 
-        await settle_visual(turn_id, self._visual_timeout_s)
+        await settle_visual(turn_id, self._scene_timeout_s)
 
         reply = "\n".join("".join(deltas) for deltas in record.streams)
         head = classify_head(reply)
@@ -938,10 +949,11 @@ def report(
         "head token when a brief is present."
     )
     print(
-        "a visual lands when its diagram.push or app.push payload reaches Connection.send_json "
-        "after the EndOfTurn; brief to first clause runs from the head closing to the first "
+        "a visual lands when its scene.show reaches Connection.send_json, the harness answering "
+        "each scene.push with a passing scene.ready since no page is attached, after the "
+        "EndOfTurn; brief to first clause runs from the head closing to the first "
         "model clause reaching Connection.play. Visuals are serialized: each turn waits for its "
-        "own visual task, up to visual_timeout_s, before the next turn is injected, so a visual "
+        "own visual task, up to scene_timeout_s, before the next turn is injected, so a visual "
         "never runs under the following turn's voice call and nothing is superseded."
     )
     print(
@@ -957,8 +969,9 @@ def report(
         f"model={cfg.reasoning_model}  arm={arm}{synth_field}  samples={len(samples)} "
         f"(plus {WARMUP} discarded warm-ups)  "
         f"subject={subject_for(args.root, args.subject)!r}  root={args.root}  "
-        f"starting_from={args.starting_from!r}  visual_timeout_s={cfg.visual_timeout_s}  "
-        f"visual_max_tokens={cfg.visual_max_tokens}"
+        f"starting_from={args.starting_from!r}  scene_timeout_s={cfg.scene_timeout_s}  "
+        f"scene_max_tokens={cfg.scene_max_tokens}  "
+        f"scene_effort={cfg.scene_effort}  scene_model={cfg.scene_model or cfg.reasoning_model}"
     )
 
     def measured(label: str, values: list[int]) -> None:

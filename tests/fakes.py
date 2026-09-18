@@ -98,6 +98,16 @@ class FakeTransport:
 
     async def send_json(self, payload: dict[str, object]) -> None:
         self.sent.append(payload)
+        if payload["type"] == "scene.push":
+            report = {
+                "type": "scene.ready",
+                "scene_id": payload["scene_id"],
+                "ok": True,
+                "steps": len(payload["steps"]),
+                "error": "",
+            }
+            for handler in self.handlers:
+                handler(report)
 
     def on_json(self, handler: Callable[[dict[str, object]], None]) -> None:
         self.handlers.append(handler)

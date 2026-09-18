@@ -5,8 +5,8 @@ import logging
 import pytest
 
 from tests.fakes import FakeConnection, grounded_registry
+from tutor import visual_tools
 from tutor.visual_tools import (
-    VISUAL_CALL_TOOLS,
     VISUAL_TOOLS,
     VOICE_VISUAL_TOOLS,
     dispatch_visual_tool,
@@ -75,14 +75,12 @@ def test_the_tool_schema_carries_title_for_both_pushes() -> None:
     assert "title" not in by_name["highlight_source"]["parameters"]["properties"]
 
 
-def test_the_call_tools_and_voice_tools_partition_the_surface() -> None:
-    call_names = [t["function"]["name"] for t in VISUAL_CALL_TOOLS]
+def test_the_voice_tools_are_the_two_that_never_draw() -> None:
     voice_names = [t["function"]["name"] for t in VOICE_VISUAL_TOOLS]
 
-    assert call_names == ["push_diagram", "push_app"]
     assert voice_names == ["clear_diagram", "highlight_source"]
-    assert sorted(call_names + voice_names) == sorted(t["function"]["name"] for t in VISUAL_TOOLS)
-    assert all(t in VISUAL_TOOLS for t in [*VISUAL_CALL_TOOLS, *VOICE_VISUAL_TOOLS])
+    assert all(t in VISUAL_TOOLS for t in VOICE_VISUAL_TOOLS)
+    assert not hasattr(visual_tools, "VISUAL_CALL_TOOLS")
 
 
 @pytest.mark.parametrize("arguments", ["{", "", "not json", "{'id': 1}"])

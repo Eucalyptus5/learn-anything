@@ -30,6 +30,7 @@ from tutor.lead_in import lead_in_sentence, lead_in_stages
 from tutor.pedagogy import PedagogyState, Phase, TurnOutcome
 from tutor.prompt import SEARCH_CODE_TOOL, Message, TurnPrompt
 from tutor.reasoning import TurnChunk
+from tutor.scene import SCENE_TOOLS
 from tutor.session import (
     BAD_ARGUMENTS,
     CONCEPT_OUTCOME_INSTRUCTION,
@@ -51,7 +52,7 @@ from tutor.tools.models import (
 )
 from tutor.tools.provenance import TurnRegistry
 from tutor.transport import INBOUND_CAPACITY, Connection
-from tutor.visual_tools import VISUAL_CALL_TOOLS, VOICE_VISUAL_TOOLS
+from tutor.visual_tools import VOICE_VISUAL_TOOLS
 
 HANG_GUARD_S = 20.0
 TICK_S = 0.25
@@ -417,7 +418,9 @@ class FakeSpeaker:
         self.finished.set()
 
 
-VISUAL_PAYLOAD_TYPES = frozenset({"diagram.push", "diagram.clear", "source.highlight", "app.push"})
+VISUAL_PAYLOAD_TYPES = frozenset(
+    {"diagram.push", "diagram.clear", "source.highlight", "app.push", "scene.push", "scene.show"}
+)
 
 
 def sent(log: list[tuple[str, object]], kind: str) -> list[dict[str, object]]:
@@ -441,6 +444,71 @@ class LoggingTransport:
 
     def on_json(self, handler: Callable[[dict[str, object]], None]) -> None:
         self.handlers.append(handler)
+
+
+class CheckingTransport(LoggingTransport):
+    def __init__(self, log: list[tuple[str, object]], ok: bool = True, error: str = "") -> None:
+        super().__init__(log)
+        self.ok = ok
+        self.error = error
+        self.reports: list[dict[str, object]] = []
+
+    async def send_json(self, payload: dict[str, object]) -> None:
+        self._log.append(("send_json", payload))
+        if payload["type"] != "scene.push":
+            return
+        steps = len(payload["steps"]) if self.ok else 0
+        report = {
+            "type": "scene.ready",
+            "scene_id": payload["scene_id"],
+            "ok": self.ok,
+            "steps": steps,
+            "error": self.error,
+        }
+        self.reports.append(report)
+        asyncio.get_running_loop().call_soon(lambda: [h(report) for h in self.handlers])
+
+
+class AnsweringTransport(LoggingTransport):
+    def __init__(
+        self,
+        log: list[tuple[str, object]],
+        answers: dict[str, str],
+        holds: dict[str, asyncio.Event] | None = None,
+    ) -> None:
+        super().__init__(log)
+        self.answers = answers
+        self.holds = holds if holds is not None else {}
+        self.pushes: dict[str, asyncio.Event] = {}
+        self.deliveries: list[asyncio.Task[None]] = []
+
+    async def send_json(self, payload: dict[str, object]) -> None:
+        self._log.append(("send_json", payload))
+        if payload["type"] != "scene.push":
+            return
+        scene_id = str(payload["scene_id"])
+        self.pushes.setdefault(scene_id, asyncio.Event()).set()
+        if scene_id not in self.answers:
+            return
+        error = self.answers[scene_id]
+        report = {
+            "type": "scene.ready",
+            "scene_id": scene_id,
+            "ok": error == "",
+            "steps": len(payload["steps"]) if error == "" else 0,
+            "error": error,
+        }
+        gate = self.holds.get(scene_id)
+        if gate is None:
+            asyncio.get_running_loop().call_soon(lambda: [h(report) for h in self.handlers])
+            return
+
+        async def deliver() -> None:
+            await gate.wait()
+            for handler in self.handlers:
+                handler(report)
+
+        self.deliveries.append(asyncio.create_task(deliver()))
 
 
 def visual_call(name: str, arguments: str, call_id: str) -> TurnChunk:
@@ -4063,18 +4131,17 @@ BRIEF_JSON = VisualBrief(
 BRIEF_HEAD = BRIEF_MARKER + BRIEF_JSON + BRIEF_END
 NONE_HEAD = BRIEF_MARKER + VisualBrief(kind="none", title="", show="").model_dump_json() + BRIEF_END
 BRIEFED_DELTAS = [BRIEF_HEAD[:12], BRIEF_HEAD[12:], "\n", *SPOKEN_DELTAS]
-APP_CALL = visual_call(
-    "push_app",
-    json.dumps({"id": "clip", "title": "Clipped objective", "html": "<!doctype html><p>x</p>"}),
-    "call-v",
+SCENE_STEPS = ["The ratio axis", "The clip band", "The flat region"]
+SCENE_HTML = "<!doctype html><p>x</p>"
+SCENE_CALL = visual_call(
+    "write_scene", json.dumps({"html": SCENE_HTML, "steps": SCENE_STEPS}), "call-v"
 )
 APP_TITLE = "Clipped objective"
 SECOND_CONCEPT_TEXT = "and the ratio"
 
 
 def visual_user_text(learner: str) -> str:
-    brief = VisualBrief.model_validate_json(BRIEF_JSON).model_dump_json()
-    return f"Brief: {brief}\nThe learner just said: {learner}"
+    return "Subject: PPO\nTitle: Clipped objective\nShow: surrogate vs ratio"
 
 
 def concept_loop(
@@ -4090,7 +4157,7 @@ def concept_loop(
         source,
         FakeSearch(log, found()),
         speaker,
-        transport if transport is not None else LoggingTransport(log),
+        transport if transport is not None else CheckingTransport(log),
         reasoning,
         FakeRegistry(log),
     )
@@ -4100,11 +4167,19 @@ def pending(log: list[tuple[str, object]], turn_id: str) -> list[str]:
     return [str(p["title"]) for p in sent(log, "visual.pending") if p["turn_id"] == turn_id]
 
 
+def shown(log: list[tuple[str, object]]) -> list[str]:
+    return [str(p["scene_id"]) for p in sent(log, "scene.show")]
+
+
+def pushed(log: list[tuple[str, object]]) -> list[str]:
+    return [str(p["scene_id"]) for p in sent(log, "scene.push")]
+
+
 async def test_a_validated_brief_announces_the_pending_visual_before_the_call() -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
     reasoning = FakeReasoning(
-        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL]
+        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[SCENE_CALL]
     )
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning)
 
@@ -4117,18 +4192,22 @@ async def test_a_validated_brief_announces_the_pending_visual_before_the_call() 
     assert log.index(("send_json", announced)) < log.index(
         ("start_turn", visual_user_text(CONCEPT_TEXT))
     )
-    assert [payload["title"] for payload in sent(log, "app.push")] == [APP_TITLE]
+    assert pushed(log) == ["turn-1"]
+    assert log.index(("send_json", sent(log, "scene.push")[0])) < log.index(
+        ("send_json", sent(log, "scene.show")[0])
+    )
+    assert shown(log) == ["turn-1"]
 
 
-async def test_the_visual_call_uses_the_configured_visual_model_and_the_voice_call_does_not() -> (
+async def test_the_visual_call_uses_the_configured_scene_model_and_the_voice_call_does_not() -> (
     None
 ):
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
     reasoning = FakeReasoning(
-        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL]
+        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[SCENE_CALL]
     )
-    cfg = concept_cfg().model_copy(update={"visual_model": "draw-1"})
+    cfg = concept_cfg().model_copy(update={"scene_model": "draw-1"})
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning, cfg=cfg)
 
     await asyncio.wait_for(loop.run(), HANG_GUARD_S)
@@ -4137,11 +4216,11 @@ async def test_the_visual_call_uses_the_configured_visual_model_and_the_voice_ca
     assert reasoning.models == [None, "draw-1"]
 
 
-async def test_an_empty_visual_model_leaves_the_visual_call_on_the_reasoning_model() -> None:
+async def test_an_empty_scene_model_leaves_the_visual_call_on_the_reasoning_model() -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
     reasoning = FakeReasoning(
-        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL]
+        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[SCENE_CALL]
     )
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning)
 
@@ -4155,7 +4234,7 @@ async def test_kind_none_announces_no_pending_visual() -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
     deltas = spoken_chunks([NONE_HEAD, *SPOKEN_DELTAS])
-    reasoning = FakeReasoning(log, deltas, speaker.received, visual=[APP_CALL])
+    reasoning = FakeReasoning(log, deltas, speaker.received, visual=[SCENE_CALL])
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning)
 
     await asyncio.wait_for(loop.run(), HANG_GUARD_S)
@@ -4167,7 +4246,7 @@ async def test_kind_none_announces_no_pending_visual() -> None:
 async def test_a_truncated_visual_clears_the_pending_title() -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
-    cut = visual_call("push_app", APP_CALL.text[:40], "call-v")
+    cut = visual_call("write_scene", SCENE_CALL.text[:40], "call-v")
     reasoning = FakeReasoning(
         log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[cut], visual_finish="length"
     )
@@ -4177,7 +4256,7 @@ async def test_a_truncated_visual_clears_the_pending_title() -> None:
     await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
 
     assert pending(log, "turn-1") == [APP_TITLE, ""]
-    assert sent(log, "app.push") == []
+    assert pushed(log) == []
 
 
 class ClosedSettleTransport(LoggingTransport):
@@ -4197,7 +4276,7 @@ async def test_a_pending_clear_on_a_closed_channel_is_a_warning_not_a_second_fai
         spoken_chunks(BRIEFED_DELTAS),
         speaker.received,
         fails=visual_user_text(CONCEPT_TEXT),
-        visual=[APP_CALL],
+        visual=[SCENE_CALL],
     )
     loop = concept_loop(
         log, SerialSource([CONCEPT_TEXT]), speaker, reasoning, transport=ClosedSettleTransport(log)
@@ -4211,14 +4290,14 @@ async def test_a_pending_clear_on_a_closed_channel_is_a_warning_not_a_second_fai
     messages = session_messages(caplog)
     assert "visual.pending_push_failed turn_id=turn-1 error=ChannelClosed" in messages
     errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
-    assert errors == ["visual.failed turn_id=turn-1 error=RateLimited"]
+    assert errors == ["scene.failed turn_id=turn-1 error=RateLimited"]
 
 
 async def test_a_brief_head_starts_the_visual_call_and_is_never_spoken() -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
     reasoning = FakeReasoning(
-        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL]
+        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[SCENE_CALL]
     )
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning)
 
@@ -4231,26 +4310,32 @@ async def test_a_brief_head_starts_the_visual_call_and_is_never_spoken() -> None
     assert captions == SPOKEN_CLAUSES
     assert all(BRIEF_MARKER not in text for text in [*spoken, *captions])
     assert reasoning.tool_choices == [None, "required"]
-    assert reasoning.tools[1] == VISUAL_CALL_TOOLS
-    assert reasoning.max_tokens[1] == 3000
-    assert [payload["title"] for payload in sent(log, "app.push")] == [APP_TITLE]
-    assert reasoning.prompts[1].history == reasoning.prompts[0].history
-    assert reasoning.prompts[1].tool_context == reasoning.prompts[0].tool_context
+    assert reasoning.tools[1] == SCENE_TOOLS
+    assert reasoning.max_tokens[1] == 32000
+    assert reasoning.efforts[1] == "high"
+    assert shown(log) == ["turn-1"]
+    assert reasoning.prompts[1].history == []
+    assert reasoning.prompts[1].tool_context == []
     assert reasoning.prompts[1].user_text == visual_user_text(CONCEPT_TEXT)
+    (push,) = sent(log, "scene.push")
+    assert push["title"] == APP_TITLE and push["html"] == SCENE_HTML
+    assert push["steps"] == SCENE_STEPS
+    (show,) = sent(log, "scene.show")
+    assert show["at"] == 1 and show["seq"] > push["seq"]
 
 
 async def test_kind_none_starts_no_visual_call() -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
     deltas = spoken_chunks([NONE_HEAD, *SPOKEN_DELTAS])
-    reasoning = FakeReasoning(log, deltas, speaker.received, visual=[APP_CALL])
+    reasoning = FakeReasoning(log, deltas, speaker.received, visual=[SCENE_CALL])
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning)
 
     await asyncio.wait_for(loop.run(), HANG_GUARD_S)
     await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
 
     assert len(reasoning.prompts) == 1
-    assert sent(log, "app.push") == []
+    assert shown(log) == []
     assert speaker.utterances == [SPOKEN_CLAUSES]
 
 
@@ -4258,7 +4343,7 @@ async def test_a_missing_head_speaks_everything_and_starts_no_visual_call() -> N
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
     reasoning = FakeReasoning(
-        log, spoken_chunks(SPOKEN_DELTAS), speaker.received, visual=[APP_CALL]
+        log, spoken_chunks(SPOKEN_DELTAS), speaker.received, visual=[SCENE_CALL]
     )
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning)
 
@@ -4266,7 +4351,7 @@ async def test_a_missing_head_speaks_everything_and_starts_no_visual_call() -> N
     await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
 
     assert len(reasoning.prompts) == 1
-    assert sent(log, "app.push") == []
+    assert shown(log) == []
     assert speaker.utterances == [SPOKEN_CLAUSES]
 
 
@@ -4275,7 +4360,11 @@ async def test_the_visual_call_lands_after_the_turn_has_ended() -> None:
     speaker = FakeSpeaker(log)
     gate = asyncio.Event()
     reasoning = FakeReasoning(
-        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL], visual_gates=[gate]
+        log,
+        spoken_chunks(BRIEFED_DELTAS),
+        speaker.received,
+        visual=[SCENE_CALL],
+        visual_gates=[gate],
     )
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning)
 
@@ -4284,13 +4373,13 @@ async def test_the_visual_call_lands_after_the_turn_has_ended() -> None:
     visual = visual_task()
 
     assert not visual.done()
-    assert sent(log, "app.push") == []
+    assert shown(log) == []
     assert speaker.utterances == [SPOKEN_CLAUSES]
 
     gate.set()
     await asyncio.wait_for(visual, HANG_GUARD_S)
 
-    assert [payload["title"] for payload in sent(log, "app.push")] == [APP_TITLE]
+    assert shown(log) == ["turn-1"]
     assert pending(log, "turn-1") == [APP_TITLE]
     await loop.aclose()
 
@@ -4302,7 +4391,11 @@ async def test_a_visual_that_finishes_after_a_newer_one_has_landed_is_dropped(
     speaker = FakeSpeaker(log)
     gate = asyncio.Event()
     reasoning = FakeReasoning(
-        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL], visual_gates=[gate]
+        log,
+        spoken_chunks(BRIEFED_DELTAS),
+        speaker.received,
+        visual=[SCENE_CALL],
+        visual_gates=[gate],
     )
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT, SECOND_CONCEPT_TEXT]), speaker, reasoning)
 
@@ -4310,15 +4403,15 @@ async def test_a_visual_that_finishes_after_a_newer_one_has_landed_is_dropped(
         await asyncio.wait_for(loop.run(), HANG_GUARD_S)
         first = visual_task()
         assert not first.done()
-        assert len(sent(log, "app.push")) == 1
+        assert len(shown(log)) == 1
         log.append(("release", None))
         gate.set()
         await asyncio.wait_for(first, HANG_GUARD_S)
         await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
 
-    (push,) = sent(log, "app.push")
+    (push,) = sent(log, "scene.show")
     assert log.index(("send_json", push)) < log.index(("release", None))
-    assert "visual.superseded turn_id=turn-1" in session_messages(caplog)
+    assert "scene.superseded turn_id=turn-1" in session_messages(caplog)
     assert pending(log, "turn-1") == [APP_TITLE, ""]
     assert pending(log, "turn-2") == [APP_TITLE]
 
@@ -4332,7 +4425,7 @@ async def test_an_older_visual_lands_while_the_newer_one_is_still_drawing() -> N
         log,
         spoken_chunks(BRIEFED_DELTAS),
         speaker.received,
-        visual=[APP_CALL],
+        visual=[SCENE_CALL],
         visual_gates=[first_gate, second_gate],
     )
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT, SECOND_CONCEPT_TEXT]), speaker, reasoning)
@@ -4340,20 +4433,20 @@ async def test_an_older_visual_lands_while_the_newer_one_is_still_drawing() -> N
     await asyncio.wait_for(loop.run(), HANG_GUARD_S)
     first = visual_task()
     second = visual_task("turn-2-visual")
-    assert sent(log, "app.push") == []
+    assert shown(log) == []
 
     first_gate.set()
     await asyncio.wait_for(first, HANG_GUARD_S)
-    assert len(sent(log, "app.push")) == 1
+    assert len(shown(log)) == 1
     assert not second.done()
 
     second_gate.set()
     await asyncio.wait_for(second, HANG_GUARD_S)
     await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
 
-    pushes = sent(log, "app.push")
-    assert [payload["title"] for payload in pushes] == [APP_TITLE, APP_TITLE]
-    assert pushes[0]["seq"] < pushes[1]["seq"]
+    assert shown(log) == ["turn-1", "turn-2"]
+    shows = sent(log, "scene.show")
+    assert shows[0]["seq"] < shows[1]["seq"]
     assert pending(log, "turn-1") == [APP_TITLE]
     assert pending(log, "turn-2") == [APP_TITLE]
 
@@ -4368,7 +4461,7 @@ async def test_a_visual_call_error_is_one_log_line_and_the_voice_is_untouched(
         spoken_chunks(BRIEFED_DELTAS),
         speaker.received,
         fails=visual_user_text(CONCEPT_TEXT),
-        visual=[APP_CALL],
+        visual=[SCENE_CALL],
     )
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning)
 
@@ -4378,8 +4471,8 @@ async def test_a_visual_call_error_is_one_log_line_and_the_voice_is_untouched(
 
     assert speaker.utterances == [SPOKEN_CLAUSES]
     errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
-    assert errors == ["visual.failed turn_id=turn-1 error=RateLimited"]
-    assert sent(log, "app.push") == []
+    assert errors == ["scene.failed turn_id=turn-1 error=RateLimited"]
+    assert shown(log) == []
     assert pending(log, "turn-1") == [APP_TITLE, ""]
 
 
@@ -4390,9 +4483,13 @@ async def test_a_visual_call_past_the_timeout_is_cancelled(
     speaker = FakeSpeaker(log)
     gate = asyncio.Event()
     reasoning = FakeReasoning(
-        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL], visual_gates=[gate]
+        log,
+        spoken_chunks(BRIEFED_DELTAS),
+        speaker.received,
+        visual=[SCENE_CALL],
+        visual_gates=[gate],
     )
-    cfg = concept_cfg().model_copy(update={"visual_timeout_s": 0.01})
+    cfg = concept_cfg().model_copy(update={"scene_timeout_s": 0.01})
     loop = concept_loop(
         log, SerialSource([CONCEPT_TEXT, SECOND_CONCEPT_TEXT]), speaker, reasoning, cfg=cfg
     )
@@ -4408,12 +4505,12 @@ async def test_a_visual_call_past_the_timeout_is_cancelled(
         await asyncio.wait_for(running, HANG_GUARD_S)
         await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
 
-    assert visual.result() == "visual: timeout"
+    assert visual.result() == "scene: timeout"
     assert ("stream_closed", 0) in log
-    assert "visual.timeout turn_id=turn-1" in session_messages(caplog)
+    assert "scene.timeout turn_id=turn-1" in session_messages(caplog)
     assert ("open_turn", "turn-2") in log
     assert speaker.utterances == [SPOKEN_CLAUSES, SPOKEN_CLAUSES]
-    assert [payload["title"] for payload in sent(log, "app.push")] == [APP_TITLE]
+    assert shown(log) == ["turn-2"]
     assert pending(log, "turn-1") == [APP_TITLE, ""]
     assert pending(log, "turn-2") == [APP_TITLE]
 
@@ -4429,7 +4526,7 @@ async def test_a_barge_in_cancels_the_interrupted_turns_visual_call() -> None:
         speaker.received,
         gate=gate,
         holds_at=3,
-        visual=[APP_CALL],
+        visual=[SCENE_CALL],
         visual_gates=[visual_gate],
     )
     barge = asyncio.Event()
@@ -4454,13 +4551,13 @@ async def test_a_barge_in_cancels_the_interrupted_turns_visual_call() -> None:
     assert drain.cancelled()
     assert visual.cancelled()
     assert pending(log, "turn-1") == [APP_TITLE, ""]
-    assert sent(log, "app.push") == []
+    assert shown(log) == []
     assert ("abandon", "turn-1") in log
 
     resume.set()
     await asyncio.wait_for(running, HANG_GUARD_S)
     await loop.aclose()
-    assert sent(log, "app.push") == []
+    assert shown(log) == []
 
 
 @pytest.mark.parametrize("matches", [True, False], ids=["matching", "mismatching"])
@@ -4470,7 +4567,7 @@ async def test_a_speculative_brief_waits_for_the_claim(matches: bool) -> None:
     gate = asyncio.Event()
     turns = [spoken_chunks(BRIEFED_DELTAS), spoken_chunks(SPOKEN_DELTAS)]
     reasoning = FakeReasoning(
-        log, [], speaker.received, gate=gate, holds_at=3, turns=turns, visual=[APP_CALL]
+        log, [], speaker.received, gate=gate, holds_at=3, turns=turns, visual=[SCENE_CALL]
     )
     final = CONCEPT_TEXT if matches else "two"
     endpoint = asyncio.Event()
@@ -4499,11 +4596,11 @@ async def test_a_speculative_brief_waits_for_the_claim(matches: bool) -> None:
 
     if matches:
         assert reasoning.tool_choices == [None, "required"]
-        assert [payload["title"] for payload in sent(log, "app.push")] == [APP_TITLE]
+        assert shown(log) == ["turn-1"]
         assert reasoning.prompts[1].user_text == visual_user_text(CONCEPT_PARTIAL)
     else:
         assert reasoning.tool_choices == [None, None]
-        assert sent(log, "app.push") == []
+        assert shown(log) == []
     assert speaker.utterances == [SPOKEN_CLAUSES]
 
 
@@ -4519,7 +4616,7 @@ async def test_a_mismatched_speculation_leaves_no_brief_behind(completes: bool) 
         speaker.received,
         gate=gate,
         holds_at=holds_at,
-        visual=[APP_CALL],
+        visual=[SCENE_CALL],
     )
     endpoint = asyncio.Event()
     source = ScriptedSource(
@@ -4550,7 +4647,7 @@ async def test_a_mismatched_speculation_leaves_no_brief_behind(completes: bool) 
         "two",
         visual_user_text("two"),
     ]
-    assert [payload["title"] for payload in sent(log, "app.push")] == [APP_TITLE]
+    assert shown(log) == ["turn-1"]
     assert speaker.utterances == [SPOKEN_CLAUSES]
 
 
@@ -4558,7 +4655,7 @@ async def test_the_next_turn_sees_the_brief_head_in_its_history() -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
     deltas = spoken_chunks([NONE_HEAD, "\n", *SPOKEN_DELTAS])
-    reasoning = FakeReasoning(log, deltas, speaker.received, visual=[APP_CALL])
+    reasoning = FakeReasoning(log, deltas, speaker.received, visual=[SCENE_CALL])
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT, SECOND_CONCEPT_TEXT]), speaker, reasoning)
 
     await asyncio.wait_for(loop.run(), HANG_GUARD_S)
@@ -4568,25 +4665,6 @@ async def test_the_next_turn_sees_the_brief_head_in_its_history() -> None:
     assert reasoning.prompts[1].history == [
         Message(role="user", content=CONCEPT_TEXT),
         Message(role="assistant", content=NONE_HEAD + "\n" + " ".join(SPOKEN_CLAUSES)),
-    ]
-
-
-async def test_the_visual_call_sees_the_kept_head_too() -> None:
-    log: list[tuple[str, object]] = []
-    speaker = FakeSpeaker(log)
-    reasoning = FakeReasoning(
-        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL]
-    )
-    loop = concept_loop(log, SerialSource([CONCEPT_TEXT, SECOND_CONCEPT_TEXT]), speaker, reasoning)
-
-    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
-    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
-
-    assert reasoning.tool_choices == [None, "required", None, "required"]
-    assert reasoning.prompts[3].history == reasoning.prompts[2].history
-    assert reasoning.prompts[3].history == [
-        Message(role="user", content=CONCEPT_TEXT),
-        Message(role="assistant", content=BRIEF_HEAD + "\n" + " ".join(SPOKEN_CLAUSES)),
     ]
 
 
@@ -4602,7 +4680,7 @@ async def test_a_mismatched_speculation_leaves_no_head_in_the_transcript(complet
         spoken_chunks(SPOKEN_DELTAS),
     ]
     reasoning = FakeReasoning(
-        log, [], speaker.received, gate=gate, holds_at=holds_at, turns=turns, visual=[APP_CALL]
+        log, [], speaker.received, gate=gate, holds_at=holds_at, turns=turns, visual=[SCENE_CALL]
     )
     endpoint = asyncio.Event()
     source = ScriptedSource(
@@ -4639,14 +4717,14 @@ async def test_a_mismatched_speculation_leaves_no_head_in_the_transcript(complet
         Message(role="user", content="two"),
         Message(role="assistant", content=" ".join(SPOKEN_CLAUSES)),
     ]
-    assert sent(log, "app.push") == []
+    assert shown(log) == []
 
 
 async def test_a_missing_head_leaves_the_history_as_before() -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
     reasoning = FakeReasoning(
-        log, spoken_chunks(SPOKEN_DELTAS), speaker.received, visual=[APP_CALL]
+        log, spoken_chunks(SPOKEN_DELTAS), speaker.received, visual=[SCENE_CALL]
     )
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT, SECOND_CONCEPT_TEXT]), speaker, reasoning)
 
@@ -4660,67 +4738,20 @@ async def test_a_missing_head_leaves_the_history_as_before() -> None:
     ]
 
 
-async def test_the_previous_brief_reaches_the_next_visual_call() -> None:
-    log: list[tuple[str, object]] = []
-    speaker = FakeSpeaker(log)
-    reasoning = FakeReasoning(
-        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL]
-    )
-    loop = concept_loop(log, SerialSource([CONCEPT_TEXT, SECOND_CONCEPT_TEXT]), speaker, reasoning)
-
-    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
-    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
-
-    assert reasoning.tool_choices == [None, "required", None, "required"]
-    assert "Previous visual: none" in reasoning.prompts[1].system
-    assert "Previous visual: app, Clipped objective" in reasoning.prompts[3].system
-
-
-async def test_the_visual_call_sees_the_rounds_search_results(tmp_path: Path) -> None:
-    log: list[tuple[str, object]] = []
-    result = found()
-    speaker = FakeSpeaker(log)
-    deltas = [TurnChunk(kind="spoken", text=BRIEF_HEAD), SEARCH_CALL]
-    reasoning = FakeReasoning(
-        log, deltas, speaker.received, follow_up=spoken_chunks(SPOKEN_DELTAS), visual=[APP_CALL]
-    )
-    loop = TurnLoop(
-        config(tmp_path),
-        SerialSource([USER_TEXT]),
-        FakeSearch(log, result),
-        speaker,
-        LoggingTransport(log),
-        reasoning,
-        FakeRegistry(log),
-        FakeClock(),
-    )
-
-    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
-    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
-
-    assert reasoning.tool_choices == [None, None, "required"]
-    visual = reasoning.prompts[2]
-    assert visual.tool_context == [result]
-    assert visual.history == reasoning.prompts[0].history
-    assert visual.tool_exchange == []
-    assert [payload["title"] for payload in sent(log, "app.push")] == [APP_TITLE]
-    assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
-
-
 async def test_a_head_in_both_rounds_starts_one_visual(tmp_path: Path) -> None:
     log: list[tuple[str, object]] = []
     result = found()
     speaker = FakeSpeaker(log)
     deltas = [TurnChunk(kind="spoken", text=BRIEF_HEAD), SEARCH_CALL]
     reasoning = FakeReasoning(
-        log, deltas, speaker.received, follow_up=spoken_chunks(BRIEFED_DELTAS), visual=[APP_CALL]
+        log, deltas, speaker.received, follow_up=spoken_chunks(BRIEFED_DELTAS), visual=[SCENE_CALL]
     )
     loop = TurnLoop(
         config(tmp_path),
         SerialSource([USER_TEXT]),
         FakeSearch(log, result),
         speaker,
-        LoggingTransport(log),
+        CheckingTransport(log),
         reasoning,
         FakeRegistry(log),
         FakeClock(),
@@ -4730,13 +4761,11 @@ async def test_a_head_in_both_rounds_starts_one_visual(tmp_path: Path) -> None:
     await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
 
     assert reasoning.tool_choices == [None, None, "required"]
-    assert [payload["title"] for payload in sent(log, "app.push")] == [APP_TITLE]
+    assert shown(log) == ["turn-1"]
     assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
 
 
-async def test_a_head_only_in_the_follow_up_still_draws_with_the_search_result(
-    tmp_path: Path,
-) -> None:
+async def test_a_head_only_in_the_follow_up_still_draws(tmp_path: Path) -> None:
     log: list[tuple[str, object]] = []
     result = found()
     speaker = FakeSpeaker(log)
@@ -4745,14 +4774,14 @@ async def test_a_head_only_in_the_follow_up_still_draws_with_the_search_result(
         [SEARCH_CALL],
         speaker.received,
         follow_up=spoken_chunks(BRIEFED_DELTAS),
-        visual=[APP_CALL],
+        visual=[SCENE_CALL],
     )
     loop = TurnLoop(
         config(tmp_path),
         SerialSource([USER_TEXT]),
         FakeSearch(log, result),
         speaker,
-        LoggingTransport(log),
+        CheckingTransport(log),
         reasoning,
         FakeRegistry(log),
         FakeClock(),
@@ -4762,8 +4791,7 @@ async def test_a_head_only_in_the_follow_up_still_draws_with_the_search_result(
     await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
 
     assert reasoning.tool_choices == [None, None, "required"]
-    assert reasoning.prompts[2].tool_context == [result]
-    assert [payload["title"] for payload in sent(log, "app.push")] == [APP_TITLE]
+    assert shown(log) == ["turn-1"]
     assert speaker.utterances == [[lead_in_sentence([result]), *SPOKEN_CLAUSES]]
 
 
@@ -4772,9 +4800,9 @@ async def test_a_theme_message_reaches_the_visual_prompt(theme: object) -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
     reasoning = FakeReasoning(
-        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL]
+        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[SCENE_CALL]
     )
-    transport = LoggingTransport(log)
+    transport = CheckingTransport(log)
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning, transport=transport)
     (handler,) = transport.handlers
     handler({"type": "theme", "theme": theme})
@@ -4793,9 +4821,9 @@ async def test_an_accepted_theme_is_logged_and_a_rejected_one_is_not(
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
     reasoning = FakeReasoning(
-        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL]
+        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[SCENE_CALL]
     )
-    transport = LoggingTransport(log)
+    transport = CheckingTransport(log)
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning, transport=transport)
     (handler,) = transport.handlers
 
@@ -5037,7 +5065,11 @@ async def test_aclose_cancels_a_visual_call_in_flight() -> None:
     speaker = FakeSpeaker(log)
     gate = asyncio.Event()
     reasoning = FakeReasoning(
-        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[APP_CALL], visual_gates=[gate]
+        log,
+        spoken_chunks(BRIEFED_DELTAS),
+        speaker.received,
+        visual=[SCENE_CALL],
+        visual_gates=[gate],
     )
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning)
 
@@ -5047,7 +5079,238 @@ async def test_aclose_cancels_a_visual_call_in_flight() -> None:
 
     assert visual.cancelled()
     assert pending(log, "turn-1") == [APP_TITLE, ""]
-    assert sent(log, "app.push") == []
+    assert shown(log) == []
+
+
+async def test_a_failed_check_retries_once_with_the_error_and_then_gives_up(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(
+        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[SCENE_CALL]
+    )
+    transport = CheckingTransport(log, ok=False, error="timeline lacks labels step-3")
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning, transport=transport)
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert reasoning.tool_choices == [None, "required", "required"]
+    assert "timeline lacks labels step-3" not in reasoning.prompts[1].user_text
+    assert reasoning.prompts[2].user_text.endswith(
+        "The previous attempt failed its check: timeline lacks labels step-3\n"
+        "Write the whole scene again."
+    )
+    assert pushed(log) == ["turn-1", "turn-1"]
+    assert shown(log) == []
+    assert pending(log, "turn-1") == [APP_TITLE, ""]
+    messages = session_messages(caplog)
+    assert "scene.check_failed turn_id=turn-1 attempt=1 steps=0 chars=28" in messages
+    assert "scene.check_failed turn_id=turn-1 attempt=2 steps=0 chars=28" in messages
+    assert "scene.shown" not in " ".join(messages)
+
+
+async def test_a_check_the_page_never_answers_fails_within_its_own_bound(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(
+        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[SCENE_CALL]
+    )
+    cfg = concept_cfg().model_copy(update={"scene_ready_timeout_s": 0.01})
+    loop = concept_loop(
+        log,
+        SerialSource([CONCEPT_TEXT]),
+        speaker,
+        reasoning,
+        cfg=cfg,
+        transport=LoggingTransport(log),
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+        visual = reasoning.visual_callers[0]
+        assert visual is not None and visual.get_name() == VISUAL_TASK
+        await asyncio.wait_for(visual, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert visual.result() == "scene: error: no report"
+    assert reasoning.tool_choices == [None, "required"]
+    assert pushed(log) == ["turn-1"]
+    assert shown(log) == []
+    assert pending(log, "turn-1") == [APP_TITLE, ""]
+    messages = session_messages(caplog)
+    assert "scene.no_report turn_id=turn-1 attempt=1" in messages
+    assert "scene.check_failed" not in " ".join(messages)
+    assert loop._ready == {}
+
+
+async def test_a_push_the_page_replaced_is_superseded_without_a_second_build(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    first_gate = asyncio.Event()
+    second_gate = asyncio.Event()
+    reasoning = FakeReasoning(
+        log,
+        spoken_chunks(BRIEFED_DELTAS),
+        speaker.received,
+        visual=[SCENE_CALL],
+        visual_gates=[first_gate, second_gate],
+    )
+    cfg = concept_cfg().model_copy(update={"scene_ready_timeout_s": 0.2})
+    transport = AnsweringTransport(log, answers={"turn-2": ""})
+    loop = concept_loop(
+        log,
+        SerialSource([CONCEPT_TEXT, SECOND_CONCEPT_TEXT]),
+        speaker,
+        reasoning,
+        cfg=cfg,
+        transport=transport,
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+        first = visual_task()
+        second = visual_task("turn-2-visual")
+        first_gate.set()
+        await asyncio.wait_for(
+            transport.pushes.setdefault("turn-1", asyncio.Event()).wait(), HANG_GUARD_S
+        )
+        assert pushed(log) == ["turn-1"]
+        second_gate.set()
+        await asyncio.wait_for(second, HANG_GUARD_S)
+        assert shown(log) == ["turn-2"]
+        await asyncio.wait_for(first, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert first.result() == "scene: superseded"
+    assert reasoning.tool_choices.count("required") == 2
+    assert pushed(log) == ["turn-1", "turn-2"]
+    messages = session_messages(caplog)
+    assert "scene.no_report turn_id=turn-1 attempt=1" in messages
+    assert "scene.superseded turn_id=turn-1" in messages
+    assert loop._ready == {}
+
+
+async def test_a_failed_check_is_not_rebuilt_once_a_newer_scene_has_landed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    first_gate = asyncio.Event()
+    second_gate = asyncio.Event()
+    reasoning = FakeReasoning(
+        log,
+        spoken_chunks(BRIEFED_DELTAS),
+        speaker.received,
+        visual=[SCENE_CALL],
+        visual_gates=[first_gate, second_gate],
+    )
+    verdict = asyncio.Event()
+    transport = AnsweringTransport(
+        log,
+        answers={"turn-1": "timeline lacks labels step-3", "turn-2": ""},
+        holds={"turn-1": verdict},
+    )
+    loop = concept_loop(
+        log,
+        SerialSource([CONCEPT_TEXT, SECOND_CONCEPT_TEXT]),
+        speaker,
+        reasoning,
+        transport=transport,
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+        first = visual_task()
+        second = visual_task("turn-2-visual")
+        first_gate.set()
+        await asyncio.wait_for(
+            transport.pushes.setdefault("turn-1", asyncio.Event()).wait(), HANG_GUARD_S
+        )
+        assert pushed(log) == ["turn-1"]
+        second_gate.set()
+        await asyncio.wait_for(second, HANG_GUARD_S)
+        assert shown(log) == ["turn-2"]
+        verdict.set()
+        await asyncio.wait_for(first, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert first.result() == "scene: superseded"
+    assert reasoning.tool_choices.count("required") == 2
+    assert pushed(log) == ["turn-1", "turn-2"]
+    assert shown(log) == ["turn-2"]
+    assert "scene.check_failed turn_id=turn-1 attempt=1 steps=0 chars=28" in session_messages(
+        caplog
+    )
+    assert pending(log, "turn-1") == [APP_TITLE, ""]
+
+
+async def test_a_ready_report_for_no_waiting_scene_is_one_log_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    transport = LoggingTransport(log)
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning, transport=transport)
+    (handler,) = transport.handlers
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        handler({"type": "scene.ready", "scene_id": "turn-9", "ok": True, "steps": 3, "error": ""})
+        handler({"type": "scene.ready", "scene_id": "turn-9", "ok": True, "steps": 3})
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    messages = session_messages(caplog)
+    assert "scene.ready_unexpected scene_id=turn-9" in messages
+    assert "client.message_rejected type=scene.ready" in messages
+    assert speaker.utterances == [SPOKEN_CLAUSES]
+
+
+async def test_a_ready_report_never_interrupts_the_turn() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(
+        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[SCENE_CALL]
+    )
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning)
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert ("flush_playout", None) not in log
+    assert speaker.utterances == [SPOKEN_CLAUSES]
+    assert shown(log) == ["turn-1"]
+
+
+async def test_a_superseded_draft_is_never_pushed_to_the_page() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    gate = asyncio.Event()
+    reasoning = FakeReasoning(
+        log,
+        spoken_chunks(BRIEFED_DELTAS),
+        speaker.received,
+        visual=[SCENE_CALL],
+        visual_gates=[gate],
+    )
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT, SECOND_CONCEPT_TEXT]), speaker, reasoning)
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+    first = visual_task()
+    assert shown(log) == ["turn-2"]
+    gate.set()
+    await asyncio.wait_for(first, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert first.result() == "scene: superseded"
+    assert pushed(log) == ["turn-2"]
 
 
 COVERED_TAIL = json.dumps({"signal": "covered", "settling": ""})

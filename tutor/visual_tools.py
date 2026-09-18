@@ -59,9 +59,6 @@ VISUAL_TOOLS: list[dict[str, object]] = [
     for name, model in _MODELS.items()
 ]
 
-VISUAL_CALL_TOOLS = [
-    t for t in VISUAL_TOOLS if t["function"]["name"] in {"push_diagram", "push_app"}
-]
 VOICE_VISUAL_TOOLS = [
     t for t in VISUAL_TOOLS if t["function"]["name"] in {"clear_diagram", "highlight_source"}
 ]

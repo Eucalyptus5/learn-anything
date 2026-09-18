@@ -14,9 +14,6 @@ class Settings(BaseSettings):
     reasoning_effort: str = "low"
     reasoning_max_tokens: int = 400
     history_turns: int = Field(default=10, ge=0)
-    visual_timeout_s: float = Field(default=90.0, gt=0)
-    visual_max_tokens: int = Field(default=3000, gt=0)
-    visual_model: str = ""
     scene_model: str = ""
     scene_effort: str = "high"
     scene_max_tokens: int = Field(default=32000, gt=0)

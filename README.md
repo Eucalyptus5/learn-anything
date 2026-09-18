@@ -24,12 +24,13 @@ on the machine. The only network call is the reasoning model, and it receives te
 - ripgrep as the grounding tool when a folder is given;
 - an OpenAI-compatible reasoning endpoint, `glm-5.3-flash` by default, configured from `.env`.
 
-A turn is one streamed voice call built from the last ten turns and the current pedagogy
-directive. If the model opens its reply with a visual brief, a second call runs beside the voice
-with the same history and lands either a mermaid diagram or an app built on plotly, KaTeX, p5, d3
-or GSAP. Those libraries are vendored and served from `/vendor/`; the visual itself renders only
-inside a sandboxed iframe with no network and no bridge to the host page. A visual that finishes
-after a newer turn's visual has already landed is dropped.
+A turn is one streamed voice call built from the last ten turns and the current pedagogy directive.
+If the model opens its reply with a visual brief, a second call starts beside the voice, sees only
+the subject, the brief and the page's theme, and builds a scene: one HTML document animated with
+GSAP that may draw with plotly, KaTeX, p5, d3 or mermaid, checked in a hidden frame on the page and
+shown when it passes. Those libraries are vendored and served from `/vendor/`; the visual itself
+renders only inside a sandboxed iframe with no network and no bridge to the host page. A visual
+that finishes after a newer turn's visual has already landed is dropped.
 
 In folder mode the model gets a `search_code` tool. A gate between the model's text and the
 synthesizer withholds any clause that names a file path, symbol or line that did not come back
@@ -120,7 +121,7 @@ uv run pytest -q
 uv run ruff format && uv run ruff check
 ```
 
-875 tests in about six seconds. Every model is a fake in the suite; ripgrep is real and runs
+1024 tests in about seven seconds. Every model is a fake in the suite; ripgrep is real and runs
 against `tests/data/fixture_repo`, and one test runs the diagram frame's id parsing under node.
 No test sleeps or asserts a wall-clock latency. Timing lives in `scripts/bench_*.py`, run on
 purpose, and each prints its sample count.
