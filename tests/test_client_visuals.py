@@ -344,6 +344,16 @@ def test_the_check_page_narrates_one_app_through_the_helper() -> None:
     assert '"lesson: ok"' in text
 
 
+def test_the_check_page_loads_gsap_in_the_sandbox() -> None:
+    text = VISUAL_CHECK.read_text()
+    libs = re.search(r"const libsHtml = `(.*?)`;", text, re.DOTALL)
+    assert libs is not None
+    assert '<script src="/vendor/gsap.min.js"><\\/script>' in libs[1]
+    assert 'typeof gsap.timeline === "function"' in libs[1]
+    assert 'log("gsap: " + gsap)' in text
+    assert 'katex && plotly && gsap ? "libs: ok"' in text
+
+
 def say_handler(text: str) -> str:
     handler = re.search(
         r'say\.addEventListener\("keydown",\s*\(event\)\s*=>\s*\{(.*?)\n\}\);', text, re.DOTALL

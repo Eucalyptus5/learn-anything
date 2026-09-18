@@ -85,6 +85,12 @@ ASSETS = [
         sha256="7e36605710a2ba54846797c8c6d888911341b215ae53257dc32a49a0b824355e",
         members={"package/dist/d3.min.js": VENDOR / "d3.min.js"},
     ),
+    Asset(
+        name="gsap",
+        url="https://cdn.jsdelivr.net/npm/gsap@3.15.0/dist/gsap.min.js",
+        sha256="92bb9a96476f983d212a2bc4f54c889039c1696dd4461d40a736860938570fbb",
+        members={"": VENDOR / "gsap.min.js"},
+    ),
 ]
 
 

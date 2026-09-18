@@ -26,10 +26,10 @@ on the machine. The only network call is the reasoning model, and it receives te
 
 A turn is one streamed voice call built from the last ten turns and the current pedagogy
 directive. If the model opens its reply with a visual brief, a second call runs beside the voice
-with the same history and lands either a mermaid diagram or an app built on plotly, KaTeX, p5 or
-d3. Those libraries are vendored and served from `/vendor/`; the visual itself renders only inside
-a sandboxed iframe with no network and no bridge to the host page. A visual that finishes after a
-newer turn's visual has already landed is dropped.
+with the same history and lands either a mermaid diagram or an app built on plotly, KaTeX, p5, d3
+or GSAP. Those libraries are vendored and served from `/vendor/`; the visual itself renders only
+inside a sandboxed iframe with no network and no bridge to the host page. A visual that finishes
+after a newer turn's visual has already landed is dropped.
 
 In folder mode the model gets a `search_code` tool. A gate between the model's text and the
 synthesizer withholds any clause that names a file path, symbol or line that did not come back
@@ -103,8 +103,8 @@ The browser libraries are vendored the same way:
 uv run python scripts/fetch_client_assets.py
 ```
 
-downloads sha256-pinned tarballs from the npm registry into `client/vendor/`. ripgrep and node
-have to be on `PATH`. Then:
+downloads sha256-pinned tarballs and files from the npm registry and jsdelivr into
+`client/vendor/`. ripgrep and node have to be on `PATH`. Then:
 
 ```
 uv run tutor

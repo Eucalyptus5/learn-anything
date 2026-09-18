@@ -127,6 +127,7 @@ const libsHtml = `<!doctype html><meta charset="utf-8">
 <link rel="stylesheet" href="/vendor/katex/katex.min.css">
 <script src="/vendor/katex/katex.min.js"><\/script>
 <script src="/vendor/plotly.min.js"><\/script>
+<script src="/vendor/gsap.min.js"><\/script>
 <div id="math"></div><div id="plot"></div>
 <script>
 katex.render("r_t(\\\\theta)", document.getElementById("math"));
@@ -135,6 +136,7 @@ document.fonts.ready.then(() => setTimeout(() => {
   parent.postMessage({ libs: {
     katex: !!document.querySelector(".katex") && document.fonts.check("12px KaTeX_Main"),
     plotly: !!document.querySelector(".plotly svg"),
+    gsap: typeof gsap !== "undefined" && typeof gsap.timeline === "function",
   } }, "*");
 }, 800));
 <\/script>`;
@@ -235,9 +237,11 @@ window.addEventListener("message", (event) => {
   if (typeof event.data.libs !== "object" || event.data.libs === null) return;
   const katex = event.data.libs.katex === true;
   const plotly = event.data.libs.plotly === true;
+  const gsap = event.data.libs.gsap === true;
   log("katex: " + katex);
   log("plotly: " + plotly);
-  log(katex && plotly ? "libs: ok" : "libs: FAIL");
+  log("gsap: " + gsap);
+  log(katex && plotly && gsap ? "libs: ok" : "libs: FAIL");
   receive({ type: "app.push", seq: 104, id: "lesson", html: lessonHtml, title: "lesson" });
   const narrated = canvas.querySelectorAll("iframe");
   appFrame = narrated[narrated.length - 1];

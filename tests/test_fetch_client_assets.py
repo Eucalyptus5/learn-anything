@@ -35,6 +35,16 @@ def test_members_land_under_vendor_and_never_above_it() -> None:
             assert destination.resolve().is_relative_to(vendor), destination
 
 
+def test_gsap_is_pinned_as_a_bare_file_beside_mermaid() -> None:
+    by_name = {asset.name: asset for asset in fetch_client_assets.ASSETS}
+
+    assert list(by_name) == ["mermaid", "plotly", "katex", "p5", "d3", "gsap"]
+    gsap = by_name["gsap"]
+    assert gsap.url == "https://cdn.jsdelivr.net/npm/gsap@3.15.0/dist/gsap.min.js"
+    assert gsap.sha256 == "92bb9a96476f983d212a2bc4f54c889039c1696dd4461d40a736860938570fbb"
+    assert gsap.members == {"": fetch_client_assets.VENDOR / "gsap.min.js"}
+
+
 def test_extract_writes_only_the_listed_members(tmp_path: Path) -> None:
     tar_path = tmp_path / "pkg.tgz"
     write_tarball(
