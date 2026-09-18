@@ -167,6 +167,9 @@ def test_the_validator_names_every_channel_payload_type() -> None:
     assert '"state": ["type", "seq", "state", "phase", "interrupted"]' in keys[1]
     assert '"caption": ["type", "seq", "turn_id", "text", "lead_ms"]' in keys[1]
     assert '"visual.pending": ["type", "seq", "turn_id", "title"]' in keys[1]
+    assert '"scene.push": ["type", "seq", "scene_id", "title", "html", "steps"]' in keys[1]
+    assert '"scene.show": ["type", "seq", "scene_id", "at"]' in keys[1]
+    assert '"scene.step": ["type", "seq", "scene_id", "n", "lead_ms"]' in keys[1]
 
 
 def test_the_validator_checks_the_lead_and_the_interrupted_flag() -> None:
@@ -310,7 +313,7 @@ def test_every_push_on_the_check_page_carries_a_title() -> None:
     pushes = re.findall(r'\{ type: "(?:diagram|app)\.push"[^}]*\}', good[1])
     receives = re.findall(r'receive\(\{ type: "(?:diagram|app)\.push"[^}]*\}\)', text)
     assert len(pushes) == 2
-    assert len(receives) == 5
+    assert len(receives) == 4
     for literal in pushes + receives:
         assert "title:" in literal, literal
     for name in ('"title of 81"', '"app.push missing title"', '"diagram.push missing title"'):
@@ -584,3 +587,137 @@ process.stdout.write(JSON.stringify({
     assert flowchart is not None
     assert "edgeEnds(edgeId(path.id), names)" in flowchart[1]
     assert "labels.get(edgeId(path.id))" in flowchart[1]
+
+
+def test_a_scene_is_checked_in_a_hidden_frame_and_shown_only_for_its_id() -> None:
+    visuals = VISUALS.read_text()
+    assert len(re.findall(r'createElement\("iframe"\)', visuals)) == 1
+    check = re.search(r"function check\(payload\) \{(.*?)\n\}", visuals, re.DOTALL)
+    promote = re.search(r"function promote\(at\) \{(.*?)\n\}", visuals, re.DOTALL)
+    receive = re.search(r"export function receive\(payload\) \{(.*?)\n\}", visuals, re.DOTALL)
+    reset = re.search(r"export function reset\(\) \{(.*?)\n\}", visuals, re.DOTALL)
+    assert check is not None and promote is not None and receive is not None and reset is not None
+    assert "dropChecking()" in check[1]
+    assert 'classList.add("checking")' in check[1]
+    assert "checking = { payload, frame: element }" in check[1]
+    assert 'classList.add("landing")' in promote[1]
+    assert 'classList.remove("checking")' in promote[1]
+    assert 'requestAnimationFrame(() => element.classList.remove("landing"))' in promote[1]
+    assert "mountApp(element)" in promote[1]
+    assert "history.push({ payload, title: payload.title })" in promote[1]
+    show = re.search(r'case "scene\.show":(.*?)case "scene\.step":', receive[1], re.DOTALL)
+    assert show is not None
+    assert "checking.payload.scene_id !== payload.scene_id" in show[1]
+    assert "promote(payload.at)" in show[1]
+    assert re.search(r'case "scene\.push":\s*check\(payload\);', receive[1])
+    assert re.search(r'case "scene\.step":\s*listeners\.get\("step"\)\?\.\(payload\);', receive[1])
+    assert "dropChecking()" in reset[1]
+    index = INDEX.read_text()
+    assert (
+        ".canvas iframe.checking { opacity: 0; pointer-events: none; transform: translateY(10px); }"
+        in index
+    )
+    assert ".canvas iframe.leaving" in index
+    assert "grid-template-rows: auto minmax(0, 1fr) auto" in index
+
+
+def test_the_ready_report_is_taken_from_the_checking_frame_only_and_compared_to_the_push() -> None:
+    visuals = VISUALS.read_text()
+    listener = re.search(
+        r'window\.addEventListener\("message", \(event\) => \{(.*?)\n\}\);', visuals, re.DOTALL
+    )
+    assert listener is not None
+    assert "checking === null || event.source !== checking.frame.contentWindow" in listener[1]
+    assert 'm.type !== "scene.ready"' in listener[1]
+    assert "Number.isInteger(m.steps)" in listener[1]
+    assert "Number.isFinite(m.width)" in listener[1] and "Number.isFinite(m.height)" in listener[1]
+    assert 'typeof m.error !== "string"' in listener[1]
+    assert "m.error.slice(0, ERROR_CAP)" in listener[1]
+    assert "m.steps === payload.steps.length" in listener[1]
+    assert "m.width > 0 && m.height > 0" in listener[1]
+    assert '"reported " + m.steps + " steps, pushed " + payload.steps.length' in listener[1]
+    assert '"root has no size " + Math.round(m.width) + "x" + Math.round(m.height)' in listener[1]
+    assert 'const ok = error === "";' in listener[1]
+    assert "if (checking.reported) return;\n  checking.reported = true;" in listener[1]
+    assert "if (!ok) dropChecking();" in listener[1]
+    dropped = listener[1].index("if (!ok) dropChecking();")
+    assert dropped < listener[1].index('listeners.get("ready")?.(')
+    assert 'listeners.get("ready")?.(' in listener[1]
+    assert "const ERROR_CAP = 500;" in visuals
+    assert visuals.count('addEventListener("message"') == 1
+    for sink in HTML_SINKS:
+        assert not sink.search(listener[1]), sink.pattern
+
+
+def test_a_step_is_held_for_its_lead_and_reaches_the_frame_only_through_step_scene() -> None:
+    client = CLIENT.read_text()
+    handler = re.search(r'onPayload\("step", \(payload\) => \{(.*?)\n\}\);', client, re.DOTALL)
+    assert handler is not None
+    assert "setTimeout(" in handler[1]
+    assert "payload.lead_ms)" in handler[1]
+    assert "held.add(timer)" in handler[1]
+    assert "stepScene(payload.n)" in handler[1]
+    assert "postMessage" not in client
+    for kind in ("scene.push", "scene.show", "scene.step"):
+        assert f'onJson("{kind}", receive)' in client, kind
+    assert client.startswith(
+        'import { entries, mount, onPayload, receive, reset, show, stepScene, theme } from "/visuals.js";'
+    )
+    ready = re.search(r'onPayload\("ready", \(report\) => \{(.*?)\n\}\);', client, re.DOTALL)
+    assert ready is not None
+    assert 'sendJson({ type: "scene.ready", ...report })' in ready[1]
+    assert 'channel.readyState === "open"' in ready[1]
+    visuals = VISUALS.read_text()
+    step = re.search(r"export function stepScene\(n\) \{(.*?)\n\}", visuals, re.DOTALL)
+    assert step is not None
+    assert 'target.contentWindow.postMessage({ step: n }, "*")' in step[1]
+    assert "if (target === app)" in step[1]
+    assert visuals.count("postMessage(") == 2
+    assert 'frame.contentWindow.postMessage(message, "*")' in visuals
+
+
+def test_the_validator_checks_the_scene_id_the_steps_and_the_counts() -> None:
+    visuals = VISUALS.read_text()
+    validate = re.search(r"export function validate\(payload\) \{(.*?)\n\}", visuals, re.DOTALL)
+    assert validate is not None
+    assert "const SCENE_ID = /^[a-z][a-z0-9-]{0,31}$/;" in visuals
+    push = re.search(r'case "scene\.push":(.*?)return true;', validate[1], re.DOTALL)
+    show = re.search(r'case "scene\.show":(.*?)return true;', validate[1], re.DOTALL)
+    step = re.search(r'case "scene\.step":(.*?)return true;', validate[1], re.DOTALL)
+    assert push is not None and show is not None and step is not None
+    assert "sceneId(payload.scene_id)" in push[1] and "stepList(payload.steps)" in push[1]
+    assert 'cappedString(payload, "html", SCENE_HTML_CAP)' in push[1]
+    assert 'payload.html === ""' in push[1]
+    assert "positiveInteger(payload.at)" in show[1]
+    assert "positiveInteger(payload.n)" in step[1]
+    assert "payload.lead_ms < 0" in step[1]
+    assert "const SCENE_HTML_CAP = 200000;" in visuals
+    assert "const STEP_CAP = 120;" in visuals and "const STEPS_MAX = 8;" in visuals
+
+
+def test_the_check_page_probes_the_scene_payloads_and_a_broken_scene() -> None:
+    text = VISUAL_CHECK.read_text()
+    good = re.search(r"const good = \[(.*?)\n\];", text, re.DOTALL)
+    hostile = re.search(r"const hostile = \[(.*?)\n\];", text, re.DOTALL)
+    assert good is not None and hostile is not None
+    for name in ('"scene.push"', '"scene.show"', '"scene.step"'):
+        assert name in good[1], name
+    for name in (
+        '"scene.push scene_id Bad"',
+        '"scene.push html of 200001"',
+        '"scene.push empty html"',
+        '"scene.push nine steps"',
+        '"scene.push step of 121"',
+        '"scene.push no steps"',
+        '"scene.show at 0"',
+        '"scene.step n 0"',
+        '"scene.step lead_ms -1"',
+    ):
+        assert name in hostile[1], name
+    assert len(re.findall(r'receive\(\{ type: "scene\.push"', text)) == 2
+    assert 'receive({ type: "scene.show", seq: 105, scene_id: "check-scene", at: 1 })' in text
+    assert "stepScene(2)" in text and "stepScene(3)" in text
+    assert 'onPayload("ready", (report) => {' in text
+    assert '"scene: ok"' in text and '"broken scene: reported"' in text
+    assert "const brokenHtml" in text
+    assert re.search(r"#log \{[^}]*max-height: 10rem; overflow: auto; \}", text)

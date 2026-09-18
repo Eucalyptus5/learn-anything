@@ -4,8 +4,9 @@
 <title>visual check</title>
 <style>
   body { font: 14px ui-monospace, Menlo, monospace; margin: 2rem; max-width: 46rem; }
-  #log { white-space: pre-wrap; background: #f4f4f4; padding: .8rem; }
+  #log { white-space: pre-wrap; background: #f4f4f4; padding: .8rem; max-height: 10rem; overflow: auto; }
   #canvas iframe { width: 100%; height: 8rem; border: 1px solid #999; }
+  #canvas iframe.checking { opacity: 0; pointer-events: none; }
 </style>
 
 <h2>Visual payload check</h2>
@@ -13,14 +14,14 @@
 <p>Runs <code>validate()</code> over good and hostile payloads, then pushes a mini app whose
 script tries to escape its sandbox and reports what each attempt threw, an app that loads the
 vendored KaTeX, Plotly and GSAP bundles, and a scene that registers a timeline through the
-lesson helper and is stepped to its last label. Load this page from the tutor server, not from
-a file URL.</p>
+lesson helper and is stepped to its last label, then a broken scene that is reported and never
+shown. Load this page from the tutor server, not from a file URL.</p>
 
 <div id="log">starting</div>
 <div id="canvas"></div>
 
 <script type="module">
-import { validate, mount, receive } from "/visuals.js";
+import { validate, mount, onPayload, receive, stepScene } from "/visuals.js";
 
 const logEl = document.getElementById("log");
 const log = (line) => { logEl.textContent += "\n" + line; };
@@ -37,6 +38,9 @@ const good = [
   ["transcript", { type: "transcript", seq: 9, turn_id: "turn-1", text: "teach me ppo" }],
   ["visual.pending", { type: "visual.pending", seq: 10, turn_id: "turn-1", title: "Clipped objective" }],
   ["visual.pending cleared", { type: "visual.pending", seq: 11, turn_id: "turn-1", title: "" }],
+  ["scene.push", { type: "scene.push", seq: 12, scene_id: "turn-4", title: "Clipped objective", html: "<p>x</p>", steps: ["The ratio axis", "The clip band", "The flat region"] }],
+  ["scene.show", { type: "scene.show", seq: 13, scene_id: "turn-4", at: 1 }],
+  ["scene.step", { type: "scene.step", seq: 14, scene_id: "turn-4", n: 2, lead_ms: 1200 }],
 ];
 
 const hostile = [
@@ -71,6 +75,15 @@ const hostile = [
   ["seq 0", { type: "diagram.clear", seq: 0 }],
   ["seq string", { type: "diagram.clear", seq: "5" }],
   ["array payload", [] ],
+  ["scene.push scene_id Bad", { type: "scene.push", seq: 5, scene_id: "Bad", title: "t", html: "<p>x</p>", steps: ["a"] }],
+  ["scene.push html of 200001", { type: "scene.push", seq: 5, scene_id: "s", title: "t", html: "x".repeat(200001), steps: ["a"] }],
+  ["scene.push empty html", { type: "scene.push", seq: 5, scene_id: "s", title: "t", html: "", steps: ["a"] }],
+  ["scene.push nine steps", { type: "scene.push", seq: 5, scene_id: "s", title: "t", html: "<p>x</p>", steps: Array(9).fill("a") }],
+  ["scene.push step of 121", { type: "scene.push", seq: 5, scene_id: "s", title: "t", html: "<p>x</p>", steps: ["a".repeat(121)] }],
+  ["scene.push no steps", { type: "scene.push", seq: 5, scene_id: "s", title: "t", html: "<p>x</p>", steps: [] }],
+  ["scene.show at 0", { type: "scene.show", seq: 5, scene_id: "s", at: 0 }],
+  ["scene.step n 0", { type: "scene.step", seq: 5, scene_id: "s", n: 0, lead_ms: 0 }],
+  ["scene.step lead_ms -1", { type: "scene.step", seq: 5, scene_id: "s", n: 1, lead_ms: -1 }],
 ];
 
 let accepted = 0;
@@ -178,6 +191,16 @@ window.addEventListener("message", (event) => {
 });
 <\/script>`;
 
+const brokenHtml = `<!doctype html><meta charset="utf-8">
+<script src="/lesson.js"><\/script>
+<script src="/vendor/gsap.min.js"><\/script>
+<div id="picture"><p>broken</p></div>
+<script>
+const tl = gsap.timeline({ paused: true });
+tl.addLabel("step-1");
+lesson.scene({ root: "#picture", timeline: tl, steps: ["one", "two"] });
+<\/script>`;
+
 let hostFrameSrcViolations = 0;
 document.addEventListener("securitypolicyviolation", (event) => {
   log("host csp " + event.violatedDirective + " " + event.blockedURI);
@@ -253,20 +276,21 @@ window.addEventListener("message", (event) => {
   log("plotly: " + plotly);
   log("gsap: " + gsap);
   log(katex && plotly && gsap ? "libs: ok" : "libs: FAIL");
-  receive({ type: "app.push", seq: 104, id: "scene", html: sceneHtml, title: "scene" });
-  const narrated = canvas.querySelectorAll("iframe");
-  appFrame = narrated[narrated.length - 1];
+  receive({ type: "scene.push", seq: 104, scene_id: "check-scene", title: "scene", html: sceneHtml, steps: ["The ratio starts at one", "It climbs toward the clip", "Past epsilon it is clipped"] });
 });
 
-window.addEventListener("message", (event) => {
-  if (event.source !== appFrame.contentWindow) return;
-  if (typeof event.data !== "object" || event.data === null) return;
-  if (event.data.type !== "scene.ready") return;
-  const { steps, width, height, error } = event.data;
-  log("scene ready: steps=" + steps + " size=" + Math.round(width) + "x" + Math.round(height) + " error=" + JSON.stringify(error));
-  log(steps === 3 && width > 0 && height > 0 && error === "" ? "scene: ok" : "scene: FAIL");
-  appFrame.contentWindow.postMessage({ step: 2 }, "*");
-  setTimeout(() => appFrame.contentWindow.postMessage({ step: 3 }, "*"), 800);
+onPayload("ready", (report) => {
+  log("scene ready: id=" + report.scene_id + " ok=" + report.ok + " steps=" + report.steps + " error=" + JSON.stringify(report.error));
+  if (report.scene_id === "check-broken") {
+    log(report.ok === false && report.error !== "" ? "broken scene: reported" : "broken scene: FAIL");
+    log("done");
+    return;
+  }
+  log(report.ok ? "scene: ok" : "scene: FAIL");
+  receive({ type: "scene.show", seq: 105, scene_id: "check-scene", at: 1 });
+  appFrame = canvas.querySelector("iframe.landing");
+  setTimeout(() => stepScene(2), 600);
+  setTimeout(() => stepScene(3), 1400);
 });
 
 window.addEventListener("message", (event) => {
@@ -276,6 +300,6 @@ window.addEventListener("message", (event) => {
   const { lines, now, cx } = event.data.motion;
   log("motion lines: " + lines + " now: " + now + " cx: " + cx);
   log(lines === 3 && now === 2 && cx === "150" ? "motion: ok" : "motion: FAIL");
-  log("done");
+  receive({ type: "scene.push", seq: 106, scene_id: "check-broken", title: "broken", html: brokenHtml, steps: ["one", "two"] });
 });
 </script>

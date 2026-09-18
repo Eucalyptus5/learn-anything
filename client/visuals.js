@@ -1,6 +1,7 @@
 const KINDS = new Set(["flowchart", "sequence"]);
 const STATES = new Set(["listening", "thinking", "speaking"]);
 const PHASES = new Set(["teach", "concrete", "interrogate"]);
+const SCENE_ID = /^[a-z][a-z0-9-]{0,31}$/;
 const KEYS = {
   "diagram.push": ["type", "seq", "id", "kind", "source", "title"],
   "diagram.clear": ["type", "seq"],
@@ -10,9 +11,17 @@ const KEYS = {
   "caption": ["type", "seq", "turn_id", "text", "lead_ms"],
   "transcript": ["type", "seq", "turn_id", "text"],
   "visual.pending": ["type", "seq", "turn_id", "title"],
+  "scene.push": ["type", "seq", "scene_id", "title", "html", "steps"],
+  "scene.show": ["type", "seq", "scene_id", "at"],
+  "scene.step": ["type", "seq", "scene_id", "n", "lead_ms"],
 };
 const CAPS = { id: 64, source: 8000, html: 64000, path: 4096, title: 80, turn_id: 32 };
 const TEXT_CAPS = { caption: 2000, transcript: 4000 };
+const SCENE_HTML_CAP = 200000;
+const STEP_CAP = 120;
+const STEPS_MAX = 8;
+const ERROR_CAP = 500;
+const FADE_MS = 450;
 const listeners = new Map();
 const history = [];
 
@@ -20,6 +29,7 @@ let canvas = null;
 let frame = null;
 let highlight = null;
 let app = null;
+let checking = null;
 let loaded = Promise.resolve();
 let lastSeq = 0;
 let themeSeq = 0;
@@ -36,6 +46,19 @@ function cappedString(payload, key, cap = CAPS[key]) {
 
 function positiveInteger(value) {
   return Number.isInteger(value) && value >= 1;
+}
+
+function sceneId(value) {
+  return typeof value === "string" && SCENE_ID.test(value);
+}
+
+function stepList(value) {
+  return (
+    Array.isArray(value) &&
+    value.length >= 1 &&
+    value.length <= STEPS_MAX &&
+    value.every((say) => typeof say === "string" && say !== "" && [...say].length <= STEP_CAP)
+  );
 }
 
 export function validate(payload) {
@@ -87,6 +110,23 @@ export function validate(payload) {
       if (!cappedString(payload, "turn_id")) return reject("bad turn_id");
       if (!cappedString(payload, "text", TEXT_CAPS.transcript)) return reject("bad text");
       return true;
+    case "scene.push":
+      if (!sceneId(payload.scene_id)) return reject("bad scene_id");
+      if (!cappedString(payload, "title")) return reject("bad title");
+      if (!cappedString(payload, "html", SCENE_HTML_CAP) || payload.html === "") {
+        return reject("bad html");
+      }
+      if (!stepList(payload.steps)) return reject("bad steps");
+      return true;
+    case "scene.show":
+      if (!sceneId(payload.scene_id)) return reject("bad scene_id");
+      if (!positiveInteger(payload.at)) return reject("bad at");
+      return true;
+    case "scene.step":
+      if (!sceneId(payload.scene_id)) return reject("bad scene_id");
+      if (!positiveInteger(payload.n)) return reject("bad n");
+      if (!Number.isInteger(payload.lead_ms) || payload.lead_ms < 0) return reject("bad lead_ms");
+      return true;
   }
 }
 
@@ -100,6 +140,7 @@ function sandboxedFrame() {
   element.setAttribute("allow", "");
   element.setAttribute("referrerpolicy", "no-referrer");
   element.classList.add("landing");
+  element.ready = new Promise((resolve) => element.addEventListener("load", resolve, { once: true }));
   element.addEventListener("load", () => element.classList.remove("landing"), { once: true });
   return element;
 }
@@ -107,7 +148,7 @@ function sandboxedFrame() {
 export function mount(root) {
   canvas = root;
   frame = sandboxedFrame();
-  loaded = new Promise((resolve) => frame.addEventListener("load", resolve, { once: true }));
+  loaded = frame.ready;
   frame.src = "/frame.html";
   highlight = document.createElement("div");
   highlight.className = "highlight";
@@ -118,22 +159,61 @@ function post(message) {
   loaded = loaded.then(() => frame.contentWindow.postMessage(message, "*"));
 }
 
+function dropChecking() {
+  if (checking !== null) checking.frame.remove();
+  checking = null;
+}
+
 function unmountApp() {
-  if (app !== null) app.remove();
   app = null;
+  for (const gone of canvas.querySelectorAll("iframe")) {
+    if (gone !== frame && (checking === null || gone !== checking.frame)) gone.remove();
+  }
   frame.hidden = false;
 }
 
+function mountApp(element) {
+  const previous = app;
+  app = element;
+  frame.hidden = true;
+  if (previous === null) return;
+  element.ready.then(() => {
+    previous.classList.add("leaving");
+    setTimeout(() => previous.remove(), FADE_MS);
+  });
+}
+
 function render(payload) {
-  unmountApp();
   if (payload.type === "diagram.push") {
+    unmountApp();
     post({ seq: payload.seq, kind: payload.kind, source: payload.source });
     return;
   }
-  app = sandboxedFrame();
-  app.srcdoc = payload.html;
-  canvas.append(app);
-  frame.hidden = true;
+  const element = sandboxedFrame();
+  element.srcdoc = payload.html;
+  canvas.append(element);
+  mountApp(element);
+}
+
+function check(payload) {
+  dropChecking();
+  const element = sandboxedFrame();
+  element.classList.add("checking");
+  element.srcdoc = payload.html;
+  canvas.append(element);
+  checking = { payload, frame: element };
+}
+
+function promote(at) {
+  const { payload, frame: element } = checking;
+  checking = null;
+  element.classList.add("landing");
+  element.classList.remove("checking");
+  requestAnimationFrame(() => element.classList.remove("landing"));
+  mountApp(element);
+  history.push({ payload, title: payload.title });
+  announce(history.length - 1);
+  if (at > 1) stepScene(at);
 }
 
 function announce(current) {
@@ -163,12 +243,33 @@ export function receive(payload) {
     case "visual.pending":
       listeners.get("pending")?.(payload);
       break;
+    case "scene.push":
+      check(payload);
+      break;
+    case "scene.show":
+      if (checking === null || checking.payload.scene_id !== payload.scene_id) {
+        reject("no checked scene " + payload.scene_id);
+        break;
+      }
+      promote(payload.at);
+      break;
+    case "scene.step":
+      listeners.get("step")?.(payload);
+      break;
     case "state":
     case "caption":
     case "transcript":
       listeners.get(payload.type)?.(payload);
       break;
   }
+}
+
+export function stepScene(n) {
+  if (app === null) return;
+  const target = app;
+  target.ready.then(() => {
+    if (target === app) target.contentWindow.postMessage({ step: n }, "*");
+  });
 }
 
 export function show(i) {
@@ -187,8 +288,29 @@ export function theme(name) {
 export function reset() {
   lastSeq = 0;
   history.length = 0;
+  dropChecking();
   unmountApp();
   highlight.textContent = "";
   post({ seq: 0, clear: true });
   announce(-1);
 }
+
+window.addEventListener("message", (event) => {
+  if (checking === null || event.source !== checking.frame.contentWindow) return;
+  const m = event.data;
+  if (typeof m !== "object" || m === null || m.type !== "scene.ready") return;
+  if (!Number.isInteger(m.steps) || !Number.isFinite(m.width) || !Number.isFinite(m.height)) return;
+  if (typeof m.error !== "string") return;
+  if (checking.reported) return;
+  checking.reported = true;
+  const { payload } = checking;
+  let error = m.error.slice(0, ERROR_CAP);
+  const counted = m.steps === payload.steps.length;
+  const sized = m.width > 0 && m.height > 0;
+  if (error === "" && !counted) error = "reported " + m.steps + " steps, pushed " + payload.steps.length;
+  if (error === "" && !sized) error = "root has no size " + Math.round(m.width) + "x" + Math.round(m.height);
+  const ok = error === "";
+  const steps = Math.min(Math.max(m.steps, 0), STEPS_MAX);
+  if (!ok) dropChecking();
+  listeners.get("ready")?.({ scene_id: payload.scene_id, ok, steps, error });
+});

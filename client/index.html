@@ -264,8 +264,8 @@
   .canvas {
     flex: 1;
     min-height: 0;
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
     width: 100%;
     max-width: 880px;
     margin: 0 auto;
@@ -275,13 +275,16 @@
     box-shadow: 0 0 0 1px var(--hair), var(--lift);
   }
   .canvas .title {
+    grid-row: 1;
     margin-bottom: 12px;
     font-size: 13px;
     color: var(--ink-3);
   }
   .canvas iframe {
+    grid-row: 2;
+    grid-column: 1;
     width: 100%;
-    flex: 1;
+    height: 100%;
     min-height: 0;
     border: 0;
     background: transparent;
@@ -289,12 +292,14 @@
   }
   .canvas.drawing iframe { opacity: 0.6; }
   .canvas iframe.landing { opacity: 0; transform: translateY(10px); }
+  .canvas iframe.leaving { opacity: 0; pointer-events: none; }
+  .canvas iframe.checking { opacity: 0; pointer-events: none; transform: translateY(10px); }
   .canvas.drawing { animation: drawing 2s ease-in-out infinite; }
   @keyframes drawing {
     0%, 100% { box-shadow: 0 0 0 1px var(--hair), var(--lift); }
     50% { box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent), var(--lift); }
   }
-  .canvas .highlight { font: 12px/1.6 var(--mono); color: var(--ink-3); }
+  .canvas .highlight { grid-row: 3; font: 12px/1.6 var(--mono); color: var(--ink-3); }
   .canvas .highlight:empty { display: none; }
 
   .reply {
@@ -462,6 +467,7 @@
     .bars i { animation: none; height: 60%; }
     .canvas iframe { transition: none; }
     .canvas iframe.landing { opacity: 1; transform: none; }
+    .canvas iframe.checking { opacity: 0; }
     .canvas.drawing { animation: none; box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent), var(--lift); }
   }
 </style>

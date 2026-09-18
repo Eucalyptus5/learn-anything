@@ -1,4 +1,4 @@
-import { entries, mount, onPayload, receive, reset, show, theme } from "/visuals.js";
+import { entries, mount, onPayload, receive, reset, show, stepScene, theme } from "/visuals.js";
 
 const app = document.querySelector(".app");
 const welcome = document.querySelector(".welcome");
@@ -411,6 +411,21 @@ onPayload("pending", (payload) => {
   canvasTitle.textContent = currentTitle;
 });
 
+onPayload("ready", (report) => {
+  if (channel !== null && channel.readyState === "open") {
+    sendJson({ type: "scene.ready", ...report });
+  }
+});
+
+onPayload("step", (payload) => {
+  const timer = setTimeout(() => {
+    held.delete(timer);
+    stepScene(payload.n);
+    if (held.size === 0 && pendingState !== null) applyState(pendingState);
+  }, payload.lead_ms);
+  held.add(timer);
+});
+
 onPayload("history", (items, current) => {
   historyList.replaceChildren(
     ...items.map(({ i, title }) => {
@@ -440,6 +455,9 @@ onJson("state", receive);
 onJson("caption", receive);
 onJson("transcript", receive);
 onJson("visual.pending", receive);
+onJson("scene.push", receive);
+onJson("scene.show", receive);
+onJson("scene.step", receive);
 onOpen(reset);
 onOpen(begin);
 onOpen(sendTheme);
