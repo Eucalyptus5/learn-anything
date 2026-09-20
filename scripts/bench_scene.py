@@ -32,7 +32,7 @@ from tutor.brief import VisualBrief
 from tutor.config import Settings, settings
 from tutor.cost import turn_cost_usd
 from tutor.reasoning import ReasoningClient
-from tutor.scene import NO_TOOL_CALL, SceneDraft, run_scene_build, scene_prompt
+from tutor.scene import EMPTY_REPLY, NO_TOOL_CALL, SceneDraft, run_scene_build, scene_prompt
 
 VALID_FLOOR = 27
 SUBJECT = "PPO"
@@ -60,6 +60,7 @@ class BuildSample(BaseModel):
     steps: int | None
     uses_helper: bool | None
     uses_gsap: bool | None
+    empty: bool
     result: str
 
 
@@ -90,6 +91,7 @@ async def one_build(
         steps=None if draft is None else len(draft.steps),
         uses_helper=None if draft is None else LESSON_TAG in draft.html,
         uses_gsap=None if draft is None else GSAP_TAG in draft.html,
+        empty=result == EMPTY_REPLY,
         result=result,
     )
     return sample, draft
@@ -132,11 +134,12 @@ def report(cfg: Settings, args: argparse.Namespace, samples: list[BuildSample], 
     print(
         "validity: the call returned a draft, three to five steps and a document; helper and "
         "gsap count the drafts whose document carries the two required tags; prose only counts "
-        "the streams that ended with no tool call; other errors counts the rest, an unexpected "
-        "tool, arguments that were not JSON or a draft the boundary rejected. cost is the list "
-        "price at the flash rate in tutor/cost.py applied to the tokens; the cost line is the "
-        "flash list price applied to the tokens whatever the scene_model, so a non-flash run is "
-        "not priced at its own rate.",
+        "the streams that ended with prose and no tool call; empty counts the streams that "
+        "ended with neither, a build that spent its whole budget before the call; other errors "
+        "counts the rest, an unexpected tool, arguments that were not JSON or a draft the "
+        "boundary rejected. cost is the list price at the flash rate in tutor/cost.py applied "
+        "to the tokens; the cost line is the flash list price applied to the tokens whatever "
+        "the scene_model, so a non-flash run is not priced at its own rate.",
     )
     model = args.model or cfg.scene_model or cfg.reasoning_model
     print(
@@ -157,7 +160,8 @@ def report(cfg: Settings, args: argparse.Namespace, samples: list[BuildSample], 
     print(f"valid {valid}/{len(samples)}")
     print(f"truncated {sum(1 for s in samples if s.truncated)}/{len(samples)}")
     print(f"prose only {prose}/{len(samples)}")
-    other = sum(1 for s in samples if not (s.valid or s.truncated or s.prose_only))
+    print(f"empty {sum(1 for s in samples if s.empty)}/{len(samples)}")
+    other = sum(1 for s in samples if not (s.valid or s.truncated or s.prose_only or s.empty))
     print(f"other errors {other}/{len(samples)}")
     print(f"helper {sum(1 for s in drafts if s.uses_helper)}/{len(drafts)}")
     print(f"gsap {sum(1 for s in drafts if s.uses_gsap)}/{len(drafts)}")

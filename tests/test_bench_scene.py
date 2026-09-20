@@ -98,6 +98,7 @@ async def test_a_scripted_draft_is_a_valid_sample_and_is_written(tmp_path: Path)
     assert scripted.efforts == ["high"] and scripted.models == ["draw-1"]
     assert scripted.max_tokens == [32000]
     assert sample.valid is True and sample.truncated is False and sample.prose_only is False
+    assert sample.empty is False
     assert sample.output_tokens == 2000 and sample.first_chunk_ms == 5
     assert sample.cost_usd is not None and sample.cost_usd > 0
     assert sample.steps == 3 and sample.uses_helper is True and sample.uses_gsap is True
@@ -123,6 +124,7 @@ async def test_prose_and_a_bare_document_are_read_for_what_they_are() -> None:
     sample, draft = await bench_scene.one_build(reasoning, bench_scene.BRIEF, 32000, "high")
 
     assert sample.valid is False and sample.prose_only is True and draft is None
+    assert sample.empty is False
     assert sample.steps is None and sample.uses_helper is None and sample.uses_gsap is None
     assert sample.result == "scene: error: no tool call"
 
@@ -138,6 +140,21 @@ async def test_prose_and_a_bare_document_are_read_for_what_they_are() -> None:
 
     assert sample.valid is True
     assert sample.uses_helper is False and sample.uses_gsap is False
+
+
+async def test_a_stream_that_ends_at_the_cap_with_nothing_is_empty_not_prose() -> None:
+    capped = ScriptedStream(
+        [], TurnUsage(prompt_tokens=4277, completion_tokens=128000), "length", 4000
+    )
+    reasoning = bench_scene.MeteredReasoning(ScriptedReasoning(capped))
+
+    sample, draft = await bench_scene.one_build(reasoning, bench_scene.BRIEF, 128000, "high")
+
+    assert draft is None and sample.valid is False
+    assert sample.empty is True and sample.prose_only is False and sample.truncated is False
+    assert sample.output_tokens == 128000 and sample.first_chunk_ms == 4000
+    assert sample.steps is None and sample.uses_helper is None and sample.uses_gsap is None
+    assert sample.result == "scene: error: empty reply"
 
 
 async def test_a_stream_without_a_usage_chunk_has_an_unknown_cost() -> None:
@@ -179,8 +196,23 @@ def test_the_report_names_the_model_the_effort_and_the_run_directory(capsys) -> 
             steps=4,
             uses_helper=True,
             uses_gsap=True,
+            empty=False,
             result="scene: sent",
-        )
+        ),
+        bench_scene.BuildSample(
+            build_ms=421000,
+            first_chunk_ms=4000,
+            valid=False,
+            truncated=False,
+            prose_only=False,
+            output_tokens=128000,
+            cost_usd=0.03,
+            steps=None,
+            uses_helper=None,
+            uses_gsap=None,
+            empty=True,
+            result="scene: error: empty reply",
+        ),
     ]
 
     bench_scene.report(cfg, args, samples, Path("/tmp/run"))
@@ -190,9 +222,12 @@ def test_the_report_names_the_model_the_effort_and_the_run_directory(capsys) -> 
     assert "scene_model=draw-1" in header and "effort=medium" in header
     assert "scene_max_tokens=128000" in header and "out=/tmp/run" in header
     assert any(line.startswith("build ") for line in lines)
-    assert "valid 1/1" in lines and "helper 1/1" in lines and "gsap 1/1" in lines
-    assert "other errors 0/1" in lines
+    assert "valid 1/2" in lines and "helper 1/1" in lines and "gsap 1/1" in lines
+    assert lines.index("prose only 0/2") + 1 == lines.index("empty 1/2")
+    assert "other errors 0/2" in lines
     assert any(line.startswith("steps ") for line in lines)
     assert any("flash" in line and "not priced" in line for line in lines)
+    (validity,) = [line for line in lines if line.startswith("validity:")]
+    assert "empty counts the streams that ended with neither" in validity
     (verdict,) = [line for line in lines if line.startswith("verdict:")]
-    assert verdict.endswith("valid 1/1 against the floor of 27, prose only 0/1, FAIL")
+    assert verdict.endswith("valid 1/2 against the floor of 27, prose only 0/2, FAIL")
