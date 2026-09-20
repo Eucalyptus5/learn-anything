@@ -4259,6 +4259,31 @@ async def test_a_truncated_visual_clears_the_pending_title() -> None:
     assert pushed(log) == []
 
 
+async def test_a_build_that_ends_at_the_cap_with_nothing_clears_the_title_and_leaves_one_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(
+        log, spoken_chunks(BRIEFED_DELTAS), speaker.received, visual=[], visual_finish="length"
+    )
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning)
+
+    with caplog.at_level(logging.INFO, logger="tutor.scene"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+        (visual,) = reasoning.visual_callers
+        assert visual is not None
+        await asyncio.wait_for(visual, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert visual.result() == "scene: error: empty reply"
+    assert pending(log, "turn-1") == [APP_TITLE, ""]
+    assert pushed(log) == []
+    assert speaker.utterances == [SPOKEN_CLAUSES]
+    scene_lines = [r.getMessage() for r in caplog.records if r.name == "tutor.scene"]
+    assert scene_lines == ["scene.empty finish=length"]
+
+
 class ClosedSettleTransport(LoggingTransport):
     async def send_json(self, payload: dict[str, object]) -> None:
         if payload["type"] == "visual.pending" and payload["title"] == "":

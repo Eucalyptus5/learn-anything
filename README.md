@@ -121,7 +121,7 @@ uv run pytest -q
 uv run ruff format && uv run ruff check
 ```
 
-1033 tests in about seven seconds. Every model is a fake in the suite; ripgrep is real and runs
+1035 tests in about seven seconds. Every model is a fake in the suite; ripgrep is real and runs
 against `tests/data/fixture_repo`, and one test runs the diagram frame's id parsing under node.
 No test sleeps or asserts a wall-clock latency. Timing lives in `scripts/bench_*.py`, run on
 purpose, and each prints its sample count.

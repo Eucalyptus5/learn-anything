@@ -9,6 +9,7 @@ from tutor.brief import VisualBrief
 from tutor.reasoning import TurnChunk
 from tutor.scene import (
     CONTRACT,
+    EMPTY_REPLY,
     GUIDE,
     NO_TOOL_CALL,
     SCENE_TOOL,
@@ -161,13 +162,32 @@ async def test_prose_without_a_tool_call_is_the_no_tool_string(caplog) -> None:
     assert "scene.prose chars=15" in caplog.messages
 
 
+async def test_a_stream_with_neither_prose_nor_a_call_is_empty_and_one_line(caplog) -> None:
+    log: list[tuple[str, object]] = []
+    capped = FakeReasoning(log, [], asyncio.Event(), visual=[], visual_finish="length")
+    with caplog.at_level(logging.INFO, logger="tutor.scene"):
+        result = await run_scene_build(capped, scene_prompt("PPO", BRIEF, "light"), 128000, "high")
+
+    assert result == EMPTY_REPLY == "scene: error: empty reply"
+    assert [m for m in caplog.messages if m.startswith("scene.")] == ["scene.empty finish=length"]
+
+    caplog.clear()
+    dropped = FakeReasoning(log, [], asyncio.Event(), visual=[])
+    with caplog.at_level(logging.INFO, logger="tutor.scene"):
+        result = await run_scene_build(dropped, scene_prompt("PPO", BRIEF, "light"), 128000, "high")
+
+    assert result == EMPTY_REPLY
+    assert [m for m in caplog.messages if m.startswith("scene.")] == ["scene.empty finish=None"]
+
+
 async def test_an_unexpected_tool_and_a_truncated_stream_are_error_strings(caplog) -> None:
     log: list[tuple[str, object]] = []
     other = FakeReasoning(log, [], asyncio.Event(), visual=[call("{}", "push_app")])
-    assert (
-        await run_scene_build(other, scene_prompt("PPO", BRIEF, "light"), 32000, "high")
-        == "scene: error: unexpected tool push_app"
-    )
+    with caplog.at_level(logging.WARNING, logger="tutor.scene"):
+        result = await run_scene_build(other, scene_prompt("PPO", BRIEF, "light"), 32000, "high")
+    assert result == "scene: error: unexpected tool push_app"
+    assert "scene.unexpected_tool chars=2" in caplog.messages
+    assert "push_app" not in " ".join(caplog.messages)
     cut = FakeReasoning(
         log, [], asyncio.Event(), visual=[call(DRAFT_ARGUMENTS[:20])], visual_finish="length"
     )
@@ -188,9 +208,11 @@ async def test_bad_arguments_are_error_strings_that_carry_no_text(caplog) -> Non
     short = FakeReasoning(
         log, [], asyncio.Event(), visual=[call(json.dumps({"html": "<p>x</p>", "steps": ["a"]}))]
     )
-    result = await run_scene_build(short, scene_prompt("PPO", BRIEF, "light"), 32000, "high")
+    with caplog.at_level(logging.WARNING, logger="tutor.scene"):
+        result = await run_scene_build(short, scene_prompt("PPO", BRIEF, "light"), 32000, "high")
     assert isinstance(result, str) and result.startswith("scene: error: steps: ")
     assert "<p>" not in result
+    assert "scene.rejected errors=1" in caplog.messages
 
     extra = FakeReasoning(
         log,
@@ -198,8 +220,11 @@ async def test_bad_arguments_are_error_strings_that_carry_no_text(caplog) -> Non
         asyncio.Event(),
         visual=[call(json.dumps({**DRAFT, "<p>secret</p>": 1}))],
     )
-    result = await run_scene_build(extra, scene_prompt("PPO", BRIEF, "light"), 32000, "high")
+    with caplog.at_level(logging.WARNING, logger="tutor.scene"):
+        result = await run_scene_build(extra, scene_prompt("PPO", BRIEF, "light"), 32000, "high")
     assert result == "scene: error: extra: Extra inputs are not permitted"
+    assert caplog.messages.count("scene.rejected errors=1") == 2
+    assert "<p>" not in " ".join(caplog.messages)
 
     digits = FakeReasoning(
         log,

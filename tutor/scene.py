@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 GUIDE = (Path(__file__).parent / "prompts" / "scene_guide.md").read_text()
 SCENE_TOOL = "write_scene"
 NO_TOOL_CALL = "scene: error: no tool call"
+EMPTY_REPLY = "scene: error: empty reply"
 
 CONTRACT = """
 You build one scene for a spoken lesson: a complete HTML document that draws one picture and
@@ -113,8 +114,12 @@ async def run_scene_build(
     if prose:
         logger.info("scene.prose chars=%d", prose)
     if call is None or not call.tool_name:
-        return NO_TOOL_CALL
+        if prose:
+            return NO_TOOL_CALL
+        logger.info("scene.empty finish=%s", stream.finish_reason)
+        return EMPTY_REPLY
     if call.tool_name != SCENE_TOOL:
+        logger.warning("scene.unexpected_tool chars=%d", len(call.text))
         return f"scene: error: unexpected tool {call.tool_name}"
     if stream.finish_reason == "length":
         logger.info("scene.truncated chars=%d", len(call.text))
@@ -135,6 +140,7 @@ async def run_scene_build(
                 else ".".join(str(part) for part in error["loc"])
             )
             reasons.append(f"{where or 'body'}: {error['msg']}")
+        logger.warning("scene.rejected errors=%d", len(reasons))
         return f"scene: error: {'; '.join(reasons)}"
     logger.info(
         "scene.call ms=%d finish=%s chars=%d steps=%d",
