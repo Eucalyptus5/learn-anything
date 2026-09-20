@@ -94,7 +94,7 @@ def test_filled_template_yields_defaults(tmp_path: Path) -> None:
     assert cfg.history_turns == 10
     assert cfg.scene_model == ""
     assert cfg.scene_effort == "high"
-    assert cfg.scene_max_tokens == 32000
+    assert cfg.scene_max_tokens == 128000
     assert cfg.scene_timeout_s == 600.0
     assert cfg.signaling_port == 8080
 

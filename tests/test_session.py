@@ -4311,7 +4311,7 @@ async def test_a_brief_head_starts_the_visual_call_and_is_never_spoken() -> None
     assert all(BRIEF_MARKER not in text for text in [*spoken, *captions])
     assert reasoning.tool_choices == [None, "required"]
     assert reasoning.tools[1] == SCENE_TOOLS
-    assert reasoning.max_tokens[1] == 32000
+    assert reasoning.max_tokens[1] == 128000
     assert reasoning.efforts[1] == "high"
     assert shown(log) == ["turn-1"]
     assert reasoning.prompts[1].history == []

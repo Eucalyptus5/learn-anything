@@ -153,7 +153,7 @@ class TurnLoopConfig(BaseModel):
     history_turns: int = Field(default=10, ge=0)
     scene_model: str = ""
     scene_effort: str = "high"
-    scene_max_tokens: int = Field(default=32000, gt=0)
+    scene_max_tokens: int = Field(default=128000, gt=0)
     scene_timeout_s: float = Field(default=600.0, gt=0)
     scene_ready_timeout_s: float = Field(default=20.0, gt=0)
     speculative_reasoning: bool = False

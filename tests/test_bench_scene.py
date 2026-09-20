@@ -188,7 +188,7 @@ def test_the_report_names_the_model_the_effort_and_the_run_directory(capsys) -> 
     lines = capsys.readouterr().out.splitlines()
     (header,) = [line for line in lines if line.startswith("model=")]
     assert "scene_model=draw-1" in header and "effort=medium" in header
-    assert "scene_max_tokens=32000" in header and "out=/tmp/run" in header
+    assert "scene_max_tokens=128000" in header and "out=/tmp/run" in header
     assert any(line.startswith("build ") for line in lines)
     assert "valid 1/1" in lines and "helper 1/1" in lines and "gsap 1/1" in lines
     assert "other errors 0/1" in lines
