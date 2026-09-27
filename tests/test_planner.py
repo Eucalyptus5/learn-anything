@@ -214,3 +214,21 @@ async def test_a_plan_that_names_a_source_path_is_refused_without_its_text(
     assert kept == LessonPlan.model_validate(numbered)
     assert "planner.positions count=1" in caplog.messages
     assert not any("pool" in m or "number line" in m for m in caplog.messages)
+
+
+async def test_a_decimal_ratio_in_a_step_is_not_refused(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ratio = plan()
+    ratio["scenes"][0]["steps"][0] = {
+        "show": "The ratio r = 0.6/0.4 = 1.5 on one sample",
+        "ask": "",
+    }
+    log: list[tuple[str, object]] = []
+    reasoning = FakeReasoning(log, [], asyncio.Event(), visual=[call(json.dumps(ratio))])
+    prompt = plan_prompt("PPO", STARTING, False, None, [], [])
+    with caplog.at_level(logging.INFO, logger="tutor.planner"):
+        result = await run_planner(reasoning, prompt, 8000, "high")
+
+    assert result == LessonPlan.model_validate(ratio)
+    assert not any(m.startswith("planner.positions") for m in caplog.messages)

@@ -91,3 +91,36 @@ def test_the_suffix_branch_keeps_urls_and_clock_times_ahead_of_path_shapes() -> 
     ]
     assert extract_positions("24") == [Position(path="", line=24)]
     assert extract_positions("handler.php") == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ratio r = 0.6/0.4 = 1.5 on one sample.",
+        "pi_old solid 0.5/0.3/0.2 and pi_new dashed 0.2/0.4/0.4",
+        "tag them: r(left)=0.4/0.8=0.5, r(right)=0.6/0.2=3.",
+        "a bracket giving r=0.30/0.20=1.5",
+        "KL < d/1.5 -> beta halves",
+    ],
+)
+def test_a_decimal_ratio_is_not_a_path(text: str) -> None:
+    assert [position for position in extract_positions(text) if position.path] == []
+
+
+def test_a_decimal_before_a_colon_is_not_a_path_and_line() -> None:
+    assert extract_positions("odds of 1.5:1 against") == []
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("tutor/session.py", [Position(path="tutor/session.py")]),
+        ("src/app.ts", [Position(path="src/app.ts")]),
+        ("session.py", [Position(path="session.py")]),
+        ("README.md", [Position(path="README.md")]),
+        ("session.py:42", [Position(path="session.py", line=42)]),
+        ("built on Node.js", [Position(path="Node.js")]),
+    ],
+)
+def test_letter_extensions_still_read_as_paths(text: str, expected: list[Position]) -> None:
+    assert extract_positions(text) == expected

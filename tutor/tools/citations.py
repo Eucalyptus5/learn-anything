@@ -16,7 +16,7 @@ _VALUE_DIGITS = 20
 _UNSPEAKABLE = 10**_VALUE_DIGITS
 _NUMBER_WORD_LIMIT = 16
 _SEAM_LIMIT = 32
-_SHORT_EXTENSION = re.compile(r"\.[A-Za-z0-9]{1,6}$")
+_SHORT_EXTENSION = re.compile(r"\.[A-Za-z][A-Za-z0-9]{0,5}$")
 _RANGE_WORDS = frozenset({"to", "through", "and"})
 _LINE_WORDS = frozenset({"line", "lines"})
 
