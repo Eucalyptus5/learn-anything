@@ -153,7 +153,7 @@ def is_valid(result: str) -> bool:
 
 
 def is_truncated(result: str) -> bool:
-    return result.startswith("scene: error: truncated")
+    return result.startswith(("scene: error: truncated", "planner: error: truncated"))
 
 
 def floored(pcm: np.ndarray) -> np.ndarray:
@@ -537,6 +537,8 @@ class TurnRecord:
         self.voice_usage: TurnUsage | None = None
         self.visual_usage: TurnUsage | None = None
         self.visual_first_chunk_ms: int | None = None
+        self.planner_usage: TurnUsage | None = None
+        self.planner_first_chunk_ms: int | None = None
         self.visual_task: asyncio.Task[str] | None = None
 
 
@@ -589,8 +591,10 @@ class MeteredStream:
                     record.brief_at = time.perf_counter()
                 deltas.append(chunk.text)
             yield chunk
-        if not voice:
+        if self._kind == "visual":
             record.visual_first_chunk_ms = self._inner.first_chunk_ms
+        elif self._kind == "planner":
+            record.planner_first_chunk_ms = self._inner.first_chunk_ms
         usage = self._inner.usage
         if usage is None:
             return
@@ -598,6 +602,8 @@ class MeteredStream:
             ledger.add(usage)
         if voice:
             record.voice_usage = add_usage(record.voice_usage, usage)
+        elif self._kind == "planner":
+            record.planner_usage = add_usage(record.planner_usage, usage)
         else:
             record.visual_usage = add_usage(record.visual_usage, usage)
 
@@ -608,7 +614,7 @@ class MeteredReasoning:
         self.arm = arm
         self.retained: list[Retained] = []
         self.ledger = UsageLedger()
-        self.ledgers = {"voice": UsageLedger(), "visual": UsageLedger()}
+        self.ledgers = {"voice": UsageLedger(), "visual": UsageLedger(), "planner": UsageLedger()}
         self.record = TurnRecord()
 
     def begin(self, turn: int = 0) -> TurnRecord:
@@ -628,7 +634,13 @@ class MeteredReasoning:
         record = self.record
         if record.requested is None:
             record.requested = time.perf_counter()
-        kind = "voice" if tool_choice is None else "visual"
+        names = {tool["function"]["name"] for tool in tools or ()}
+        if tool_choice is None:
+            kind = "voice"
+        elif "write_plan" in names:
+            kind = "planner"
+        else:
+            kind = "visual"
         if kind == "visual":
             record.visual_task = asyncio.current_task()
         prompt = prompt.model_copy(

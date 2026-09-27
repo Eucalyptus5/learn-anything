@@ -492,6 +492,8 @@ def test_the_visual_predicates_read_the_result_string() -> None:
     assert not bench_turn.is_valid("scene: timeout")
     assert bench_turn.is_truncated("scene: error: truncated at 32000 tokens")
     assert not bench_turn.is_truncated("scene: sent")
+    assert bench_turn.is_truncated("planner: error: truncated at 8000 tokens")
+    assert not bench_turn.is_truncated("planner: sent")
 
 
 POWERMETRICS_BLOCKS = """Machine model: Mac14,2
@@ -1120,3 +1122,21 @@ def test_heads_by_utterance_groups_on_the_samples_own_utterance(capsys) -> None:
 
     lines = capsys.readouterr().out.splitlines()
     assert "arm=stripped heads by utterance 0:0/0 1:0/0 2:0/0 3:1/1 4:0/1 5:1/1" in lines
+
+
+async def test_a_planner_stream_is_attributed_to_the_planner_ledger() -> None:
+    from tutor.planner import PLAN_TOOLS
+
+    usage = TurnUsage(prompt_tokens=10, completion_tokens=20)
+    chunk = TurnChunk(kind="tool_call", text="{}", tool_call_id="c", tool_name="write_plan")
+    stream = ScriptedStream([chunk], usage=usage, first_chunk_ms=12)
+    reasoning = bench_turn.MeteredReasoning(ScriptedReasoning([stream]))
+    record = reasoning.begin()
+    metered = reasoning.start_turn(_prompt_with_history(), tools=PLAN_TOOLS, tool_choice="required")
+    async for _ in metered:
+        pass
+    assert reasoning.ledgers["planner"].turns == 1
+    assert reasoning.ledgers["planner"].total.prompt_tokens == 10
+    assert reasoning.ledgers["visual"].turns == 0
+    assert record.planner_usage == usage and record.planner_first_chunk_ms == 12
+    assert record.visual_usage is None

@@ -82,3 +82,12 @@ class BuiltScene(BaseModel):
     version: int = Field(ge=1)
     say: list[StepLine] = Field(min_length=3, max_length=5)
     html: str = Field(min_length=1, max_length=200000)
+
+
+def rerun_conflict(old: LessonPlan, new: LessonPlan, protected: int) -> str | None:
+    if len(new.scenes) < protected:
+        return "committed_removed"
+    for position in range(protected):
+        if new.scenes[position] != old.scenes[position]:
+            return "committed_changed"
+    return None

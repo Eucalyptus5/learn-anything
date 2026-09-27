@@ -1,6 +1,6 @@
 import pytest
 
-from tutor.lesson import OPENING_TEXT, BuiltScene, Cursor, LessonPlan, Scene, Step
+from tutor.lesson import OPENING_TEXT, BuiltScene, Cursor, LessonPlan, Scene, Step, rerun_conflict
 
 STEP = {"show": "The ratio axis from 0.5 to 2.0", "ask": ""}
 ASKING = {"show": "The clip band at 0.8 and 1.2", "ask": "Where does the band sit?"}
@@ -119,3 +119,24 @@ def test_a_built_scene_holds_its_version_and_the_say_lines_the_builder_wrote() -
 
 def test_the_opening_text_is_fixed() -> None:
     assert OPENING_TEXT == "(the lesson begins)" and OPENING_TEXT.isascii()
+
+
+def test_a_rerun_may_not_touch_the_protected_prefix() -> None:
+    old = LessonPlan.model_validate(plan(3))
+    same = LessonPlan.model_validate(plan(3))
+    assert rerun_conflict(old, same, 2) is None
+    appended = LessonPlan.model_validate(plan(4))
+    assert rerun_conflict(old, appended, 2) is None
+    reshaped = LessonPlan.model_validate({**plan(2), "scenes": [scene(1), scene(3)]})
+    assert rerun_conflict(old, reshaped, 1) is None
+    retitled = plan(3)
+    retitled["scenes"][1]["title"] = "Another"
+    assert rerun_conflict(old, LessonPlan.model_validate(retitled), 2) == "committed_changed"
+    restepped = plan(3)
+    restepped["scenes"][0]["steps"][0] = {"show": "Other", "ask": ""}
+    assert rerun_conflict(old, LessonPlan.model_validate(restepped), 1) == "committed_changed"
+    dropped = LessonPlan.model_validate({**plan(1), "scenes": [scene(1)]})
+    assert rerun_conflict(old, dropped, 2) == "committed_removed"
+    inserted = LessonPlan.model_validate({**plan(3), "scenes": [scene(9), scene(1), scene(2)]})
+    assert rerun_conflict(old, inserted, 1) == "committed_changed"
+    assert rerun_conflict(old, inserted, 0) is None
