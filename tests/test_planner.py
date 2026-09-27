@@ -3,6 +3,8 @@ import json
 import logging
 import re
 
+import pytest
+
 from tests.test_lesson import plan
 from tests.test_session import FakeReasoning, visual_call
 from tutor.lesson import LessonPlan
@@ -101,7 +103,9 @@ def test_the_rerun_prompt_carries_the_transcript_the_plan_and_the_protected_ids(
     assert "exactly as they are" in RERUN and "never insert" in RERUN
 
 
-async def test_a_tool_call_becomes_a_plan_and_is_logged_without_its_text(caplog) -> None:
+async def test_a_tool_call_becomes_a_plan_and_is_logged_without_its_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     log: list[tuple[str, object]] = []
     reasoning = FakeReasoning(log, [], asyncio.Event(), visual=[call(PLAN_ARGUMENTS)])
     prompt = plan_prompt("PPO", STARTING, False, None, [], [])
@@ -119,7 +123,9 @@ async def test_a_tool_call_becomes_a_plan_and_is_logged_without_its_text(caplog)
     assert "Knows policy" not in " ".join(caplog.messages)
 
 
-async def test_prose_without_a_tool_call_is_the_no_tool_string(caplog) -> None:
+async def test_prose_without_a_tool_call_is_the_no_tool_string(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     log: list[tuple[str, object]] = []
     reasoning = FakeReasoning(
         log, [], asyncio.Event(), visual=[TurnChunk(kind="spoken", text="here is a plan")]
@@ -132,7 +138,9 @@ async def test_prose_without_a_tool_call_is_the_no_tool_string(caplog) -> None:
     assert "planner.prose chars=14" in caplog.messages
 
 
-async def test_a_stream_with_neither_prose_nor_a_call_is_empty_and_one_line(caplog) -> None:
+async def test_a_stream_with_neither_prose_nor_a_call_is_empty_and_one_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     log: list[tuple[str, object]] = []
     reasoning = FakeReasoning(log, [], asyncio.Event(), visual=[], visual_finish="length")
     prompt = plan_prompt("PPO", STARTING, False, None, [], [])
@@ -145,7 +153,9 @@ async def test_a_stream_with_neither_prose_nor_a_call_is_empty_and_one_line(capl
     ]
 
 
-async def test_an_unexpected_tool_and_a_truncated_stream_are_error_strings(caplog) -> None:
+async def test_an_unexpected_tool_and_a_truncated_stream_are_error_strings(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     log: list[tuple[str, object]] = []
     prompt = plan_prompt("PPO", STARTING, False, None, [], [])
     other = FakeReasoning(log, [], asyncio.Event(), visual=[call(PLAN_ARGUMENTS, "write_scene")])
@@ -162,7 +172,9 @@ async def test_an_unexpected_tool_and_a_truncated_stream_are_error_strings(caplo
     assert "planner.truncated chars=40" in caplog.messages
 
 
-async def test_bad_arguments_are_error_strings_that_carry_no_text(caplog) -> None:
+async def test_bad_arguments_are_error_strings_that_carry_no_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     log: list[tuple[str, object]] = []
     prompt = plan_prompt("PPO", STARTING, False, None, [], [])
     broken = FakeReasoning(log, [], asyncio.Event(), visual=[call("{not json")])
@@ -180,7 +192,9 @@ async def test_bad_arguments_are_error_strings_that_carry_no_text(caplog) -> Non
     assert "not json" not in " ".join(caplog.messages)
 
 
-async def test_a_plan_that_names_a_source_path_is_refused_without_its_text(caplog) -> None:
+async def test_a_plan_that_names_a_source_path_is_refused_without_its_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     named = plan()
     named["scenes"][0]["steps"][0] = {
         "show": "The second argument to acquire in src/pool.py",
