@@ -1,11 +1,13 @@
 import asyncio
 import json
+from typing import get_args
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from tests.fakes import FakeConnection, grounded_registry, search_result
 from tutor.visuals import (
+    AckReason,
     AppPush,
     Caption,
     ChannelPayload,
@@ -13,10 +15,18 @@ from tutor.visuals import (
     DiagramClear,
     DiagramPush,
     LearnerText,
+    LessonAck,
+    LessonAttach,
+    LessonCheckpoint,
+    LessonCue,
+    LessonStatePush,
+    LessonSync,
+    LessonSynced,
     SayMessage,
     ScenePush,
     SceneReady,
     SceneShow,
+    SceneStatus,
     SceneStep,
     SourceHighlight,
     ThemeMessage,
@@ -661,3 +671,172 @@ def test_a_scene_ready_message_validates_as_a_client_message() -> None:
     ):
         with pytest.raises(ValidationError):
             _client_adapter.validate_python(body)
+
+
+LESSON_STATE = {
+    "type": "lesson.state",
+    "scenes": [{"id": "scene-1", "title": "Clipped objective", "status": "building"}],
+    "current": "scene-1",
+}
+LESSON_CUE = {
+    "type": "lesson.cue",
+    "epoch": 1,
+    "barrier": 0,
+    "cue_id": 3,
+    "chunk_id": 7,
+    "scene_id": "scene-1",
+    "revision": 2,
+    "lead_ms": 480,
+    "audio_ms": 1650,
+    "tag": {"kind": "step", "n": 2},
+}
+LESSON_ACK = {
+    "type": "lesson.ack",
+    "epoch": 1,
+    "barrier": 0,
+    "cue_id": 3,
+    "outcome": "fired",
+    "reason": None,
+    "scene_id": "scene-1",
+    "step": 2,
+    "revision": 3,
+}
+LESSON_SYNCED = {
+    "type": "lesson.synced",
+    "epoch": 1,
+    "barrier": 1,
+    "scene_id": "scene-1",
+    "step": 2,
+    "revision": 3,
+    "last_cue": 3,
+}
+LESSON_CHECKPOINT = {
+    "type": "lesson.checkpoint",
+    "epoch": 1,
+    "scene_id": "scene-1",
+    "version": 1,
+    "step": 2,
+    "revision": 3,
+}
+
+
+def without(body: dict[str, object], key: str) -> dict[str, object]:
+    return {k: v for k, v in body.items() if k != key}
+
+
+def test_a_scene_status_is_one_of_five_words() -> None:
+    row = SceneStatus(id="scene-1", title="Clipped objective", status="building")
+    assert row.model_dump() == {"id": "scene-1", "title": "Clipped objective", "status": "building"}
+    for body in (
+        {"id": "scene-1", "title": "t", "status": "drawing"},
+        {"id": "Scene-1", "title": "t", "status": "planned"},
+        {"id": "scene-1", "title": "t" * 81, "status": "planned"},
+        {"id": "scene-1", "title": "t", "status": "planned", "at": 1},
+    ):
+        with pytest.raises(ValueError):
+            SceneStatus.model_validate(body)
+
+
+@pytest.mark.parametrize(
+    "model, body",
+    [
+        (LessonStatePush, LESSON_STATE),
+        (LessonStatePush, {**LESSON_STATE, "scenes": [], "current": None}),
+        (LessonAttach, {"type": "lesson.attach", "epoch": 1}),
+        (LessonCue, LESSON_CUE),
+        (LessonCue, {**LESSON_CUE, "chunk_id": 0}),
+        (
+            LessonCue,
+            {
+                **LESSON_CUE,
+                "scene_id": None,
+                "tag": {"kind": "scene", "n": 1, "scene_id": "scene-1"},
+            },
+        ),
+        (LessonSync, {"type": "lesson.sync", "epoch": 1, "barrier": 1}),
+        (LessonAck, LESSON_ACK),
+        (LessonAck, {**LESSON_ACK, "outcome": "dropped", "reason": "barrier"}),
+        (
+            LessonAck,
+            {**LESSON_ACK, "outcome": "failed", "reason": "runtime", "scene_id": None, "step": 0},
+        ),
+        (LessonSynced, LESSON_SYNCED),
+        (LessonCheckpoint, LESSON_CHECKPOINT),
+        (LessonCheckpoint, {**LESSON_CHECKPOINT, "scene_id": None, "version": 0, "step": 0}),
+    ],
+)
+def test_the_lesson_models_round_trip_through_json(model: type, body: dict[str, object]) -> None:
+    assert json.loads(model.model_validate(body).model_dump_json()) == body
+
+
+def test_every_ack_reason_is_accepted_on_a_dropped_ack() -> None:
+    for reason in get_args(AckReason):
+        assert LessonAck.model_validate({**LESSON_ACK, "outcome": "dropped", "reason": reason})
+
+
+@pytest.mark.parametrize(
+    "model, body",
+    [
+        (LessonStatePush, {**LESSON_STATE, "scenes": LESSON_STATE["scenes"] * 13}),
+        (LessonStatePush, {**LESSON_STATE, "current": "Scene-1"}),
+        (LessonStatePush, {**LESSON_STATE, "phase": "teach"}),
+        (LessonStatePush, without(LESSON_STATE, "current")),
+        (LessonAttach, {"type": "lesson.attach", "epoch": 0}),
+        (LessonAttach, {"type": "lesson.attach", "epoch": 1, "checkpoint": None}),
+        (LessonAttach, {"type": "lesson.attach"}),
+        (LessonCue, {**LESSON_CUE, "type": "lesson.position"}),
+        (LessonCue, {**LESSON_CUE, "epoch": 0}),
+        (LessonCue, {**LESSON_CUE, "barrier": -1}),
+        (LessonCue, {**LESSON_CUE, "cue_id": 0}),
+        (LessonCue, {**LESSON_CUE, "chunk_id": -1}),
+        (LessonCue, {**LESSON_CUE, "scene_id": "Scene-1"}),
+        (LessonCue, {**LESSON_CUE, "revision": -1}),
+        (LessonCue, {**LESSON_CUE, "lead_ms": -1}),
+        (LessonCue, {**LESSON_CUE, "audio_ms": -1}),
+        (LessonCue, {**LESSON_CUE, "tag": {"kind": "step", "n": 0}}),
+        (LessonCue, {**LESSON_CUE, "tag": {"kind": "step", "n": 6}}),
+        (LessonCue, {**LESSON_CUE, "tag": {"kind": "step", "n": 2, "at": 1}}),
+        (LessonCue, {**LESSON_CUE, "tag": {"kind": "scene", "n": 0, "scene_id": "scene-1"}}),
+        (LessonCue, {**LESSON_CUE, "tag": {"kind": "scene", "n": 13, "scene_id": "scene-1"}}),
+        (LessonCue, {**LESSON_CUE, "tag": {"kind": "scene", "n": 1, "scene_id": "Bad"}}),
+        (LessonCue, {**LESSON_CUE, "tag": {"kind": "scene", "n": 1}}),
+        (LessonCue, {**LESSON_CUE, "tag": {"kind": "set", "n": 1}}),
+        (LessonCue, {**LESSON_CUE, "html": "<p>x</p>"}),
+        (LessonCue, without(LESSON_CUE, "chunk_id")),
+        (LessonCue, without(LESSON_CUE, "scene_id")),
+        (LessonSync, {"type": "lesson.sync", "epoch": 0, "barrier": 1}),
+        (LessonSync, {"type": "lesson.sync", "epoch": 1, "barrier": 0}),
+        (LessonSync, {"type": "lesson.sync", "epoch": 1, "barrier": 1, "cue_id": 1}),
+        (LessonAck, {**LESSON_ACK, "type": "lesson.applied"}),
+        (LessonAck, {**LESSON_ACK, "epoch": 0}),
+        (LessonAck, {**LESSON_ACK, "barrier": -1}),
+        (LessonAck, {**LESSON_ACK, "cue_id": 0}),
+        (LessonAck, {**LESSON_ACK, "outcome": "applied"}),
+        (LessonAck, {**LESSON_ACK, "reason": "barrier"}),
+        (LessonAck, {**LESSON_ACK, "outcome": "dropped"}),
+        (LessonAck, {**LESSON_ACK, "outcome": "failed", "reason": "late"}),
+        (LessonAck, {**LESSON_ACK, "scene_id": "Scene-1"}),
+        (LessonAck, {**LESSON_ACK, "step": -1}),
+        (LessonAck, {**LESSON_ACK, "revision": -1}),
+        (LessonAck, {**LESSON_ACK, "text": "x"}),
+        (LessonAck, without(LESSON_ACK, "reason")),
+        (LessonSynced, {**LESSON_SYNCED, "epoch": 0}),
+        (LessonSynced, {**LESSON_SYNCED, "barrier": 0}),
+        (LessonSynced, {**LESSON_SYNCED, "scene_id": "Scene-1"}),
+        (LessonSynced, {**LESSON_SYNCED, "step": -1}),
+        (LessonSynced, {**LESSON_SYNCED, "revision": -1}),
+        (LessonSynced, {**LESSON_SYNCED, "last_cue": -1}),
+        (LessonSynced, {**LESSON_SYNCED, "cue_id": 3}),
+        (LessonSynced, without(LESSON_SYNCED, "last_cue")),
+        (LessonCheckpoint, {**LESSON_CHECKPOINT, "epoch": 0}),
+        (LessonCheckpoint, {**LESSON_CHECKPOINT, "scene_id": "Scene-1"}),
+        (LessonCheckpoint, {**LESSON_CHECKPOINT, "version": -1}),
+        (LessonCheckpoint, {**LESSON_CHECKPOINT, "step": -1}),
+        (LessonCheckpoint, {**LESSON_CHECKPOINT, "revision": -1}),
+        (LessonCheckpoint, {**LESSON_CHECKPOINT, "dials": {}}),
+        (LessonCheckpoint, without(LESSON_CHECKPOINT, "version")),
+    ],
+)
+def test_a_lesson_model_rejects_each_bad_field(model: type, body: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        model.model_validate(body)

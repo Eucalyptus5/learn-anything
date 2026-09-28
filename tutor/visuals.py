@@ -90,6 +90,128 @@ SCENE_ID = r"^[a-z][a-z0-9-]{0,31}$"
 StepLine = Annotated[str, Field(min_length=1, max_length=120)]
 
 
+SceneId = Annotated[str, Field(pattern=SCENE_ID)]
+STATUS = Literal["planned", "building", "built", "failed", "done"]
+AckReason = Literal[
+    "stale_epoch",
+    "stale_barrier",
+    "stale_revision",
+    "barrier",
+    "range",
+    "invalid",
+    "runtime",
+    "layout",
+    "owned",
+]
+
+
+class SceneStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: SceneId
+    title: str = Field(max_length=80)
+    status: STATUS
+
+
+class LessonStatePush(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["lesson.state"] = "lesson.state"
+    scenes: list[SceneStatus] = Field(max_length=12)
+    current: SceneId | None
+
+
+class LessonAttach(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["lesson.attach"] = "lesson.attach"
+    epoch: int = Field(ge=1)
+
+
+class StepCue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["step"] = "step"
+    n: int = Field(ge=1, le=5)
+
+
+class SceneCue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["scene"] = "scene"
+    n: int = Field(ge=1, le=12)
+    scene_id: SceneId
+
+
+CueTag = Annotated[StepCue | SceneCue, Field(discriminator="kind")]
+
+
+class LessonCue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["lesson.cue"] = "lesson.cue"
+    epoch: int = Field(ge=1)
+    barrier: int = Field(ge=0)
+    cue_id: int = Field(ge=1)
+    chunk_id: int = Field(ge=0)
+    scene_id: SceneId | None
+    revision: int = Field(ge=0)
+    lead_ms: int = Field(ge=0)
+    audio_ms: int = Field(ge=0)
+    tag: CueTag
+
+
+class LessonSync(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["lesson.sync"] = "lesson.sync"
+    epoch: int = Field(ge=1)
+    barrier: int = Field(ge=1)
+
+
+class LessonAck(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["lesson.ack"] = "lesson.ack"
+    epoch: int = Field(ge=1)
+    barrier: int = Field(ge=0)
+    cue_id: int = Field(ge=1)
+    outcome: Literal["fired", "dropped", "failed"]
+    reason: AckReason | None
+    scene_id: SceneId | None
+    step: int = Field(ge=0)
+    revision: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _reason_matches_outcome(self) -> Self:
+        if (self.outcome == "fired") != (self.reason is None):
+            raise ValueError("a fired ack has no reason; a dropped or failed one has one")
+        return self
+
+
+class LessonSynced(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["lesson.synced"] = "lesson.synced"
+    epoch: int = Field(ge=1)
+    barrier: int = Field(ge=1)
+    scene_id: SceneId | None
+    step: int = Field(ge=0)
+    revision: int = Field(ge=0)
+    last_cue: int = Field(ge=0)
+
+
+class LessonCheckpoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["lesson.checkpoint"] = "lesson.checkpoint"
+    epoch: int = Field(ge=1)
+    scene_id: SceneId | None
+    version: int = Field(ge=0)
+    step: int = Field(ge=0)
+    revision: int = Field(ge=0)
+
+
 class ScenePush(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
