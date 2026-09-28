@@ -1,6 +1,6 @@
 from typing import Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from tutor.visuals import SCENE_ID, StepLine
 
@@ -91,3 +91,15 @@ def rerun_conflict(old: LessonPlan, new: LessonPlan, protected: int) -> str | No
         if new.scenes[position] != old.scenes[position]:
             return "committed_changed"
     return None
+
+
+def splice_rerun(old: LessonPlan, new: LessonPlan, protected: int) -> LessonPlan | str:
+    prefix = old.scenes[:protected]
+    drawn = {scene.id for scene in prefix}
+    tail = [scene for scene in new.scenes if scene.id not in drawn]
+    try:
+        return LessonPlan.model_validate(
+            {**new.model_dump(exclude={"scenes"}), "scenes": [*prefix, *tail]}
+        )
+    except ValidationError:
+        return "splice_invalid"

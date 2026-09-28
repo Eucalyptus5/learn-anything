@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from tests.test_bench_turn import ScriptedReasoning, ScriptedStream
-from tests.test_lesson import plan
+from tests.test_lesson import plan, scene
 from tutor.config import Settings
 from tutor.cost import TurnUsage
 from tutor.lesson import LessonPlan
@@ -105,7 +105,7 @@ async def test_prose_empty_and_a_cut_stream_are_read_for_what_they_are() -> None
         assert not sample.valid and written is None and check(sample)
 
 
-async def test_a_rerun_sample_judges_the_reply_against_the_protected_prefix() -> None:
+async def test_a_rerun_sample_is_judged_on_the_splice_and_notes_a_touched_prefix() -> None:
     prompt = plan_prompt(
         "PPO",
         bench_planner.STARTING_FROM,
@@ -122,11 +122,18 @@ async def test_a_rerun_sample_judges_the_reply_against_the_protected_prefix() ->
     retitled = plan(3)
     retitled["scenes"][0]["title"] = "Other"
     touched = ScriptedStream([call(retitled)], usage=USAGE, finish_reason="tool_calls")
-    sample, _ = await bench_planner.one_plan(
+    sample, written = await bench_planner.one_plan(
         metered(touched), prompt, 8000, "high", None, PLAN, ["scene-1"]
     )
-    assert sample.valid and not sample.accepted and sample.touched_protected
-    assert not sample.appended
+    assert sample.valid and sample.accepted and sample.touched_protected
+    assert sample.appended is False
+    assert written == LessonPlan.model_validate(retitled)
+    crowded = {**plan(), "scenes": [scene(n) for n in range(2, 14)]}
+    overfull = ScriptedStream([call(crowded)], usage=USAGE, finish_reason="tool_calls")
+    sample, _ = await bench_planner.one_plan(
+        metered(overfull), prompt, 8000, "high", None, PLAN, ["scene-1"]
+    )
+    assert sample.valid and sample.accepted is False and sample.appended is None
 
 
 def test_valid_unicode_plan_text_is_saved_as_ascii_json(tmp_path: Path) -> None:

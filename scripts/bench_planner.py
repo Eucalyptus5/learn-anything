@@ -26,7 +26,7 @@ from scripts.bench_turn import (
 )
 from tutor.config import Settings, settings
 from tutor.cost import turn_cost_usd
-from tutor.lesson import OPENING_TEXT, LessonPlan, rerun_conflict
+from tutor.lesson import OPENING_TEXT, LessonPlan, rerun_conflict, splice_rerun
 from tutor.planner import EMPTY_REPLY, NO_TOOL_CALL, plan_prompt, run_planner
 from tutor.prompt import Message, TurnPrompt
 from tutor.reasoning import ReasoningClient
@@ -133,10 +133,11 @@ async def one_plan(
     usage = record.planner_usage
     accepted = touched = appended = None
     if current is not None and plan is not None:
-        conflict = rerun_conflict(current, plan, len(protected))
-        accepted = conflict is None
-        touched = conflict is not None
-        appended = len(plan.scenes) > len(current.scenes)
+        spliced = splice_rerun(current, plan, len(protected))
+        touched = rerun_conflict(current, plan, len(protected)) is not None
+        accepted = isinstance(spliced, LessonPlan)
+        if accepted:
+            appended = len(spliced.scenes) > len(current.scenes)
     elif current is not None:
         accepted = False
     return (
@@ -243,9 +244,10 @@ def report(cfg: Settings, args: argparse.Namespace, samples: list[PlanSample], r
     )
     print(
         "validity: the call returned a plan the boundary accepted; at a rerun stage accepted "
-        "means the reply kept the protected prefix (all disclosed scenes, unchanged and in "
-        "place), touched protected counts the replies that did not, appended counts the replies "
-        "longer than the plan they were given. prose only, empty, truncated and other errors "
+        "means the reply yields a valid plan once the protected prefix is restored from the plan "
+        "it was given, touched protected counts the replies whose own copy of the protected "
+        "prefix differed from that plan, appended counts the accepted replies whose spliced plan "
+        "is longer than the plan they were given. prose only, empty, truncated and other errors "
         "partition the failures. cost is the flash list price in tutor/cost.py applied to the "
         "tokens whatever the planner_model, so a non-flash run is not priced at its own rate.",
     )

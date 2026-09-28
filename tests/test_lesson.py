@@ -1,6 +1,15 @@
 import pytest
 
-from tutor.lesson import OPENING_TEXT, BuiltScene, Cursor, LessonPlan, Scene, Step, rerun_conflict
+from tutor.lesson import (
+    OPENING_TEXT,
+    BuiltScene,
+    Cursor,
+    LessonPlan,
+    Scene,
+    Step,
+    rerun_conflict,
+    splice_rerun,
+)
 
 STEP = {"show": "The ratio axis from 0.5 to 2.0", "ask": ""}
 ASKING = {"show": "The clip band at 0.8 and 1.2", "ask": "Where does the band sit?"}
@@ -140,3 +149,42 @@ def test_a_rerun_may_not_touch_the_protected_prefix() -> None:
     inserted = LessonPlan.model_validate({**plan(3), "scenes": [scene(9), scene(1), scene(2)]})
     assert rerun_conflict(old, inserted, 1) == "committed_changed"
     assert rerun_conflict(old, inserted, 0) is None
+
+
+def test_a_splice_puts_the_drawn_scenes_back_from_the_current_plan() -> None:
+    old = LessonPlan.model_validate(plan(3))
+    reshown = plan(3)
+    reshown["scenes"][0]["steps"][1] = {"show": "The ratio axis from 0.5 to 2", "ask": ""}
+    reshown["scenes"][1]["show"] = "The surrogate against the ratio"
+    reshown["scenes"][2]["title"] = "Retold"
+    restored = LessonPlan.model_validate(
+        {**plan(3), "scenes": [scene(1), scene(2), reshown["scenes"][2]]}
+    )
+    assert splice_rerun(old, LessonPlan.model_validate(reshown), 2) == restored
+    dropped = LessonPlan.model_validate({**plan(2), "scenes": [scene(1), scene(3)]})
+    assert splice_rerun(old, dropped, 2) == old
+    inserted = {**plan(3), "scenes": [scene(9), {**scene(1), "title": "Other"}, scene(2)]}
+    moved = LessonPlan.model_validate({**plan(3), "scenes": [scene(1), scene(9), scene(2)]})
+    assert splice_rerun(old, LessonPlan.model_validate(inserted), 1) == moved
+
+
+def test_a_splice_keeps_the_reply_tail_and_profile() -> None:
+    old = LessonPlan.model_validate(plan(3))
+    appended = plan(4)
+    appended["scenes"][0]["title"] = "Other"
+    longer = LessonPlan.model_validate(plan(4))
+    assert splice_rerun(old, LessonPlan.model_validate(appended), 2) == longer
+    profile = "Knows the clip, not why it is there."
+    reprofiled = {**plan(3), "profile": profile}
+    reprofiled["scenes"][0]["show"] = "The surrogate"
+    kept = LessonPlan.model_validate({**plan(3), "profile": profile})
+    assert splice_rerun(old, LessonPlan.model_validate(reprofiled), 1) == kept
+
+
+def test_a_splice_past_twelve_scenes_is_invalid() -> None:
+    old = LessonPlan.model_validate(plan(2))
+    twelve = LessonPlan.model_validate({**plan(), "scenes": [scene(n) for n in range(3, 15)]})
+    assert splice_rerun(old, twelve, 2) == "splice_invalid"
+    assert splice_rerun(old, twelve, 1) == "splice_invalid"
+    ten = LessonPlan.model_validate({**plan(), "scenes": [scene(n) for n in range(3, 13)]})
+    assert splice_rerun(old, ten, 2) == LessonPlan.model_validate(plan(12))
