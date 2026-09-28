@@ -216,20 +216,70 @@ async def test_a_reply_through_the_splitter_and_the_chunker_speaks_no_tag() -> N
     assert not any("<" in item or ">" in item for item in out if isinstance(item, str))
 
 
-def test_a_tag_ends_the_text_where_it_stands(caplog) -> None:
+def test_a_tag_inside_a_sentence_waits_for_the_sentence_to_end(caplog) -> None:
     with caplog.at_level(logging.INFO, logger="tutor.tags"):
-        assert fed("Look at the band, <step 2> which clips the ratio.") == [
-            "Look at the band, ",
+        assert fed("It falls, <step 2> then rises. Next one.") == [
+            "It falls,  then rises.",
             RawTag("step 2"),
-            " which clips the ratio.",
+            " Next one.",
         ]
-        assert fed("It falls <step 3> and rises.") == ["It falls ", RawTag("step 3"), " and rises."]
-        assert fed("done. <step 2> <step 3> now") == [
-            "done. ",
-            RawTag("step 2"),
-            " ",
-            RawTag("step 3"),
-            " now",
+        assert fed("It falls, <draw:secret> then rises.") == [
+            "It falls,  then rises.",
+            RawTag("draw:secret"),
         ]
-        assert fed("a <<step 2> b") == ["a <", RawTag("step 2"), " b"]
+    assert caplog.messages == ["tag.deferred name=step", "tag.deferred name=draw"]
+
+
+def test_a_sentence_end_split_across_deltas_still_releases_the_tag() -> None:
+    assert fed("It falls, <step 2> then", " rises.", " Next") == [
+        "It falls,  then rises.",
+        RawTag("step 2"),
+        " Next",
+    ]
+    assert fed("It falls <step 2> and rises.<step 3> Next.") == [
+        "It falls  and rises.",
+        RawTag("step 2"),
+        RawTag("step 3"),
+        " Next.",
+    ]
+
+
+def test_a_tag_at_a_sentence_start_is_not_deferred(caplog) -> None:
+    with caplog.at_level(logging.INFO, logger="tutor.tags"):
+        assert fed("Done. <step 2> Next.") == ["Done. ", RawTag("step 2"), " Next."]
+        assert fed("<scene 1>Here we go.") == [RawTag("scene 1"), "Here we go."]
     assert caplog.messages == []
+
+
+def test_deferred_tags_come_out_in_order_at_the_end_of_the_reply() -> None:
+    assert fed("It falls <step 2> and <step 3> rises") == [
+        "It falls  and  rises",
+        RawTag("step 2"),
+        RawTag("step 3"),
+    ]
+
+
+def test_a_deferred_tag_between_two_words_leaves_a_space() -> None:
+    assert fed("The band<step 2>clips it.") == ["The band clips it.", RawTag("step 2")]
+    assert fed(*"The band<step 2>clips it.") == ["The band clips it.", RawTag("step 2")]
+
+
+def test_a_decimal_point_ends_no_sentence_and_a_question_mark_does() -> None:
+    assert fed("Is it 0.5 <step 2> here? Yes.") == [
+        "Is it 0.5  here?",
+        RawTag("step 2"),
+        " Yes.",
+    ]
+
+
+def test_a_sentence_may_end_inside_a_closing_quote_or_bracket() -> None:
+    assert fed('He said "stop." <step 2> Next.') == [
+        'He said "stop." ',
+        RawTag("step 2"),
+        " Next.",
+    ]
+    assert fed('It falls <step 2> and "rises." Next.') == [
+        'It falls  and "rises."',
+        RawTag("step 2"),
+        " Next.",
+    ]

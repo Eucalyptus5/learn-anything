@@ -8,6 +8,8 @@ TAG_NAMES = ("step", "scene", "set", "point", "look", "orbit", "hand", "take", "
 TAG_MAX_CHARS = 240
 _OPENS = re.compile(r"<(?:" + "|".join(TAG_NAMES) + r")(?![a-z])", re.IGNORECASE)
 _MARKER = re.compile(r"(step|scene) ([1-9][0-9]?)")
+_CLOSERS = "\"')]"
+_SENTENCE_END = re.compile(r"[.?!][\"')\]]*(?=\s)")
 
 
 class RawTag(NamedTuple):
@@ -45,6 +47,10 @@ class TagSplitter:
         self._skipped = 0
         self._quoted = False
         self._escaped = False
+        self._deferred: list[RawTag] = []
+        self._last = ""
+        self._ended = False
+        self._gap = False
 
     def feed(self, delta: str) -> list[str | RawTag]:
         if self._skipped:
@@ -60,10 +66,10 @@ class TagSplitter:
         while text:
             at = text.find("<")
             if at < 0:
-                out.append(text)
+                self._text(out, text)
                 break
             if at:
-                out.append(text[:at])
+                self._text(out, text[:at])
                 text = text[at:]
             if _OPENS.match(text):
                 end, quoted, escaped = _close(text, False, False)
@@ -76,13 +82,13 @@ class TagSplitter:
                 if end > TAG_MAX_CHARS:
                     logger.info("tag.unterminated chars=%d", end)
                 else:
-                    out.append(RawTag(text[1 : end - 1]))
+                    self._tag(out, RawTag(text[1 : end - 1]))
                 text = text[end:]
             elif _could_open(text):
                 self._held = text
                 break
             else:
-                out.append("<")
+                self._text(out, "<")
                 text = text[1:]
         return out
 
@@ -90,8 +96,41 @@ class TagSplitter:
         dropped = self._skipped or len(self._held)
         if dropped:
             logger.info("tag.unterminated chars=%d", dropped)
+        deferred = self._deferred
         self._held, self._skipped, self._quoted, self._escaped = "", 0, False, False
-        return []
+        self._deferred, self._last, self._ended, self._gap = [], "", False, False
+        return deferred
+
+    def _text(self, out: list[str | RawTag], text: str) -> None:
+        if self._gap and not text[0].isspace():
+            text = " " + text
+        self._gap = False
+        if self._deferred and self._ended and text[0].isspace():
+            out.extend(self._deferred)
+            self._deferred = []
+        end = _SENTENCE_END.search(text) if self._deferred else None
+        if end is None:
+            out.append(text)
+        else:
+            out.append(text[: end.end()])
+            out.extend(self._deferred)
+            self._deferred = []
+            if rest := text[end.end() :]:
+                out.append(rest)
+        if stripped := text.rstrip().rstrip(_CLOSERS).rstrip():
+            self._last = stripped[-1]
+        if body := text.rstrip(_CLOSERS):
+            self._ended = body[-1] in ".?!"
+
+    def _tag(self, out: list[str | RawTag], tag: RawTag) -> None:
+        if self._last in ("", ".", "?", "!"):
+            out.extend(self._deferred)
+            self._deferred = []
+            out.append(tag)
+            return
+        self._deferred.append(tag)
+        self._gap = True
+        logger.info("tag.deferred name=%s", tag_name(tag))
 
 
 def tag_name(tag: RawTag) -> str:
