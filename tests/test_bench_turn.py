@@ -182,6 +182,10 @@ class ScriptedReasoning:
         return self._streams.pop(0)
 
 
+def _spoken(*texts: str) -> list[TurnChunk]:
+    return [TurnChunk(kind="spoken", text=text) for text in texts]
+
+
 async def test_a_visual_stream_is_attributed_to_the_visual_ledger() -> None:
     call = TurnChunk(kind="tool_call", text="{}", tool_call_id="c", tool_name="push_diagram")
     stream = ScriptedStream(
