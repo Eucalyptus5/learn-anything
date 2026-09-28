@@ -3,6 +3,7 @@ import logging
 import pytest
 
 from tutor.lesson import (
+    NO_PLAN,
     OPENING_TEXT,
     BuiltScene,
     Cursor,
@@ -11,6 +12,7 @@ from tutor.lesson import (
     Scene,
     SentCue,
     Step,
+    lesson_block,
     rerun_conflict,
     splice_rerun,
 )
@@ -489,3 +491,102 @@ def test_a_rerun_keeps_the_larger_of_the_prefix_it_was_shown_and_the_live_one(
         "lesson.prefix_touched reason=committed_changed",
     ]
     assert state.acked == Cursor()
+
+
+def test_the_block_without_a_plan_asks_for_words_and_no_tags() -> None:
+    text = lesson_block(LessonState(), learner_spoke=True, dropped=[])
+    assert text == NO_PLAN
+    assert "no lesson plan yet" in text and "write no tags" in text and text.isascii()
+
+
+def test_the_block_lists_every_title_marks_the_current_scene_and_numbers_the_steps() -> None:
+    state = opened()
+    state.opened = True
+    text = lesson_block(state, learner_spoke=True, dropped=[])
+    assert text.startswith("Profile: Knows policy gradients.")
+    assert "1. Scene 1 (now)\n2. Scene 2\n3. Scene 3" in text
+    assert "Current scene, 1 of 3: Scene 1." in text
+    assert (
+        "1. The ratio axis from 0.5 to 2.0\n2. The ratio axis from 0.5 to 2.0\n"
+        "3. The clip band at 0.8 and 1.2 (ask first: Where does the band sit?)"
+    ) in text
+    assert "Next scene, 2: Scene 2." in text
+    assert "The page shows scene 1 at step 1 of 3." in text
+    assert (
+        "The next step, 2, does not ask: write <step 2> at the start of the sentence where" in text
+    )
+    assert "phase" not in text.lower() and text.isascii()
+
+
+def test_the_block_directs_the_opening_and_a_learner_who_spoke_first() -> None:
+    state = three_scenes()
+    opening = lesson_block(state, learner_spoke=False, dropped=[])
+    assert "There is no learner text" in opening and "Open scene one" in opening
+    assert "write <scene 1> at the start of the sentence where it opens" in opening
+    assert "The page has not opened a scene yet." in opening
+    assert "1. Scene 1 (now)" in opening
+    spoke = lesson_block(state, learner_spoke=True, dropped=[])
+    assert "spoke before the lesson was ready" in spoke and "open scene one" in spoke
+    assert "Answer what they said in a sentence" in spoke
+    state.opened = True
+    missed = lesson_block(state, learner_spoke=True, dropped=[])
+    assert "Scene one is not open yet" in missed and "write <scene 1>" in missed
+
+
+def test_the_block_asks_before_an_asking_step_and_closes_a_scene_and_the_lesson() -> None:
+    state = opened()
+    state.opened = True
+    assert state.step_tag(2) is None
+    state.acknowledge(ack(2, step=2, revision=2))
+    text = lesson_block(state, learner_spoke=True, dropped=[])
+    assert "The next step, 3, asks first: Where does the band sit?" in text
+    assert "put it and stop" in text and "write <step 3>" in text
+    assert state.step_tag(3) is None
+    state.acknowledge(ack(3, step=3, revision=3))
+    done = lesson_block(state, learner_spoke=True, dropped=[])
+    assert "This scene is done" in done and "write <scene 2>" in done and "start at 2" in done
+    assert state.scene_tag(2) is None
+    state.acknowledge(ack(4, scene_id="scene-2", step=1, revision=4))
+    assert state.scene_tag(3) is None
+    state.acknowledge(ack(5, scene_id="scene-3", step=1, revision=5))
+    assert state.step_tag(3) is None
+    state.acknowledge(ack(6, scene_id="scene-3", step=3, revision=6))
+    last = lesson_block(state, learner_spoke=True, dropped=[])
+    assert "last scene" in last and "close the lesson" in last and "<scene" not in last
+    assert "3. Scene 3 (now)" in last and "Next scene" not in last
+
+
+def test_the_block_reads_the_position_with_tags_already_sent() -> None:
+    state = opened()
+    state.opened = True
+    assert state.step_tag(2) is None
+    text = lesson_block(state, learner_spoke=True, dropped=[])
+    assert "The page shows scene 1 at step 1 of 3." in text
+    assert "The next step, 3, asks first" in text
+
+
+def test_the_block_shows_the_drawn_say_lines_or_says_the_board_is_blank() -> None:
+    state = opened()
+    state.opened = True
+    unbuilt = lesson_block(state, learner_spoke=True, dropped=[])
+    assert "The board is blank for this scene" in unbuilt and "still write the step tags" in unbuilt
+    state.built["scene-1"] = BuiltScene(
+        scene_id="scene-1", version=1, say=["The axes", "The curve", "The band"], html="<p>x</p>"
+    )
+    text = lesson_block(state, learner_spoke=True, dropped=[])
+    assert "what each step shows, as drawn:\n1. The axes\n2. The curve\n3. The band" in text
+    assert "blank" not in text
+    del state.built["scene-1"]
+    state.failed.add("scene-1")
+    failed = lesson_block(state, learner_spoke=True, dropped=[])
+    assert "not coming" in failed and "blank" in failed
+
+
+def test_the_block_names_the_tags_dropped_from_the_last_reply() -> None:
+    state = opened()
+    state.opened = True
+    text = lesson_block(
+        state, learner_spoke=True, dropped=["<step 4>: past_end", "<set>: unsupported"]
+    )
+    assert "Tags dropped from your last reply: <step 4>: past_end; <set>: unsupported." in text
+    assert "Tags dropped" not in lesson_block(state, learner_spoke=True, dropped=[])

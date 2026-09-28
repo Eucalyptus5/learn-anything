@@ -3,6 +3,7 @@ import json
 
 from tutor.brief import BRIEF_END, BRIEF_MARKER
 from tutor.prompt import (
+    LESSON_PROMPT,
     SEARCH_CODE_TOOL,
     SYSTEM_PROMPT,
     TOOL_CONTEXT_BYTES,
@@ -11,6 +12,7 @@ from tutor.prompt import (
     ToolCallFunction,
     TurnPrompt,
 )
+from tutor.tags import TAG_NAMES
 from tutor.tools.models import SearchMatch, SearchResult
 from tutor.tools.search import search
 
@@ -380,3 +382,26 @@ def test_the_system_prompt_names_the_three_phases() -> None:
     assert "Interrogate:" in SYSTEM_PROMPT
     assert "Explore" not in SYSTEM_PROMPT
     assert "Reverse Feynman" not in SYSTEM_PROMPT
+
+
+def test_the_lesson_prompt_names_only_the_step_and_scene_tags_and_stays_ascii() -> None:
+    assert LESSON_PROMPT.isascii()
+    assert "<step n>" in LESSON_PROMPT and "<scene n>" in LESSON_PROMPT
+    for name in TAG_NAMES[2:]:
+        assert f"<{name}" not in LESSON_PROMPT, name
+    for gone in ("<visual>", "Teach:", "Concrete:", "Interrogate:", "three phases", "brief"):
+        assert gone not in LESSON_PROMPT, gone
+    flat = " ".join(LESSON_PROMPT.split())
+    assert (
+        "<step n> at the start of the sentence where step n of the current scene should appear"
+        in flat
+    )
+    assert "A new scene opens at its first step, so its step tags start at 2." in flat
+    assert "Never name a phase, a mode, the plan, a scene number or a step number aloud." in flat
+
+
+def test_the_lesson_prompt_keeps_the_grounding_speech_interruption_and_tools_paragraphs() -> None:
+    for lead in ("Grounding.", "Speech.", "Interruption.", "Tools."):
+        paragraph = next(p for p in SYSTEM_PROMPT.split("\n\n") if p.startswith(lead))
+        assert paragraph in LESSON_PROMPT, lead
+    assert LESSON_PROMPT != SYSTEM_PROMPT and "Teach:" in SYSTEM_PROMPT

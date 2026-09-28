@@ -319,3 +319,119 @@ class LessonState:
             rows.append(SceneStatus(id=scene.id, title=scene.title, status=status))
         shown = self.scene_at(self.acked.scene)
         return rows, None if shown is None else shown.id
+
+
+NO_PLAN = (
+    "There is no lesson plan yet. Teach from the subject and the starting-from line in words, "
+    "one idea at a time, and write no tags."
+)
+OPEN_SCENE_ONE = (
+    "write <scene 1> at the start of the sentence where it opens, say what its first step "
+    "shows, then go on through the steps that do not ask, writing <step n> at the start of the "
+    "sentence where step n should appear, until the next step that asks; put that question and "
+    "stop."
+)
+
+
+def _steps(steps: list[Step]) -> list[str]:
+    return [
+        f"{n}. {step.show}" + (f" (ask first: {step.ask})" if step.ask else "")
+        for n, step in enumerate(steps, start=1)
+    ]
+
+
+def _directive(state: LessonState, scene: Scene, learner_spoke: bool) -> str:
+    at = state.position()
+    if at.scene == 0:
+        if state.opened:
+            lead = (
+                "Scene one is not open yet. If the learner said something, answer it in a "
+                "sentence; then open scene one: "
+            )
+        elif learner_spoke:
+            lead = (
+                "The learner spoke before the lesson was ready. Answer what they said in a "
+                "sentence, then open scene one: "
+            )
+        else:
+            lead = "This is the opening of the lesson. There is no learner text. Open scene one: "
+        return lead + OPEN_SCENE_ONE
+    if at.step >= len(scene.steps):
+        if state.next_scene() is None:
+            return (
+                "This was the last scene and it is done: close the lesson in a few sentences, "
+                "and keep talking about whatever the learner raises."
+            )
+        return (
+            f"This scene is done. Open the next scene in the same breath: write "
+            f"<scene {at.scene + 1}> at the start of the sentence where it opens, say what its "
+            "first step shows, then go on through its steps by the same rules; step tags in a "
+            "new scene start at 2."
+        )
+    n = at.step + 1
+    following = scene.steps[at.step]
+    if following.ask:
+        return (
+            f"The next step, {n}, asks first: {following.ask} If that question is not yet in "
+            "the conversation above, put it and stop. If the learner has just answered it, say "
+            f"in one sentence whether they have it, write <step {n}> and explain what appears, "
+            "then continue through the steps that do not ask until the next one that does, or "
+            "the scene ends. If the learner has asked to be told, explain the rest of the scene "
+            "without questions, writing each step's tag. On the learner's own question, answer "
+            "it in words first and return to the step."
+        )
+    return (
+        f"The next step, {n}, does not ask: write <step {n}> at the start of the sentence where "
+        "it should appear and explain it, and continue through the steps that do not ask until "
+        "the next one that does; put that question and stop. On the learner's own question, "
+        "answer it in words first and return to the step."
+    )
+
+
+def lesson_block(state: LessonState, learner_spoke: bool, dropped: list[str]) -> str:
+    plan = state.plan
+    scene = state.current()
+    if plan is None or scene is None:
+        return NO_PLAN
+    at = max(state.position().scene, 1)
+    lines = [f"Profile: {plan.profile}", "Lesson, in order:"]
+    for n, each in enumerate(plan.scenes, start=1):
+        lines.append(f"{n}. {each.title}" + (" (now)" if n == at else ""))
+    lines.append("")
+    lines.append(
+        f"Current scene, {at} of {len(plan.scenes)}: {scene.title}. "
+        f"As a whole it shows: {scene.show}"
+    )
+    lines.append("Its steps:")
+    lines.extend(_steps(scene.steps))
+    built = state.built.get(scene.id)
+    if built is not None:
+        lines.append("The picture is drawn; what each step shows, as drawn:")
+        lines.extend(f"{n}. {say}" for n, say in enumerate(built.say, start=1))
+    elif scene.id in state.failed:
+        lines.append(
+            "The picture for this scene is not coming; the board stays blank under its title. "
+            "Teach it in words and still write the step tags."
+        )
+    else:
+        lines.append(
+            "The board is blank for this scene: its picture is not drawn yet. Teach it in words "
+            "and still write the step tags."
+        )
+    following = state.next_scene()
+    if following is not None:
+        lines.append(f"Next scene, {at + 1}: {following.title}. It shows: {following.show}")
+        lines.extend(_steps(following.steps))
+    lines.append("")
+    shown = state.scene_at(state.acked.scene)
+    if shown is None:
+        lines.append("The page has not opened a scene yet.")
+    else:
+        lines.append(
+            f"The page shows scene {state.acked.scene} at step {state.acked.step} "
+            f"of {len(shown.steps)}."
+        )
+    if dropped:
+        lines.append(f"Tags dropped from your last reply: {'; '.join(dropped)}.")
+    lines.append(_directive(state, scene, learner_spoke))
+    return "\n".join(lines)
