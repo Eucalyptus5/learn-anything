@@ -5634,6 +5634,11 @@ CUED_DELTAS = [
     "it is a single number.",
 ]
 SCENE_DELTAS = ["<scene 1>The ratio compares two policies. ", "They agree at one."]
+WITHHELD_DELTAS = [
+    "The ratio compares two policies. ",
+    "<scene 1>Look in setup.py for the flags. ",
+    "They agree at one.",
+]
 
 
 def spoken_texts(speaker: FakeSpeaker) -> list[str]:
@@ -5646,6 +5651,19 @@ class TimedSpeaker(FakeSpeaker):
             await on_play(chunk, 300, 900)
 
         await super().speak(chunks, timed)
+
+
+class HeldCuePage(FakePage):
+    def __init__(self, log: list[tuple[str, object]]) -> None:
+        super().__init__(log, syncs=False)
+        self.holding = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send_json(self, payload: dict[str, object]) -> None:
+        await super().send_json(payload)
+        if payload["type"] == "lesson.cue":
+            self.holding.set()
+            await self.release.wait()
 
 
 async def test_the_page_is_attached_before_anything_else_is_sent() -> None:
@@ -6085,6 +6103,7 @@ async def test_tags_never_reach_the_speaker_and_every_tag_drops_without_a_plan(
     page = FakePage(log)
     reasoning = FakeReasoning(log, spoken_chunks(TAGGED_DELTAS), speaker.received)
     loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning, transport=page)
+    caplog.set_level(logging.INFO, logger="tutor.lesson")
 
     with caplog.at_level(logging.INFO, logger="tutor.session"):
         await asyncio.wait_for(loop.run(), HANG_GUARD_S)
@@ -6105,6 +6124,17 @@ async def test_tags_never_reach_the_speaker_and_every_tag_drops_without_a_plan(
     )
     assert sent(log, "lesson.cue") == []
     assert loop._lesson.sent == []
+    assert [message for message in messages if message.startswith("tag.dropped ")] == [
+        "tag.dropped turn_id=turn-1 kind=set reason=unsupported chars=10",
+        "tag.dropped turn_id=turn-1 kind=step reason=malformed chars=6",
+    ]
+    lesson = [record.getMessage() for record in caplog.records if record.name == "tutor.lesson"]
+    assert [message for message in lesson if message.startswith("scene.dropped ")] == [
+        "scene.dropped n=1 reason=no_plan"
+    ]
+    assert [message for message in lesson if message.startswith("step.dropped ")] == [
+        "step.dropped scene_id=None n=2 reason=no_plan"
+    ]
 
 
 async def test_each_cue_goes_out_when_the_chunk_after_its_tag_plays() -> None:
@@ -6205,6 +6235,7 @@ async def test_a_trailing_tag_takes_the_last_chunks_timing_and_no_chunk_discards
     assert trailing["tag"] == {"kind": "step", "n": 2}
     assert trailing["chunk_id"] == opening["chunk_id"]
     assert (trailing["lead_ms"], trailing["audio_ms"]) == (950, 0)
+    assert (opening["lead_ms"], opening["audio_ms"]) == (300, 900)
     assert "tag.discarded turn_id=turn-2 count=1 reason=no_chunk" in session_messages(caplog)
     assert [entry.cue_id for entry in loop._lesson.sent] == [1, 2]
 
@@ -6366,6 +6397,79 @@ async def test_a_barge_in_after_a_cue_went_out_drops_it_at_the_page_and_the_next
     assert loop._lesson.sent == [] and loop._lesson.dropped == []
     assert loop._lesson.acked == Cursor(scene=0, step=0)
     assert "lesson.ack cue_id=1 outcome=dropped reason=barrier" in session_messages(caplog)
+    await loop.aclose()
+
+
+async def test_a_tag_before_a_withheld_clause_rides_the_next_admitted_clause(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log)
+    reasoning = FakeReasoning(log, spoken_chunks(WITHHELD_DELTAS), speaker.received)
+    loop = TurnLoop(
+        concept_cfg(),
+        SerialSource([CONCEPT_TEXT]),
+        FakeSearch(log, found()),
+        speaker,
+        page,
+        reasoning,
+        TurnRegistry(),
+    )
+    loop._lesson.adopt(LESSON)
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert speaker.utterances == [["The ratio compares two policies.", "They agree at one."]]
+    messages = session_messages(caplog)
+    assert "turn.chunk_withheld turn_id=turn-1 source=model ungrounded=1" in messages
+    (cue,) = sent(log, "lesson.cue")
+    assert cue["tag"] == {"kind": "scene", "n": 1, "scene_id": "ratio"}
+    (carrier,) = [chunk for chunk in speaker.chunks if chunk.text == "They agree at one."]
+    assert cue["chunk_id"] == carrier.id
+    (caption,) = [caption for caption in sent(log, "caption") if caption["text"] == carrier.text]
+    assert log.index(("send_json", cue)) == log.index(("send_json", caption)) + 1
+
+
+async def test_a_failed_ack_while_a_cue_push_waits_discards_the_next_marker_of_that_chunk(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = HeldCuePage(log)
+    reasoning = FakeReasoning(
+        log, spoken_chunks(["<scene 1><step 2>The ratio compares two policies."]), speaker.received
+    )
+    loop = TurnLoop(
+        concept_cfg(),
+        SerialSource([CONCEPT_TEXT]),
+        FakeSearch(log, found()),
+        speaker,
+        page,
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+        HeldPace(),
+    )
+    loop._lesson.adopt(LESSON)
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(page.holding.wait(), HANG_GUARD_S)
+        page.fail(1, "runtime")
+        page.release.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+
+    (cue,) = sent(log, "lesson.cue")
+    assert cue["tag"] == {"kind": "scene", "n": 1, "scene_id": "ratio"}
+    assert [without_seq(sync) for sync in sent(log, "lesson.sync")] == [
+        {"type": "lesson.sync", "epoch": 1, "barrier": 1}
+    ]
+    assert "tag.discarded turn_id=turn-1 count=1 reason=barrier" in session_messages(caplog)
+    assert loop._lesson.sent == []
+    assert loop._lesson.dropped == ["<scene 1>: runtime"]
     await loop.aclose()
 
 
