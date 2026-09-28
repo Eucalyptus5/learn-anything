@@ -541,6 +541,7 @@ def test_the_block_asks_before_an_asking_step_and_closes_a_scene_and_the_lesson(
     text = lesson_block(state, learner_spoke=True, dropped=[])
     assert "The next step, 3, asks first: Where does the band sit?" in text
     assert "put it and stop" in text and "write <step 3>" in text
+    assert "asked to be told" in text and "without questions" in text
     assert state.step_tag(3) is None
     state.acknowledge(ack(3, step=3, revision=3))
     done = lesson_block(state, learner_spoke=True, dropped=[])
