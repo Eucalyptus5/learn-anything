@@ -96,6 +96,6 @@ def test_replay_counts_a_fenced_turn_once() -> None:
     chunks_in, chunks_out, dropped_chars, dropped_turns, remaining = bench_spoken.replay(
         GLUE_TURNS + [FENCED_TURN]
     )
-    assert (chunks_in, chunks_out, dropped_turns) == (5, 5, 1)
+    assert (chunks_in, chunks_out, dropped_turns) == (5, 6, 1)
     assert dropped_chars == Counter({"fence": len('```json\n{"type":"diagram"}\n```')})
     assert remaining == Counter({"glued": 1})

@@ -4,11 +4,11 @@ from tutor.chunker import split_clauses
 from tutor.tools.citations import extract_positions
 from tutor.tools.models import Position
 
-_LEAD_IN = "Here is the thing you should look at now,"
+_LEAD_IN = "Here is the thing you should look at now."
 
 
 def _pieces(text: str) -> list[str]:
-    clauses, remainder = split_clauses(text, 8, 12)
+    clauses, remainder = split_clauses(text, 40)
     return clauses + ([remainder.strip()] if remainder.strip() else [])
 
 

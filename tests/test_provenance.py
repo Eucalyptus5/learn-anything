@@ -237,11 +237,11 @@ def test_abandoned_turn_leaves_nothing_verifiable_in_the_next_turn() -> None:
     assert verdict.ungrounded == [Position(path="src/pool.py", line=11)]
 
 
-_LEAD_IN = "Here is the thing you should look at now,"
+_LEAD_IN = "Here is the thing you should look at now."
 
 
 def _pieces(text: str) -> list[str]:
-    clauses, remainder = split_clauses(text, 8, 12)
+    clauses, remainder = split_clauses(text, 40)
     return clauses + ([remainder.strip()] if remainder.strip() else [])
 
 
@@ -263,7 +263,8 @@ async def _streamed(
         for delta in deltas:
             yield delta
 
-    pieces = [piece async for piece in clause_chunks(tokens())]
+    # a 12-word cap puts the cap cut inside these short replies, as 40 does in long ones
+    pieces = [piece async for piece in clause_chunks(tokens(), max_words=12)]
     return pieces, [registry.verify_chunk(turn_id, piece) for piece in pieces]
 
 
@@ -362,8 +363,8 @@ def test_verify_chunk_carries_the_path_into_the_next_clause() -> None:
     registry.record("t1", _sample_result())
 
     text = (
-        "The connection pool implementation lives over there in src/pool.py,"
-        " and you want lines 9 to 10"
+        "The connection pool implementation lives over there in src/pool.py."
+        " And you want lines 9 to 10"
     )
     pieces, verdicts = _chunked(registry, "t1", text)
 
@@ -378,8 +379,8 @@ def test_verify_chunk_reports_invented_endpoints_against_the_carried_path() -> N
     registry.record("t1", _sample_result())
 
     text = (
-        "The connection pool implementation lives over there in src/pool.py,"
-        " and you want lines 40 to 41"
+        "The connection pool implementation lives over there in src/pool.py."
+        " And you want lines 40 to 41"
     )
     pieces, verdicts = _chunked(registry, "t1", text)
 

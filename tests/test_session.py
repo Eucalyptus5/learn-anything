@@ -65,38 +65,47 @@ PARTIAL_TEXT = "walk me through"
 GROUNDED_PATH = "tutor/transport.py"
 UNGROUNDED_PATH = "tutor/playout.py"
 UNPARSEABLE_PATH = "tutor/my transport.py"
-SPOKEN_DELTAS = ["It lives in ", "the reader, ", "which drains ", "the track."]
-SPOKEN_CLAUSES = ["It lives in the reader,", "which drains the track."]
+SPOKEN_DELTAS = ["It lives in ", "the reader. ", "It drains ", "the track."]
+SPOKEN_CLAUSES = ["It lives in the reader.", "It drains the track."]
 FOLLOW_DELTAS = [" Both call sites ", "drain it."]
 PATH_DELTAS = [
-    f"It lives in {GROUNDED_PATH}, ",
-    f"and the other copy of the same reader sits in {UNGROUNDED_PATH}, ",
+    f"It lives in {GROUNDED_PATH}. ",
+    f"And the other copy of the same reader sits in {UNGROUNDED_PATH}. ",
     "Both call sites drain it.",
 ]
 PATH_CLAUSES = [
-    f"It lives in {GROUNDED_PATH},",
-    f"and the other copy of the same reader sits in {UNGROUNDED_PATH},",
+    f"It lives in {GROUNDED_PATH}.",
+    f"And the other copy of the same reader sits in {UNGROUNDED_PATH}.",
     "Both call sites drain it.",
 ]
-LINE_DELTAS = [f"It lives in {GROUNDED_PATH} line 24, ", "and the reader drains the track."]
+LINE_DELTAS = [f"It lives in {GROUNDED_PATH} line 24. ", "And the reader drains the track."]
 LINE_CLAUSES = [
-    f"It lives in {GROUNDED_PATH} line 24,",
-    "and the reader drains the track.",
+    f"It lives in {GROUNDED_PATH} line 24.",
+    "And the reader drains the track.",
 ]
-COUNT_DELTAS = [f"It lives in {GROUNDED_PATH} line 24, ", "There are 3 callers of it."]
+COUNT_DELTAS = [f"It lives in {GROUNDED_PATH} line 24. ", "There are 3 callers of it."]
 SPLIT_LINE = 4021
 SPLIT_DELTAS = [
     "It lives there. The queue reader that drains ",
-    f"the inbound audio track sits on line {SPLIT_LINE} of that same file and it never blocks.",
+    (
+        "the inbound audio track hands every frame it pulls to the resampler and then to the "
+        "voice detector and after both of those steps have run does it reach the code that sits "
+        f"on line {SPLIT_LINE} of that same file and it never blocks."
+    ),
 ]
 SPLIT_CLAUSES = [
     "It lives there.",
-    "The queue reader that drains the inbound audio track sits on line",
+    (
+        "The queue reader that drains the inbound audio track hands every frame it pulls to the "
+        "resampler and then to the voice detector and after both of those steps have run does it "
+        "reach the code that sits on line"
+    ),
     f"{SPLIT_LINE} of that same file and it never blocks.",
 ]
 CHAINED_CLAUSES = [
-    "It lives in the reader,",
-    "which drains the track.\nBoth call sites drain it.",
+    "It lives in the reader.",
+    "It drains the track.",
+    "Both call sites drain it.",
 ]
 REASONING_TEXT = "weighing two call sites"
 MODEL_QUERY = "class Connection"
@@ -132,14 +141,14 @@ SPECULATION_TASK = "turn-1-speculation"
 SECOND_PATH = "tutor/resample.py"
 CARRY_DELTAS = [
     "Line 30 is the reader. ",
-    f"It lives in the queue reader inside {GROUNDED_PATH}, ",
-    "line 24 is where it drains.",
+    f"It lives in the queue reader inside {GROUNDED_PATH}. ",
+    "Line 24 is where it drains.",
 ]
 CARRY_CLAUSES = [
-    f"It lives in the queue reader inside {GROUNDED_PATH},",
-    "line 24 is where it drains.",
+    f"It lives in the queue reader inside {GROUNDED_PATH}.",
+    "Line 24 is where it drains.",
 ]
-FIRST_CLAUSE_DELTA = "It lives in the reader, "
+FIRST_CLAUSE_DELTA = "It lives in the reader. "
 FILLER_DELTA = "and "
 # One delta reaches the chunker, SPOKEN_DEPTH sit in the queue, and the next put blocks.
 QUEUE_FULL_DELTAS = SPOKEN_DEPTH + 2
@@ -1232,15 +1241,13 @@ async def test_each_reasoning_stream_is_iterated_once(tmp_path: Path) -> None:
     await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
     speaker.received.clear()
     await asyncio.wait_for(speaker.received.wait(), HANG_GUARD_S)
-    assert speaker.utterances == [[CHAINED_CLAUSES[0], lead_in_sentence([result])]]
+    assert speaker.utterances == [CHAINED_CLAUSES[:2]]
     gate.set()
     await asyncio.wait_for(running, HANG_GUARD_S)
 
     assert [stream.iterations for stream in reasoning.streams] == [1, 1]
     assert len([name for name, _ in log if name == "start_turn"]) == 2
-    assert speaker.utterances == [
-        [CHAINED_CLAUSES[0], lead_in_sentence([result]), CHAINED_CLAUSES[1]]
-    ]
+    assert speaker.utterances == [CHAINED_CLAUSES]
     await loop.aclose()
 
 
@@ -2284,7 +2291,7 @@ async def test_a_line_number_split_across_the_cut_never_reaches_the_speaker(
     with caplog.at_level(logging.INFO, logger="tutor.session"):
         await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    clauses, remainder = split_clauses("".join(SPLIT_DELTAS), 3, 12)
+    clauses, remainder = split_clauses("".join(SPLIT_DELTAS), 40)
     spoken = [text for name, text in log if name == "speak"]
     assert clauses + [remainder] == SPLIT_CLAUSES
     assert speaker.utterances == [SPLIT_CLAUSES[:2]]

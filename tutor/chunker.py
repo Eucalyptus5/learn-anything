@@ -2,73 +2,58 @@ import re
 from collections import Counter
 from collections.abc import AsyncIterator
 
-_BOUNDARY_CHARS = ".?!;:,"
+_SENTENCE_ENDS = (".", "?", "!")
+_CLOSERS = "\"')]"
+_CLAUSE_ENDS = ",;:"
 _ABBREVIATIONS = ("e.g.", "i.e.", "etc.", "vs.", "Dr.")
 _WORD = re.compile(r"\S+")
 _TAG = re.compile(r"</?[a-z]+>|<[a-z/]{0,15}\Z")
 _JSON_BOUND = 8192
 
 
-def split_clauses(text: str, min_words: int, max_words: int) -> tuple[list[str], str]:
+def split_clauses(text: str, max_words: int) -> tuple[list[str], str]:
     clauses: list[str] = []
     start = 0
-    count = 0
-    prev_end = 0
+    ends: list[int] = []
+    boundary = 0
 
     for match in _WORD.finditer(text):
+        if len(ends) == max_words:
+            kept = boundary or max_words
+            clauses.append(text[start : ends[kept - 1]].strip())
+            start = ends[kept - 1] + 1
+            ends = ends[kept:]
+            boundary = 0
+
         word_end = match.end()
-
-        if count == max_words:
-            clauses.append(text[start:prev_end].strip())
-            start = prev_end + 1
-            count = 0
-
-        count += 1
-        prev_end = word_end
+        ends.append(word_end)
+        if word_end == len(text):
+            continue
         word = match.group()
-
-        if word[-1] not in _BOUNDARY_CHARS:
-            continue
-        if word_end == len(text) or not text[word_end].isspace():
-            continue
-        if word[-1] == "." and word in _ABBREVIATIONS:
-            continue
-        if count < min_words:
-            continue
-
-        clauses.append(text[start:word_end].strip())
-        start = word_end + 1
-        count = 0
+        core = word.rstrip(_CLOSERS)
+        if core.endswith(_SENTENCE_ENDS) and core not in _ABBREVIATIONS:
+            clauses.append(text[start:word_end].strip())
+            start = word_end + 1
+            ends = []
+            boundary = 0
+        elif word[-1] in _CLAUSE_ENDS:
+            boundary = len(ends)
 
     return clauses, text[start:]
 
 
 async def clause_chunks[T](
-    tokens: AsyncIterator[str | T],
-    *,
-    first_min_words: int = 3,
-    min_words: int = 8,
-    max_words: int = 12,
+    tokens: AsyncIterator[str | T], *, max_words: int = 40
 ) -> AsyncIterator[str | T]:
     buffer = ""
-    released = False
     async for token in tokens:
         if not isinstance(token, str):
             if remainder := buffer.strip():
-                released = True
                 yield remainder
             buffer = ""
             yield token
             continue
-        buffer += token
-        if not released:
-            first, _ = split_clauses(buffer, first_min_words, max_words)
-            if not first:
-                continue
-            released = True
-            yield first[0]
-            buffer = buffer.lstrip()[len(first[0]) :]
-        clauses, buffer = split_clauses(buffer, min_words, max_words)
+        clauses, buffer = split_clauses(buffer + token, max_words)
         for clause in clauses:
             yield clause
     remainder = buffer.strip()

@@ -72,7 +72,6 @@ TURN_TEXT = (
 )
 ABANDONED_TEXT = dict(TTS_TEXTS)["full turn"]
 REPLACEMENT_TEXT = "Checking the acquire path."
-CHUNK_MAX_WORDS = 12
 CANCEL_AFTER_S = 0.05
 
 BLOCKS = (
@@ -668,8 +667,6 @@ async def bench_chunked(samples: int) -> None:
             full.append(elapsed)
             spoken = sum(durations)
             for position, span in enumerate(spans[1:], start=1):
-                if span.words != CHUNK_MAX_WORDS:
-                    continue
                 chunk_cost.append(span.elapsed)
                 previous_playout.append(durations[position - 1])
                 if span.elapsed > durations[position - 1]:
@@ -695,9 +692,9 @@ async def bench_chunked(samples: int) -> None:
     report("whole turn time to first audio", whole_first)
     report("chunked full turn", full)
     print(f"  the turn speaks {spoken:.2f}s of audio")
-    report(f"{CHUNK_MAX_WORDS}-word chunk synthesis", chunk_cost)
+    report("later chunk synthesis", chunk_cost)
     report("preceding chunk playout", previous_playout)
-    print(f"  {behind} of {len(chunk_cost)} full chunks cost more than the chunk before them buys")
+    print(f"  {behind} of {len(chunk_cost)} later chunks cost more than the chunk before them buys")
     print(f"  {gapped} of {samples} timed turns had a playout gap, widest {widest * 1000:.0f}ms")
     end(b)
 
