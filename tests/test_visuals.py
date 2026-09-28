@@ -7,6 +7,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from tests.fakes import FakeConnection, grounded_registry, search_result
 from tutor.visuals import (
+    CLIENT_MESSAGE,
     AckReason,
     AppPush,
     Caption,
@@ -23,12 +24,14 @@ from tutor.visuals import (
     LessonSync,
     LessonSynced,
     SayMessage,
+    SceneCue,
     ScenePush,
     SceneReady,
     SceneShow,
     SceneStatus,
     SceneStep,
     SourceHighlight,
+    StepCue,
     ThemeMessage,
     TurnState,
     UngroundedVisual,
@@ -840,3 +843,96 @@ def test_every_ack_reason_is_accepted_on_a_dropped_ack() -> None:
 def test_a_lesson_model_rejects_each_bad_field(model: type, body: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         model.model_validate(body)
+
+
+OPENING_CUE = LessonCue(
+    epoch=1,
+    barrier=0,
+    cue_id=1,
+    chunk_id=1,
+    scene_id=None,
+    revision=0,
+    lead_ms=0,
+    audio_ms=900,
+    tag=SceneCue(n=1, scene_id="ratio"),
+)
+STEP_CUE = LessonCue(
+    epoch=1,
+    barrier=0,
+    cue_id=2,
+    chunk_id=3,
+    scene_id="ratio",
+    revision=1,
+    lead_ms=640,
+    audio_ms=1800,
+    tag=StepCue(n=2),
+)
+PAGE_ACK = {
+    "type": "lesson.ack",
+    "epoch": 1,
+    "barrier": 0,
+    "cue_id": 2,
+    "outcome": "fired",
+    "reason": None,
+    "scene_id": "ratio",
+    "step": 2,
+    "revision": 2,
+}
+PAGE_SYNCED = {
+    "type": "lesson.synced",
+    "epoch": 1,
+    "barrier": 1,
+    "scene_id": "ratio",
+    "step": 2,
+    "revision": 2,
+    "last_cue": 2,
+}
+PAGE_CHECKPOINT = {
+    "type": "lesson.checkpoint",
+    "epoch": 1,
+    "scene_id": "ratio",
+    "version": 0,
+    "step": 2,
+    "revision": 2,
+}
+
+
+def test_the_lesson_payloads_travel_on_the_channel() -> None:
+    state = LessonStatePush(
+        scenes=[SceneStatus(id="ratio", title="The ratio", status="building")], current=None
+    )
+    for payload in (
+        LessonAttach(epoch=1),
+        OPENING_CUE,
+        STEP_CUE,
+        LessonSync(epoch=1, barrier=1),
+        state,
+    ):
+        assert _channel_adapter.validate_python(payload.model_dump(mode="json")) == payload
+    assert OPENING_CUE.model_dump(mode="json")["tag"] == {
+        "kind": "scene",
+        "n": 1,
+        "scene_id": "ratio",
+    }
+    assert STEP_CUE.model_dump(mode="json")["tag"] == {"kind": "step", "n": 2}
+    assert OPENING_CUE.model_dump(mode="json")["scene_id"] is None
+
+
+def test_the_page_messages_are_client_messages_and_never_a_say() -> None:
+    assert isinstance(CLIENT_MESSAGE.validate_python(PAGE_ACK), LessonAck)
+    assert isinstance(CLIENT_MESSAGE.validate_python(PAGE_SYNCED), LessonSynced)
+    assert isinstance(CLIENT_MESSAGE.validate_python(PAGE_CHECKPOINT), LessonCheckpoint)
+    for body in (PAGE_ACK, PAGE_SYNCED, PAGE_CHECKPOINT):
+        with pytest.raises(ValidationError):
+            CLIENT_MESSAGE.validate_python({**body, "text": "go on"})
+
+
+async def test_a_cue_reaches_the_connection_with_its_tag_nested_and_a_seq() -> None:
+    connection = FakeConnection()
+    channel = VisualChannel(connection)
+    await channel.push(LessonAttach(epoch=1))
+    await channel.push(STEP_CUE)
+    assert connection.sent == [
+        {"type": "lesson.attach", "epoch": 1, "seq": 1},
+        {**STEP_CUE.model_dump(mode="json"), "seq": 2},
+    ]

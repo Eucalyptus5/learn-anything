@@ -12,6 +12,7 @@ from tutor.brief import BRIEF_END, BRIEF_MARKER, BriefSplitter, VisualBrief
 from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.input_path import EndOfTurn, InputPath, PartialTranscript, SpeechStarted
 from tutor.lead_in import lead_in_sentence, lead_in_stages
+from tutor.lesson import LessonState
 from tutor.pedagogy import PedagogyState, TurnOutcome, parse_outcome
 from tutor.prompt import (
     SEARCH_CODE_TOOL,
@@ -32,6 +33,9 @@ from tutor.visuals import (
     CLIENT_MESSAGE,
     Caption,
     LearnerText,
+    LessonAck,
+    LessonCheckpoint,
+    LessonSynced,
     ScenePush,
     SceneReady,
     SceneShow,
@@ -213,6 +217,8 @@ class TurnLoop:
         self._chunk_id = 0
         self._theme = "light"
         self._dispatched = 0
+        self._lesson = LessonState()
+        self._epoch = 1
         transport.on_json(self._on_json)
 
     def _on_json(self, payload: dict[str, object]) -> None:
@@ -235,8 +241,38 @@ class TurnLoop:
                 return
             waiting.set_result(message)
             return
+        if isinstance(message, LessonAck):
+            self._on_ack(message)
+            return
+        if isinstance(message, LessonSynced):
+            self._on_synced(message)
+            return
+        if isinstance(message, LessonCheckpoint):
+            self._on_checkpoint(message)
+            return
         self._interrupt()
         self._dispatch(message.text)
+
+    def _on_ack(self, ack: LessonAck) -> None:
+        if ack.epoch != self._epoch:
+            logger.info("lesson.ack_ignored epoch=%d cue_id=%d", ack.epoch, ack.cue_id)
+            return
+        head = self._lesson.sent[0] if self._lesson.sent else None
+        self._lesson.acknowledge(ack)
+        if head is None or head.cue_id != ack.cue_id:
+            return
+        logger.info(
+            "lesson.ack cue_id=%d outcome=%s reason=%s", ack.cue_id, ack.outcome, ack.reason
+        )
+
+    def _on_synced(self, message: LessonSynced) -> None:
+        logger.info("lesson.synced_ignored epoch=%d barrier=%d", message.epoch, message.barrier)
+
+    def _on_checkpoint(self, message: LessonCheckpoint) -> None:
+        if message.epoch != self._epoch:
+            logger.info("lesson.checkpoint_ignored epoch=%d", message.epoch)
+            return
+        self._lesson.retain(message)
 
     async def run(self) -> None:
         async for event in self._source.events():

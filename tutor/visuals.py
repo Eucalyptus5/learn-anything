@@ -250,7 +250,11 @@ ChannelPayload = Annotated[
     | VisualPending
     | ScenePush
     | SceneShow
-    | SceneStep,
+    | SceneStep
+    | LessonAttach
+    | LessonCue
+    | LessonSync
+    | LessonStatePush,
     Field(discriminator="type"),
 ]
 
@@ -284,7 +288,10 @@ class SceneReady(BaseModel):
     error: str = Field(max_length=500)
 
 
-ClientMessage = Annotated[ThemeMessage | SayMessage | SceneReady, Field(discriminator="type")]
+ClientMessage = Annotated[
+    ThemeMessage | SayMessage | SceneReady | LessonAck | LessonSynced | LessonCheckpoint,
+    Field(discriminator="type"),
+]
 CLIENT_MESSAGE = TypeAdapter(ClientMessage)
 
 

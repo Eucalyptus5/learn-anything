@@ -53,6 +53,7 @@ from tutor.tools.models import (
 from tutor.tools.provenance import TurnRegistry
 from tutor.transport import INBOUND_CAPACITY, Connection
 from tutor.visual_tools import VOICE_VISUAL_TOOLS
+from tutor.visuals import LessonCheckpoint
 
 HANG_GUARD_S = 20.0
 TICK_S = 0.25
@@ -5332,6 +5333,93 @@ async def test_a_ready_report_for_no_waiting_scene_is_one_log_line(
     assert "scene.ready_unexpected scene_id=turn-9" in messages
     assert "client.message_rejected type=scene.ready" in messages
     assert speaker.utterances == [SPOKEN_CLAUSES]
+
+
+PAGE_MESSAGES = [
+    pytest.param(
+        {
+            "type": "lesson.ack",
+            "epoch": 2,
+            "barrier": 0,
+            "cue_id": 9,
+            "outcome": "fired",
+            "reason": None,
+            "scene_id": "ratio",
+            "step": 2,
+            "revision": 1,
+        },
+        "lesson.ack_ignored epoch=2 cue_id=9",
+        id="ack-other-epoch",
+    ),
+    pytest.param(
+        {
+            "type": "lesson.synced",
+            "epoch": 1,
+            "barrier": 4,
+            "scene_id": None,
+            "step": 0,
+            "revision": 0,
+            "last_cue": 0,
+        },
+        "lesson.synced_ignored epoch=1 barrier=4",
+        id="synced-no-barrier",
+    ),
+    pytest.param(
+        {
+            "type": "lesson.checkpoint",
+            "epoch": 2,
+            "scene_id": None,
+            "version": 0,
+            "step": 0,
+            "revision": 0,
+        },
+        "lesson.checkpoint_ignored epoch=2",
+        id="checkpoint-other-epoch",
+    ),
+]
+
+
+@pytest.mark.parametrize(("message", "line"), PAGE_MESSAGES)
+async def test_a_page_message_is_handled_apart_from_a_say(
+    message: dict[str, object], line: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    transport = LoggingTransport(log)
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning, transport=transport)
+    (handler,) = transport.handlers
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        handler(message)
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert line in session_messages(caplog)
+    assert ("flush_playout", None) not in log
+    assert [prompt.user_text for prompt in reasoning.prompts] == [CONCEPT_TEXT]
+    assert speaker.utterances == [SPOKEN_CLAUSES]
+
+
+async def test_a_checkpoint_from_the_attached_page_is_retained() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    transport = LoggingTransport(log)
+    loop = concept_loop(log, ScriptedSource([]), speaker, reasoning, transport=transport)
+    checkpoint = {
+        "type": "lesson.checkpoint",
+        "epoch": 1,
+        "scene_id": None,
+        "version": 0,
+        "step": 0,
+        "revision": 0,
+    }
+
+    transport.handlers[0](checkpoint)
+
+    assert loop._lesson.checkpoint == LessonCheckpoint.model_validate(checkpoint)
+    await loop.aclose()
 
 
 async def test_a_ready_report_never_interrupts_the_turn() -> None:
