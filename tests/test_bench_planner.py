@@ -199,7 +199,7 @@ def test_the_report_names_the_model_the_stage_and_the_run_directory(
     out = capsys.readouterr().out
     assert (
         "model=glm-5.3-flash  planner_model=glm-5.3  effort=high  stage=connect  samples=2 "
-        "(plus 3 discarded warm-ups)  planner_max_tokens=64000  subject='PPO'"
+        "(plus 3 discarded warm-ups)  planner_max_tokens=21000  subject='PPO'"
     ) in out
     assert "out=scratch/bench/plans/run" in out
     assert "valid 1/2" in out and "empty 1/2" in out and "prose only 0/2" in out

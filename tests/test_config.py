@@ -98,8 +98,8 @@ def test_filled_template_yields_defaults(tmp_path: Path) -> None:
     assert cfg.scene_timeout_s == 600.0
     assert cfg.planner_model == ""
     assert cfg.planner_effort == "high"
-    assert cfg.planner_max_tokens == 64000
-    assert cfg.planner_timeout_s == 120.0
+    assert cfg.planner_max_tokens == 21000
+    assert cfg.planner_timeout_s == 270.0
     assert cfg.signaling_port == 8080
 
 

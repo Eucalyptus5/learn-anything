@@ -20,8 +20,8 @@ class Settings(BaseSettings):
     scene_timeout_s: float = Field(default=600.0, gt=0)
     planner_model: str = ""
     planner_effort: str = "high"
-    planner_max_tokens: int = Field(default=64000, gt=0)
-    planner_timeout_s: float = Field(default=120.0, gt=0)
+    planner_max_tokens: int = Field(default=21000, gt=0)
+    planner_timeout_s: float = Field(default=270.0, gt=0)
     signaling_port: int = 8080
 
 
