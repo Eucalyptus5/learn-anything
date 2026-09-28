@@ -970,14 +970,15 @@ async def test_a_sync_never_overtakes_a_push_still_waiting_on_the_data_channel()
     attaching = asyncio.create_task(channel.push(LessonAttach(epoch=1)))
     await reach_the_channel_wait()
 
+    sync = LessonSync(epoch=1, barrier=1)
     pc.emit("datachannel", wire)
-    delivered = channel.push_nowait(LessonSync(epoch=1, barrier=1))
+    delivered = channel.push_nowait(sync)
+    fallback = asyncio.create_task(channel.push(sync))
     await attaching
+    await fallback
 
-    assert wire_order(wire) == [("lesson.attach", 1)]
-    assert delivered is False
-    await channel.push(LessonSync(epoch=1, barrier=1))
     assert wire_order(wire) == [("lesson.attach", 1), ("lesson.sync", 2)]
+    assert delivered is False
     await connection.close()
 
 
