@@ -303,6 +303,7 @@ class VisualChannel:
     def __init__(self, connection: Connection) -> None:
         self._connection = connection
         self._seq = 0
+        self._unsent = 0
         self._registry: TurnRegistry | None = None
         self._turn_id = ""
 
@@ -321,10 +322,17 @@ class VisualChannel:
 
         body = payload.model_dump(mode="json")
         self._seq += 1
+        self._unsent += 1
         body["seq"] = self._seq
-        await self._connection.send_json(body)
+        try:
+            await self._connection.send_json(body)
+        finally:
+            self._unsent -= 1
 
     def push_nowait(self, payload: LessonSync) -> bool:
+        # The page drops any seq at or below its last, so a sync never passes one still unsent.
+        if self._unsent:
+            return False
         body = payload.model_dump(mode="json")
         body["seq"] = self._seq + 1
         if not self._connection.send_json_nowait(body):

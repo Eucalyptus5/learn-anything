@@ -5973,6 +5973,64 @@ async def test_a_barge_in_while_a_sync_is_still_owed_waits_for_the_page(
     await loop.aclose()
 
 
+async def test_a_speculation_waits_for_the_page_to_answer_an_owed_sync() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log, syncs=False)
+    gate = asyncio.Event()
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received, gate=gate)
+    restored = asyncio.Event()
+    endpoint = asyncio.Event()
+    source = ScriptedSource(
+        [
+            restored,
+            PartialTranscript(text=CONCEPT_PARTIAL),
+            endpoint,
+            EndOfTurn(text=CONCEPT_TEXT),
+            speaker.finished,
+        ]
+    )
+    loop = TurnLoop(
+        concept_cfg().model_copy(update={"speculative_reasoning": True}),
+        source,
+        FakeSearch(log, found()),
+        speaker,
+        page,
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+        HeldPace(log),
+    )
+    loop._lesson.adopt(LESSON)
+    running = asyncio.create_task(loop.run())
+    await asyncio.wait_for(page.arrival("lesson.attach").wait(), HANG_GUARD_S)
+    page.reply(RESTORE)
+    assert [without_seq(sync) for sync in sent(log, "lesson.sync")] == [
+        {"type": "lesson.sync", "epoch": 1, "barrier": 1}
+    ]
+
+    await pull_past(source, restored)
+    assert ("open_turn", TURN_TASK) not in log
+    assert reasoning.prompts == []
+
+    log.append(("synced", None))
+    page.scene_id, page.step, page.revision = "ratio", 1, 3
+    page.answer_sync()
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+    assert log.index(("open_turn", TURN_TASK)) > log.index(("synced", None))
+
+    await pull_past(source, endpoint)
+    gate.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert [entry for entry in log if entry[0] == "start_turn"] == [("start_turn", CONCEPT_PARTIAL)]
+    assert [entry for entry in log if entry[0] == "open_turn"] == [("open_turn", TURN_TASK)]
+    assert speaker.utterances == [SPOKEN_CLAUSES]
+    assert not loop._lesson.resync
+    await loop.aclose()
+
+
 async def test_a_ready_report_never_interrupts_the_turn() -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)

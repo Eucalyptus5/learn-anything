@@ -5,7 +5,9 @@ from typing import get_args
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from tests.fakes import FakeConnection, grounded_registry, search_result
+from tests.fakes import FakeConnection, grounded_registry, local_peer, search_result
+from tests.test_transport import FakeChannel
+from tutor.transport import Connection
 from tutor.visuals import (
     CLIENT_MESSAGE,
     AckReason,
@@ -948,3 +950,50 @@ def test_push_nowait_sends_a_sync_with_the_next_seq_only_when_it_goes_out() -> N
     assert channel.push_nowait(LessonSync(epoch=1, barrier=3)) is True
     assert [body["seq"] for body in connection.sent] == [1, 2]
     assert [body["barrier"] for body in connection.sent] == [1, 3]
+
+
+def wire_order(wire: FakeChannel) -> list[tuple[str, int]]:
+    return [(body["type"], body["seq"]) for body in map(json.loads, wire.sent)]
+
+
+async def reach_the_channel_wait() -> None:
+    waited = asyncio.Event()
+    asyncio.get_running_loop().call_soon(waited.set)
+    await waited.wait()
+
+
+async def test_a_sync_never_overtakes_a_push_still_waiting_on_the_data_channel() -> None:
+    pc = local_peer()
+    connection = Connection(pc)
+    channel = VisualChannel(connection)
+    wire = FakeChannel()
+    attaching = asyncio.create_task(channel.push(LessonAttach(epoch=1)))
+    await reach_the_channel_wait()
+
+    pc.emit("datachannel", wire)
+    delivered = channel.push_nowait(LessonSync(epoch=1, barrier=1))
+    await attaching
+
+    assert wire_order(wire) == [("lesson.attach", 1)]
+    assert delivered is False
+    await channel.push(LessonSync(epoch=1, barrier=1))
+    assert wire_order(wire) == [("lesson.attach", 1), ("lesson.sync", 2)]
+    await connection.close()
+
+
+async def test_a_push_cancelled_on_the_channel_wait_releases_its_hold_on_the_sync() -> None:
+    pc = local_peer()
+    connection = Connection(pc)
+    channel = VisualChannel(connection)
+    wire = FakeChannel()
+    waiting = asyncio.create_task(channel.push(LessonAttach(epoch=1)))
+    await reach_the_channel_wait()
+
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    pc.emit("datachannel", wire)
+
+    assert channel.push_nowait(LessonSync(epoch=1, barrier=1)) is True
+    assert wire_order(wire) == [("lesson.sync", 2)]
+    await connection.close()
