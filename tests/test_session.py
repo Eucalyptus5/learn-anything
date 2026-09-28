@@ -42,7 +42,7 @@ from tutor.session import (
     TurnLoop,
     TurnLoopConfig,
 )
-from tutor.speech import OnPlay
+from tutor.speech import Chunk, OnPlay
 from tutor.tools.models import (
     GroundingVerdict,
     Position,
@@ -400,6 +400,7 @@ class FakeSpeaker:
         self._gate = gate
         self._hold_at = hold_at
         self.utterances: list[list[str]] = []
+        self.chunks: list[Chunk] = []
         self.openers: list[str] = []
         self.received = asyncio.Event()
         self.held = asyncio.Event()
@@ -409,14 +410,15 @@ class FakeSpeaker:
         self.openers.append(key)
         self._log.append(("speak_opener", key))
 
-    async def speak(self, chunks: AsyncIterator[str], on_play: OnPlay) -> None:
+    async def speak(self, chunks: AsyncIterator[Chunk], on_play: OnPlay) -> None:
         spoken: list[str] = []
         self.utterances.append(spoken)
         try:
             async for chunk in chunks:
-                spoken.append(chunk)
-                self._log.append(("speak", chunk))
-                await on_play(chunk, 0)
+                spoken.append(chunk.text)
+                self._log.append(("speak", chunk.text))
+                self.chunks.append(chunk)
+                await on_play(chunk, 0, 0)
                 self.received.set()
                 if self._gate is not None and len(spoken) >= self._hold_at:
                     self.held.set()
@@ -3583,6 +3585,33 @@ async def test_the_state_carries_the_phase_after_it_moves() -> None:
     await loop.aclose()
 
 
+async def test_chunk_ids_rise_by_one_across_turns() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    search = FakeSearch(log, found())
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    source = SerialSource([CONCEPT_TEXT, "why clip"])
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        search,
+        speaker,
+        LoggingTransport(log),
+        reasoning,
+        FakeRegistry(log),
+    )
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    assert speaker.chunks == [
+        Chunk(1, SPOKEN_CLAUSES[0]),
+        Chunk(2, SPOKEN_CLAUSES[1]),
+        Chunk(3, SPOKEN_CLAUSES[0]),
+        Chunk(4, SPOKEN_CLAUSES[1]),
+    ]
+    await loop.aclose()
+
+
 async def test_every_spoken_clause_is_captioned_once_it_reaches_the_playout() -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
@@ -4890,7 +4919,7 @@ class ExclusiveSpeaker(FakeSpeaker):
         super().__init__(log, gate=gate, hold_at=1)
         self.in_flight = False
 
-    async def speak(self, chunks: AsyncIterator[str], on_play: OnPlay) -> None:
+    async def speak(self, chunks: AsyncIterator[Chunk], on_play: OnPlay) -> None:
         if self.in_flight:
             raise RuntimeError("an utterance is already in flight")
         self.in_flight = True

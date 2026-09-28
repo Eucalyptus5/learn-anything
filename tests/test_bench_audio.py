@@ -8,6 +8,7 @@ import pytest
 
 from tutor.constants import FRAME_SAMPLES, SAMPLE_RATE
 from tutor.endpointer import SILENCE_WINDOW_MS
+from tutor.speech import Chunk
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "bench_audio.py"
 _spec = importlib.util.spec_from_file_location("bench_audio", SCRIPT)
@@ -151,3 +152,8 @@ async def test_the_whole_source_yields_the_text_once() -> None:
     items = [item async for item in bench_audio.whole(text)]
 
     assert items == [text]
+
+
+async def test_numbered_wraps_each_text_in_a_chunk_counting_from_one() -> None:
+    items = [item async for item in bench_audio.numbered(bench_audio.words("The pool takes"))]
+    assert items == [Chunk(1, "The "), Chunk(2, "pool "), Chunk(3, "takes ")]

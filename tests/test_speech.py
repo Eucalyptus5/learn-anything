@@ -8,7 +8,8 @@ import numpy as np
 import pytest
 
 from tests.fakes import FakeSynthesizer, FakeTransport
-from tutor.speech import Speaker
+from tutor.constants import TTS_SAMPLE_RATE
+from tutor.speech import Chunk, Speaker
 
 CHUNKS = ["one", "a longer clause", "two words"]
 TIMING_CHUNKS = ["quorum", "the acquire path", "zebra crossing"]
@@ -126,7 +127,13 @@ class BackloggedTransport(FakeTransport):
         self.backlog_s += 0.5
 
 
-async def no_play(chunk: str, lead_ms: int) -> None:
+class SizedSynthesizer(FakeSynthesizer):
+    def synthesize(self, text: str) -> np.ndarray:
+        super().synthesize(text)
+        return np.zeros(len(text.split()) * TTS_SAMPLE_RATE // 4, dtype=np.int16)
+
+
+async def no_play(chunk: Chunk, lead_ms: int, audio_ms: int) -> None:
     return None
 
 
@@ -137,9 +144,9 @@ def release() -> Iterator[threading.Event]:
     event.set()
 
 
-async def source(chunks: list[str]) -> AsyncIterator[str]:
-    for chunk in chunks:
-        yield chunk
+async def source(chunks: list[str]) -> AsyncIterator[Chunk]:
+    for n, text in enumerate(chunks, start=1):
+        yield Chunk(n, text)
 
 
 async def test_one_array_per_chunk_in_source_order() -> None:
@@ -174,19 +181,52 @@ async def test_on_play_follows_the_enqueue_with_the_backlog_measured_before_it()
     log: list[tuple[str, object]] = []
     speaker = Speaker(FakeSynthesizer(), BackloggedTransport(log))
 
-    async def on_play(chunk: str, lead_ms: int) -> None:
+    async def on_play(chunk: Chunk, lead_ms: int, audio_ms: int) -> None:
         log.append(("on_play", (chunk, lead_ms)))
 
     await speaker.speak(source(CHUNKS), on_play)
 
     assert log == [
         ("play", len(CHUNKS[0])),
-        ("on_play", (CHUNKS[0], 0)),
+        ("on_play", (Chunk(1, CHUNKS[0]), 0)),
         ("play", len(CHUNKS[1])),
-        ("on_play", (CHUNKS[1], 500)),
+        ("on_play", (Chunk(2, CHUNKS[1]), 500)),
         ("play", len(CHUNKS[2])),
-        ("on_play", (CHUNKS[2], 1000)),
+        ("on_play", (Chunk(3, CHUNKS[2]), 1000)),
     ]
+
+
+async def test_on_play_gets_the_chunk_its_lead_and_its_audio_length() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = Speaker(SizedSynthesizer(), BackloggedTransport(log))
+    plays: list[tuple[Chunk, int, int]] = []
+
+    async def on_play(chunk: Chunk, lead_ms: int, audio_ms: int) -> None:
+        plays.append((chunk, lead_ms, audio_ms))
+
+    await speaker.speak(source(CHUNKS), on_play)
+
+    assert plays == [
+        (Chunk(1, "one"), 0, 250),
+        (Chunk(2, "a longer clause"), 500, 750),
+        (Chunk(3, "two words"), 1000, 500),
+    ]
+
+
+async def test_the_speaker_synthesizes_the_text_and_never_renumbers_a_chunk() -> None:
+    synth = FakeSynthesizer()
+    ids: list[int] = []
+
+    async def numbered() -> AsyncIterator[Chunk]:
+        yield Chunk(7, "seven")
+        yield Chunk(9, "nine")
+
+    async def on_play(chunk: Chunk, lead_ms: int, audio_ms: int) -> None:
+        ids.append(chunk.id)
+
+    await Speaker(synth, FakeTransport()).speak(numbered(), on_play)
+
+    assert synth.calls == ["seven", "nine"] and ids == [7, 9]
 
 
 async def test_a_cancelled_utterance_calls_on_play_for_nothing_after_the_cancel(
@@ -197,9 +237,9 @@ async def test_a_cancelled_utterance_calls_on_play_for_nothing_after_the_cancel(
     finished = asyncio.Event()
     synth = SignallingSynthesizer(release, started, finished, loop)
     speaker = Speaker(synth, FakeTransport())
-    plays: list[tuple[str, int]] = []
+    plays: list[tuple[Chunk, int]] = []
 
-    async def on_play(chunk: str, lead_ms: int) -> None:
+    async def on_play(chunk: Chunk, lead_ms: int, audio_ms: int) -> None:
         plays.append((chunk, lead_ms))
 
     utterance = asyncio.create_task(speaker.speak(source(CHUNKS), on_play))
@@ -219,15 +259,15 @@ async def test_on_play_stops_with_the_utterance_when_the_cancel_comes_between_ch
     waiting = asyncio.Event()
     gate = asyncio.Event()
 
-    async def gated() -> AsyncIterator[str]:
-        yield CHUNKS[0]
+    async def gated() -> AsyncIterator[Chunk]:
+        yield Chunk(1, CHUNKS[0])
         waiting.set()
         await gate.wait()
-        yield CHUNKS[1]
+        yield Chunk(2, CHUNKS[1])
 
-    plays: list[tuple[str, int]] = []
+    plays: list[tuple[Chunk, int]] = []
 
-    async def on_play(chunk: str, lead_ms: int) -> None:
+    async def on_play(chunk: Chunk, lead_ms: int, audio_ms: int) -> None:
         plays.append((chunk, lead_ms))
 
     speaker = Speaker(FakeSynthesizer(), FakeTransport())
@@ -239,7 +279,7 @@ async def test_on_play_stops_with_the_utterance_when_the_cancel_comes_between_ch
         await utterance
 
     gate.set()
-    assert plays == [(CHUNKS[0], 0)]
+    assert plays == [(Chunk(1, CHUNKS[0]), 0)]
 
 
 async def test_speak_returns_when_the_source_is_exhausted() -> None:
@@ -371,11 +411,11 @@ async def test_cancel_while_suspended_on_the_source_stops_the_utterance() -> Non
     waiting = asyncio.Event()
     gate = asyncio.Event()
 
-    async def gated() -> AsyncIterator[str]:
-        yield CHUNKS[0]
+    async def gated() -> AsyncIterator[Chunk]:
+        yield Chunk(1, CHUNKS[0])
         waiting.set()
         await gate.wait()
-        yield CHUNKS[1]
+        yield Chunk(2, CHUNKS[1])
 
     synth = FakeSynthesizer()
     transport = FakeTransport()
@@ -519,13 +559,13 @@ async def test_a_cut_utterance_unwinding_late_leaves_the_replacement_in_place() 
     replacement_parked = asyncio.Event()
     replacement_gate = asyncio.Event()
 
-    async def parking() -> AsyncIterator[str]:
-        yield CHUNKS[0]
+    async def parking() -> AsyncIterator[Chunk]:
+        yield Chunk(1, CHUNKS[0])
         parked.set()
         await gate.wait()
 
-    async def replacement() -> AsyncIterator[str]:
-        yield CHUNKS[1]
+    async def replacement() -> AsyncIterator[Chunk]:
+        yield Chunk(2, CHUNKS[1])
         replacement_parked.set()
         await replacement_gate.wait()
 

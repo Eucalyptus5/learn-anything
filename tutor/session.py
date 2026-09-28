@@ -22,7 +22,7 @@ from tutor.prompt import (
 )
 from tutor.reasoning import ReasoningClient, TurnChunk
 from tutor.scene import run_scene_build, scene_prompt
-from tutor.speech import OnPlay, Speaker
+from tutor.speech import Chunk, OnPlay, Speaker
 from tutor.tools.models import SearchBudget, SearchResult
 from tutor.tools.provenance import TurnRegistry
 from tutor.transcript import Transcript
@@ -210,6 +210,7 @@ class TurnLoop:
         self._tails: dict[str, str] = {}
         self._ready: dict[str, asyncio.Future[SceneReady]] = {}
         self._landed_turn = 0
+        self._chunk_id = 0
         self._theme = "light"
         self._dispatched = 0
         transport.on_json(self._on_json)
@@ -395,8 +396,8 @@ class TurnLoop:
         return TurnState(state=state, phase=str(self._pedagogy.phase), interrupted=interrupted)
 
     def _caption(self, turn_id: str) -> OnPlay:
-        async def on_play(text: str, lead_ms: int) -> None:
-            await self._visuals.push(Caption(turn_id=turn_id, text=text, lead_ms=lead_ms))
+        async def on_play(chunk: Chunk, lead_ms: int, audio_ms: int) -> None:
+            await self._visuals.push(Caption(turn_id=turn_id, text=chunk.text, lead_ms=lead_ms))
 
         return on_play
 
@@ -478,7 +479,7 @@ class TurnLoop:
 
     async def _utterance(
         self, turn_id: str, prompt: TurnPrompt, queue: asyncio.Queue[str | None] | None
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[Chunk]:
         if queue is None:
             queue = asyncio.Queue(SPOKEN_DEPTH)
             tools = TURN_TOOLS if self._cfg.root is not None else []
@@ -501,7 +502,8 @@ class TurnLoop:
                 await self._visuals.push(self._state("speaking"))
                 first = False
             self._transcript.tutor(turn_id, text)
-            yield text
+            self._chunk_id += 1
+            yield Chunk(self._chunk_id, text)
 
     def _ground(self, turn_id: str, result: SearchResult) -> None:
         staging = self._staging.get(turn_id)

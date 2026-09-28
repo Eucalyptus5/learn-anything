@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 
 from tutor.constants import TTS_SAMPLE_RATE, WEBRTC_FRAME_SAMPLES, WEBRTC_SAMPLE_RATE
+from tutor.speech import Chunk
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "bench_caption.py"
 _spec = importlib.util.spec_from_file_location("bench_caption", SCRIPT)
@@ -55,7 +56,7 @@ async def test_the_source_holds_a_clause_until_the_backlog_is_under_its_length()
 
     assert log == [
         ("backlog", 0.0),
-        ("clause", "clause 0"),
+        ("clause", Chunk(1, "clause 0")),
         ("backlog", lengths_s[0]),
         ("wait", bench_caption.FRAME_S),
         ("backlog", lengths_s[1] + 0.02),
@@ -63,7 +64,7 @@ async def test_the_source_holds_a_clause_until_the_backlog_is_under_its_length()
         ("backlog", lengths_s[1]),
         ("wait", bench_caption.FRAME_S),
         ("backlog", lengths_s[1] - 0.02),
-        ("clause", "clause 1"),
+        ("clause", Chunk(2, "clause 1")),
     ]
     assert len(pulled) == 2
 

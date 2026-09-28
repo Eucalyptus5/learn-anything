@@ -24,7 +24,7 @@ sys.path.insert(0, str(REPO))
 from scripts.bench_llm import summarize
 from tutor.constants import TTS_SAMPLE_RATE, WEBRTC_FRAME_SAMPLES, WEBRTC_SAMPLE_RATE
 from tutor.playout import PlayoutTrack
-from tutor.speech import Speaker
+from tutor.speech import Chunk, Speaker
 
 SAMPLES = 30
 CLAUSE_MS = (1200, 800, 1600, 2400, 900)
@@ -98,12 +98,12 @@ async def clauses(
     pulled: list[float],
     backlog_s: Callable[[], float],
     pace: Callable[[float], Awaitable[None]] = asyncio.sleep,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[Chunk]:
     for k in range(n):
         while backlog_s() >= CLAUSE_MS[k % len(CLAUSE_MS)] / 1000:
             await pace(FRAME_S)
         pulled.append(time.perf_counter())
-        yield f"clause {k}"
+        yield Chunk(k + 1, f"clause {k}")
 
 
 def attribute(
@@ -136,7 +136,7 @@ async def run(n: int) -> list[ClauseSample]:
     leads: list[int] = []
     frames: list[float] = []
 
-    async def on_play(text: str, lead_ms: int) -> None:
+    async def on_play(chunk: Chunk, lead_ms: int, audio_ms: int) -> None:
         leads.append(lead_ms)
 
     puller = asyncio.create_task(pull(track, transport.first, frames))

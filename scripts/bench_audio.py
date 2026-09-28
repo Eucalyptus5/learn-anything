@@ -18,7 +18,7 @@ import subprocess
 import sys
 import time
 import wave
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -33,6 +33,7 @@ from tutor.constants import FRAME_MS, FRAME_SAMPLES, SAMPLE_RATE, TTS_SAMPLE_RAT
 if TYPE_CHECKING:
     from faster_whisper import WhisperModel
 
+    from tutor.speech import Chunk
     from tutor.stt import Transcriber
     from tutor.tts import KokoroSynthesizer
     from tutor.vad import SileroVad
@@ -576,7 +577,7 @@ class StampingTransport:
         self.lengths.clear()
 
 
-async def no_play(chunk: str, lead_ms: int) -> None:
+async def no_play(chunk: "Chunk", lead_ms: int, audio_ms: int) -> None:
     return None
 
 
@@ -607,6 +608,15 @@ async def words(text: str) -> AsyncGenerator[str, None]:
 
 async def whole(text: str) -> AsyncGenerator[str, None]:
     yield text
+
+
+async def numbered(texts: AsyncIterator[str]) -> AsyncIterator["Chunk"]:
+    from tutor.speech import Chunk
+
+    n = 0
+    async for text in texts:
+        n += 1
+        yield Chunk(n, text)
 
 
 def playout_gaps(stamps: list[float], durations: list[float]) -> list[float]:
@@ -656,7 +666,7 @@ async def bench_chunked(samples: int) -> None:
         transport.reset()
         mark = len(synth.spans)
         t = time.perf_counter()
-        await speaker.speak(clause_chunks(words(TURN_TEXT)), no_play)
+        await speaker.speak(numbered(clause_chunks(words(TURN_TEXT))), no_play)
         elapsed = time.perf_counter() - t
         spans = synth.spans[mark:]
         durations = [s.audio for s in spans]
@@ -682,7 +692,7 @@ async def bench_chunked(samples: int) -> None:
     for index in range(samples + 1):
         transport.reset()
         t = time.perf_counter()
-        await speaker.speak(whole(TURN_TEXT), no_play)
+        await speaker.speak(numbered(whole(TURN_TEXT)), no_play)
         if index >= 1:
             whole_first.append(transport.stamps[0] - t)
         print(f"  whole turn {index + 1}/{samples + 1}", end="\r", file=sys.stderr)
@@ -718,12 +728,12 @@ async def bench_cancel(samples: int) -> None:
         transport.reset()
         mark = len(synth.spans)
         speak_at = time.perf_counter()
-        task = asyncio.create_task(speaker.speak(whole(ABANDONED_TEXT), no_play))
+        task = asyncio.create_task(speaker.speak(numbered(whole(ABANDONED_TEXT)), no_play))
         await asyncio.sleep(CANCEL_AFTER_S)
         cancel_at = time.perf_counter()
         await speaker.cancel()
         returned = time.perf_counter() - cancel_at
-        await speaker.speak(whole(REPLACEMENT_TEXT), no_play)
+        await speaker.speak(numbered(whole(REPLACEMENT_TEXT)), no_play)
         spans = list(synth.spans[mark:])
         replacement = next(s for s in spans if s.words == replacement_words)
         still_running = in_flight_at(
@@ -747,7 +757,7 @@ async def bench_cancel(samples: int) -> None:
     for index in range(samples + 1):
         transport.reset()
         mark = len(synth.spans)
-        await speaker.speak(whole(REPLACEMENT_TEXT), no_play)
+        await speaker.speak(numbered(whole(REPLACEMENT_TEXT)), no_play)
         if index >= 1:
             alone.append(synth.spans[mark].elapsed)
         print(f"  baseline {index + 1}/{samples + 1}", end="\r", file=sys.stderr)

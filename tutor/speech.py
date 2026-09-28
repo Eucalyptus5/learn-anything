@@ -3,6 +3,7 @@ import contextlib
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import NamedTuple
 
 from tutor.constants import TTS_SAMPLE_RATE
 from tutor.transport import Connection
@@ -10,7 +11,13 @@ from tutor.tts import KokoroSynthesizer
 
 logger = logging.getLogger(__name__)
 
-OnPlay = Callable[[str, int], Awaitable[None]]
+
+class Chunk(NamedTuple):
+    id: int
+    text: str
+
+
+OnPlay = Callable[[Chunk, int, int], Awaitable[None]]
 
 
 def _elapsed_ms(start: float) -> int:
@@ -23,17 +30,18 @@ class Speaker:
         self._transport = transport
         self._utterance: asyncio.Task[None] | None = None
 
-    async def _drain(self, chunks: AsyncIterator[str], on_play: OnPlay) -> None:
+    async def _drain(self, chunks: AsyncIterator[Chunk], on_play: OnPlay) -> None:
         start = time.perf_counter()
         first = True
         async for chunk in chunks:
             chunk_start = time.perf_counter()
-            audio = await asyncio.to_thread(self._synth.synthesize, chunk)
-            words = len(chunk.split())
+            audio = await asyncio.to_thread(self._synth.synthesize, chunk.text)
+            audio_ms = len(audio) * 1000 // TTS_SAMPLE_RATE
+            words = len(chunk.text.split())
             logger.debug(
                 "tts.synthesize words=%d audio_ms=%d ms=%d",
                 words,
-                len(audio) * 1000 // TTS_SAMPLE_RATE,
+                audio_ms,
                 _elapsed_ms(chunk_start),
             )
             backlog = self._transport.playout_backlog_s()
@@ -41,9 +49,9 @@ class Speaker:
             if first:
                 logger.debug("tts.first_audio words=%d ms=%d", words, _elapsed_ms(start))
                 first = False
-            await on_play(chunk, int(backlog * 1000))
+            await on_play(chunk, int(backlog * 1000), audio_ms)
 
-    async def speak(self, chunks: AsyncIterator[str], on_play: OnPlay) -> None:
+    async def speak(self, chunks: AsyncIterator[Chunk], on_play: OnPlay) -> None:
         if self._utterance is not None and not self._utterance.done():
             raise RuntimeError("an utterance is already in flight")
         utterance = asyncio.create_task(self._drain(chunks, on_play))
