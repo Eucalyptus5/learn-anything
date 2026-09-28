@@ -98,14 +98,20 @@ def test_a_custom_voice_names_the_style_table(monkeypatch: pytest.MonkeyPatch) -
     synth, fake = build(monkeypatch, voice="am_adam")
 
     out = synth.synthesize("hello")
+    synth.synthesize("again")
 
     assert fake.styles == ["am_adam"]
-    [(text, kwargs)] = fake.calls
-    assert text == "hello"
-    assert kwargs["voice"].shape == (1, 1, 256)
-    np.testing.assert_array_equal(kwargs["voice"], np.full((1, 1, 256), 190, dtype=np.float32))
-    assert len(out) == 4 + 6000
-    assert not out[4:].any()
+    assert [text for text, _ in fake.calls] == ["hello", "again"]
+    row_190 = np.full((1, 1, 256), 190, dtype=np.float32)
+    for _, kwargs in fake.calls:
+        assert kwargs["voice"].shape == (1, 1, 256)
+        np.testing.assert_array_equal(kwargs["voice"], row_190)
+    np.testing.assert_array_equal(fake.calls[0][1]["voice"], fake.calls[1][1]["voice"])
+    expected = np.concatenate(
+        [np.array([-32767, 0, 32767, 16383], dtype=np.int16), np.zeros(6000, dtype=np.int16)]
+    )
+    np.testing.assert_array_equal(out, expected)
+    assert out.dtype == np.int16
 
 
 def test_wrong_sample_rate_raises(monkeypatch: pytest.MonkeyPatch) -> None:

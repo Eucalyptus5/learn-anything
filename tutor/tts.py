@@ -5,7 +5,7 @@ from kokoro_onnx import Kokoro
 
 from tutor.constants import TTS_SAMPLE_RATE
 
-# median token count of the 20 listening replies; one fixed style by owner ruling 2026-09-27
+# median whole-reply token count of 20 listening replies; one fixed style, owner ruling 2026-09-27
 FIXED_STYLE_TOKENS = 191
 SENTENCE_GAP_S = 0.25
 

@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 
 _SENTENCE_ENDS = (".", "?", "!")
 _CLOSERS = "\"')]"
+_OPENERS = "\"'(["
 _CLAUSE_ENDS = ",;:"
 _ABBREVIATIONS = ("e.g.", "i.e.", "etc.", "vs.", "Dr.")
 _WORD = re.compile(r"\S+")
@@ -31,7 +32,7 @@ def split_clauses(text: str, max_words: int) -> tuple[list[str], str]:
             continue
         word = match.group()
         core = word.rstrip(_CLOSERS)
-        if core.endswith(_SENTENCE_ENDS) and core not in _ABBREVIATIONS:
+        if core.endswith(_SENTENCE_ENDS) and core.lstrip(_OPENERS) not in _ABBREVIATIONS:
             clauses.append(text[start:word_end].strip())
             start = word_end + 1
             ends = []

@@ -112,6 +112,12 @@ def test_does_not_split_inside_vs_abbreviation() -> None:
     assert remainder == ""
 
 
+@pytest.mark.parametrize("wrapped", ["(e.g.)", '"etc."', "[vs.]", "'i.e.'", '("Dr.")'])
+def test_an_abbreviation_inside_brackets_or_quotes_ends_no_sentence(wrapped: str) -> None:
+    text = f"Use a list {wrapped} for this and go. "
+    assert split_clauses(text, max_words=40) == ([text.strip()], "")
+
+
 def test_does_not_split_inside_dr_abbreviation() -> None:
     text = "Dr. Smith wrote the original paper on this. "
     clauses, remainder = split_clauses(text, max_words=40)
