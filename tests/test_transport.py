@@ -101,6 +101,7 @@ class FakeChannel:
     def __init__(self) -> None:
         self.sent: list[str] = []
         self.deliver: Callable[[str], None]
+        self.readyState = "open"
 
     def on(self, event: str) -> Callable[[Callable[[str], None]], Callable[[str], None]]:
         def register(handler: Callable[[str], None]) -> Callable[[str], None]:
@@ -176,6 +177,21 @@ async def test_send_json_waits_for_the_channel_to_arrive() -> None:
     await sending
 
     assert [json.loads(message) for message in channel.sent] == [PAYLOAD]
+    await connection.close()
+
+
+async def test_send_json_nowait_sends_at_once_only_while_the_data_channel_is_open() -> None:
+    pc = local_peer()
+    connection = Connection(pc)
+    channel = FakeChannel()
+
+    assert connection.send_json_nowait(PAYLOAD) is False
+    pc.emit("datachannel", channel)
+    assert connection.send_json_nowait(PAYLOAD) is True
+    assert [json.loads(message) for message in channel.sent] == [PAYLOAD]
+    channel.readyState = "closed"
+    assert connection.send_json_nowait(PAYLOAD) is False
+    assert len(channel.sent) == 1
     await connection.close()
 
 

@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -34,7 +34,9 @@ from tutor.visuals import (
     Caption,
     LearnerText,
     LessonAck,
+    LessonAttach,
     LessonCheckpoint,
+    LessonSync,
     LessonSynced,
     ScenePush,
     SceneReady,
@@ -58,6 +60,7 @@ BAD_ARGUMENTS = "search_code takes a query string and a non-empty list of glob s
 OUTCOME_MARKER = "<outcome>"
 TAIL_LIMIT = 600
 NO_REPORT = "the page sent no report"
+LESSON_SYNC_TIMEOUT_S = 5.0  # a control bound on the page's answer, not a measured latency
 OUTCOME_INSTRUCTION = (
     f"End every reply with a line holding exactly {OUTCOME_MARKER} followed by one JSON object "
     'with "signal" (one of covered, follow_up, correct, misconception, told, or null), '
@@ -219,6 +222,12 @@ class TurnLoop:
         self._dispatched = 0
         self._lesson = LessonState()
         self._epoch = 1
+        self._barrier = 0
+        self._pending_barrier: int | None = None
+        self._settled = asyncio.Event()
+        self._settled.set()
+        self._sync_wait: asyncio.Task[None] | None = None
+        self._background: set[asyncio.Task[None]] = set()
         transport.on_json(self._on_json)
 
     def _on_json(self, payload: dict[str, object]) -> None:
@@ -264,17 +273,38 @@ class TurnLoop:
         logger.info(
             "lesson.ack cue_id=%d outcome=%s reason=%s", ack.cue_id, ack.outcome, ack.reason
         )
+        if ack.outcome == "failed":
+            self._resync("failed")
 
     def _on_synced(self, message: LessonSynced) -> None:
-        logger.info("lesson.synced_ignored epoch=%d barrier=%d", message.epoch, message.barrier)
+        if message.epoch != self._epoch or message.barrier != self._pending_barrier:
+            logger.info("lesson.synced_ignored epoch=%d barrier=%d", message.epoch, message.barrier)
+            return
+        self._pending_barrier = None
+        self._lesson.synced(message)
+        self._settled.set()
+        if self._sync_wait is not None:
+            self._sync_wait.cancel()
+            self._sync_wait = None
+        logger.info(
+            "lesson.synced epoch=%d barrier=%d scene_id=%s step=%d revision=%d last_cue=%d",
+            message.epoch,
+            message.barrier,
+            message.scene_id,
+            message.step,
+            message.revision,
+            message.last_cue,
+        )
 
     def _on_checkpoint(self, message: LessonCheckpoint) -> None:
         if message.epoch != self._epoch:
             logger.info("lesson.checkpoint_ignored epoch=%d", message.epoch)
             return
         self._lesson.retain(message)
+        self._resync("restore")
 
     async def run(self) -> None:
+        self._keep(self._visuals.push(LessonAttach(epoch=self._epoch)), "lesson-attach")
         async for event in self._source.events():
             if isinstance(event, SpeechStarted):
                 self._interrupt()
@@ -324,7 +354,44 @@ class TurnLoop:
                 "turn.speculation_failed turn_id=%s error=%s", turn_id, type(error).__name__
             )
 
+    def _keep(self, work: Coroutine[Any, Any, None], name: str) -> None:
+        task = asyncio.create_task(work, name=name)
+        self._background.add(task)
+        task.add_done_callback(self._kept)
+
+    def _kept(self, task: asyncio.Task[None]) -> None:
+        self._background.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning(
+                "lesson.send_failed task=%s error=%s",
+                task.get_name(),
+                type(task.exception()).__name__,
+            )
+
+    def _sync(self, reason: str) -> None:
+        self._barrier += 1
+        sync = LessonSync(epoch=self._epoch, barrier=self._barrier)
+        if not self._visuals.push_nowait(sync):
+            self._keep(self._visuals.push(sync), "lesson-sync")
+        waiting = (
+            bool(self._lesson.sent) or self._lesson.resync or self._pending_barrier is not None
+        )
+        if waiting:
+            self._arm(self._barrier)
+        logger.info(
+            "lesson.sync epoch=%d barrier=%d waiting=%s reason=%s",
+            self._epoch,
+            self._barrier,
+            waiting,
+            reason,
+        )
+
+    def _resync(self, reason: str) -> None:
+        if self._lesson.resync and self._pending_barrier is None:
+            self._sync(reason)
+
     def _interrupt(self) -> None:
+        self._sync("barge_in")
         for speculation in self._speculations.values():
             if not speculation.task.cancelling():
                 speculation.task.cancel()
@@ -340,6 +407,22 @@ class TurnLoop:
             turn.cancel()
         # Playout outlives the turn task, so what is queued drops even with no turn in flight.
         self._transport.flush_playout()
+
+    def _arm(self, barrier: int) -> None:
+        self._pending_barrier = barrier
+        self._settled.clear()
+        if self._sync_wait is not None:
+            self._sync_wait.cancel()
+        self._sync_wait = asyncio.create_task(self._sync_bound(barrier), name="lesson-sync-bound")
+
+    async def _sync_bound(self, barrier: int) -> None:
+        await self._pace(LESSON_SYNC_TIMEOUT_S)
+        if self._pending_barrier != barrier:
+            return
+        self._pending_barrier = None
+        self._lesson.forget()
+        self._settled.set()
+        logger.warning("lesson.sync_timeout epoch=%d barrier=%d", self._epoch, barrier)
 
     def _turn_done(self, turn: asyncio.Task[None]) -> None:
         self._turns.discard(turn)
@@ -362,12 +445,19 @@ class TurnLoop:
             if not task.cancelling():
                 task.cancel()
         await asyncio.gather(*visuals, return_exceptions=True)
+        background = list(self._background)
+        if self._sync_wait is not None:
+            background.append(self._sync_wait)
+        for task in background:
+            task.cancel()
+        await asyncio.gather(*background, return_exceptions=True)
 
     async def _speculate(
         self, turn_id: str, speculation: Speculation, previous: asyncio.Task[TurnOutcome] | None
     ) -> TurnOutcome:
         if previous is not None:
             await asyncio.gather(previous, return_exceptions=True)
+        await self._settled.wait()
         start = self._clock()
         self._registry.open_turn(turn_id)
         try:
@@ -441,6 +531,7 @@ class TurnLoop:
         start = self._clock()
         self._transcript.learner(turn_id, user_text)
         await self._visuals.push(LearnerText(turn_id=turn_id, text=user_text))
+        await self._settled.wait()
         grounded = await self._claim(turn_id, user_text)
         self._visuals.set_grounding(self._registry, turn_id)
         await self._visuals.push(self._state("thinking"))

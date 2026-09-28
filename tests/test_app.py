@@ -216,11 +216,12 @@ async def test_build_loop_runs_a_concept_turn_from_the_session_request(tmp_path:
     assert prompt.user_text == USER_TEXT
     assert len(transport.played) == len(models.synth.calls) > 0
     assert [len(pcm) for pcm in transport.played] == [len(text) for text in models.synth.calls]
-    assert transport.sent[0] == {
+    assert transport.sent[0] == {"type": "lesson.attach", "epoch": 1, "seq": 1}
+    assert transport.sent[1] == {
         "type": "transcript",
         "turn_id": "turn-1",
         "text": USER_TEXT,
-        "seq": 1,
+        "seq": 2,
     }
 
 

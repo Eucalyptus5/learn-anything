@@ -27,6 +27,7 @@ from tutor.input_path import (
     SpeechStarted,
 )
 from tutor.lead_in import lead_in_sentence, lead_in_stages
+from tutor.lesson import Cursor, LessonPlan, Scene, Step
 from tutor.pedagogy import PedagogyState, Phase, TurnOutcome
 from tutor.prompt import SEARCH_CODE_TOOL, Message, TurnPrompt
 from tutor.reasoning import TurnChunk
@@ -34,6 +35,7 @@ from tutor.scene import SCENE_TOOLS
 from tutor.session import (
     BAD_ARGUMENTS,
     CONCEPT_OUTCOME_INSTRUCTION,
+    LESSON_SYNC_TIMEOUT_S,
     OUTCOME_INSTRUCTION,
     OUTCOME_MARKER,
     SPOKEN_DEPTH,
@@ -453,6 +455,10 @@ class LoggingTransport:
 
     async def send_json(self, payload: dict[str, object]) -> None:
         self._log.append(("send_json", payload))
+
+    def send_json_nowait(self, payload: dict[str, object]) -> bool:
+        self._log.append(("send_json", payload))
+        return True
 
     def on_json(self, handler: Callable[[dict[str, object]], None]) -> None:
         self.handlers.append(handler)
@@ -1395,6 +1401,8 @@ async def test_speech_start_mid_synthesis_cancels_flushes_and_takes_the_next_tur
     assert drain.cancelled()
     assert reasoning.streams[0].cancels == 0
     steps = [name for name, _ in log]
+    (sync,) = sent(log, "lesson.sync")
+    assert log.index(("send_json", sync)) < steps.index("flush_playout")
     assert (
         steps.index("barge")
         < steps.index("flush_playout")
@@ -2607,6 +2615,7 @@ async def test_partials_are_ignored_with_speculation_off(tmp_path: Path) -> None
     running = asyncio.create_task(loop.run())
 
     await asyncio.wait_for(source.blocked.wait(), HANG_GUARD_S)
+    log.remove(("send_json", {"type": "lesson.attach", "epoch": 1, "seq": 1}))
     assert search.calls == []
     assert reasoning.prompts == []
     assert log == []
@@ -3658,7 +3667,7 @@ async def test_the_learner_text_reaches_the_channel_before_the_call() -> None:
 
     await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
-    transcript = {"type": "transcript", "turn_id": "turn-1", "text": CONCEPT_TEXT, "seq": 1}
+    transcript = {"type": "transcript", "turn_id": "turn-1", "text": CONCEPT_TEXT, "seq": 2}
     assert sent(log, "transcript") == [transcript]
     assert log.index(("send_json", transcript)) < log.index(("start_turn", CONCEPT_TEXT))
     await loop.aclose()
@@ -5453,6 +5462,514 @@ async def test_a_checkpoint_from_the_attached_page_is_retained() -> None:
     transport.handlers[0](checkpoint)
 
     assert loop._lesson.checkpoint == LessonCheckpoint.model_validate(checkpoint)
+    await loop.aclose()
+
+
+LESSON = LessonPlan(
+    profile="Knows policy gradients; new to clipping.",
+    scenes=[
+        Scene(
+            id="ratio",
+            title="The ratio",
+            show="The probability ratio between the new and the old policy",
+            steps=[
+                Step(show="The old and the new policy over three actions"),
+                Step(show="Their ratio at one action", ask="What is the ratio where they agree?"),
+                Step(show="The ratio across all three actions"),
+            ],
+        ),
+        Scene(
+            id="clip",
+            title="The clip",
+            show="The clipped surrogate against the ratio, epsilon 0.2",
+            steps=[
+                Step(show="The ratio axis from 0.5 to 2.0"),
+                Step(show="The clip band at 0.8 and 1.2"),
+                Step(show="The flat regions outside the band"),
+            ],
+        ),
+        Scene(
+            id="epochs",
+            title="Several epochs",
+            show="Four epochs of updates on one batch",
+            steps=[
+                Step(show="One batch of samples"),
+                Step(show="The ratio after each epoch"),
+                Step(show="The ratio held inside the band"),
+            ],
+        ),
+    ],
+)
+RESTORE = {
+    "type": "lesson.checkpoint",
+    "epoch": 1,
+    "scene_id": "ratio",
+    "version": 0,
+    "step": 1,
+    "revision": 3,
+}
+
+
+class FakePage(LoggingTransport):
+    def __init__(self, log: list[tuple[str, object]], syncs: bool = True) -> None:
+        super().__init__(log)
+        self.syncs = syncs
+        self.held: dict[int, dict[str, object]] = {}
+        self.scene_id: str | None = None
+        self.step = 0
+        self.revision = 0
+        self.last_cue = 0
+        self.syncs_seen: list[dict[str, object]] = []
+        self.arrived: dict[str, asyncio.Event] = {}
+
+    def send_json_nowait(self, payload: dict[str, object]) -> bool:
+        self._log.append(("send_json", payload))
+        self._receive(payload)
+        return True
+
+    async def send_json(self, payload: dict[str, object]) -> None:
+        self._log.append(("send_json", payload))
+        self._receive(payload)
+
+    def arrival(self, kind: str) -> asyncio.Event:
+        return self.arrived.setdefault(kind, asyncio.Event())
+
+    def _receive(self, payload: dict[str, object]) -> None:
+        kind = str(payload["type"])
+        if kind == "lesson.cue":
+            self.held[int(payload["cue_id"])] = payload
+        elif kind == "lesson.sync":
+            self.syncs_seen.append(payload)
+            if self.syncs:
+                asyncio.get_running_loop().call_soon(self.answer_sync)
+        self.arrival(kind).set()
+
+    def reply(self, message: dict[str, object]) -> None:
+        for handler in self.handlers:
+            handler(message)
+
+    def _ack(self, cue: dict[str, object], outcome: str, reason: str | None) -> None:
+        self.reply(
+            {
+                "type": "lesson.ack",
+                "epoch": cue["epoch"],
+                "barrier": cue["barrier"],
+                "cue_id": cue["cue_id"],
+                "outcome": outcome,
+                "reason": reason,
+                "scene_id": self.scene_id,
+                "step": self.step,
+                "revision": self.revision,
+            }
+        )
+
+    def answer_sync(self) -> None:
+        sync = self.syncs_seen[-1]
+        for cue_id in sorted(self.held):
+            self._ack(self.held.pop(cue_id), "dropped", "barrier")
+        self.reply(
+            {
+                "type": "lesson.synced",
+                "epoch": sync["epoch"],
+                "barrier": sync["barrier"],
+                "scene_id": self.scene_id,
+                "step": self.step,
+                "revision": self.revision,
+                "last_cue": self.last_cue,
+            }
+        )
+
+
+def page_ack(
+    cue_id: int,
+    outcome: str,
+    reason: str | None,
+    scene_id: str | None,
+    step: int,
+    revision: int,
+    barrier: int = 0,
+) -> dict[str, object]:
+    return {
+        "type": "lesson.ack",
+        "epoch": 1,
+        "barrier": barrier,
+        "cue_id": cue_id,
+        "outcome": outcome,
+        "reason": reason,
+        "scene_id": scene_id,
+        "step": step,
+        "revision": revision,
+    }
+
+
+async def test_the_page_is_attached_before_anything_else_is_sent() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    loop = concept_loop(
+        log, SerialSource([CONCEPT_TEXT]), speaker, reasoning, transport=LoggingTransport(log)
+    )
+
+    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+
+    first = next(payload for name, payload in log if name == "send_json")
+    assert first == {"type": "lesson.attach", "epoch": 1, "seq": 1}
+    assert sent(log, "lesson.attach") == [first]
+    await loop.aclose()
+
+
+async def test_a_barge_in_with_a_cue_unacknowledged_syncs_first_and_the_next_turn_waits(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold, hold_at=1)
+    page = FakePage(log, syncs=False)
+    gate = asyncio.Event()
+    turns = [spoken_chunks(SPOKEN_DELTAS), spoken_chunks(["Back to the ratio then."])]
+    reasoning = FakeReasoning(log, [], speaker.received, gate=gate, holds_at=3, turns=turns)
+    barge = asyncio.Event()
+    resume = asyncio.Event()
+    source = ScriptedSource(
+        [EndOfTurn(text=CONCEPT_TEXT), barge, SpeechStarted(), resume, EndOfTurn(text=SECOND_TEXT)]
+    )
+    pace = HeldPace(log)
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        FakeSearch(log, found()),
+        speaker,
+        page,
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+        pace,
+    )
+    loop._lesson.adopt(LESSON)
+    assert loop._lesson.scene_tag(1) is None
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(speaker.held.wait(), HANG_GUARD_S)
+    turn = turn_task()
+
+    log.append(("barge", None))
+    await pull_past(source, barge)
+    gate.set()
+    hold.set()
+    await asyncio.wait_for(asyncio.wait([turn]), HANG_GUARD_S)
+
+    assert turn.cancelled()
+    (sync,) = sent(log, "lesson.sync")
+    assert without_seq(sync) == {"type": "lesson.sync", "epoch": 1, "barrier": 1}
+    steps = [name for name, _ in log]
+    assert (
+        steps.index("barge")
+        < log.index(("send_json", sync))
+        < steps.index("flush_playout")
+        < steps.index("stream_closed")
+        < steps.index("speak_cancelled")
+    )
+    await asyncio.wait_for(pace.held.wait(), HANG_GUARD_S)
+    assert pace.waits == [LESSON_SYNC_TIMEOUT_S]
+
+    page.arrival("transcript").clear()
+    resume.set()
+    await asyncio.wait_for(page.arrival("transcript").wait(), HANG_GUARD_S)
+    assert ("start_turn", SECOND_TEXT) not in log
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        page.answer_sync()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert log.index(("start_turn", SECOND_TEXT)) > log.index(("send_json", sync))
+    assert speaker.utterances[1] == ["Back to the ratio then."]
+    assert loop._lesson.sent == []
+    assert loop._lesson.acked == Cursor(scene=0, step=0)
+    messages = session_messages(caplog)
+    assert "lesson.synced epoch=1 barrier=1 scene_id=None step=0 revision=0 last_cue=0" in messages
+    assert not any(message.startswith("lesson.sync_timeout") for message in messages)
+    await loop.aclose()
+
+
+async def test_a_page_that_never_syncs_releases_the_next_turn_at_the_bound(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold, hold_at=1)
+    page = FakePage(log, syncs=False)
+    turns = [spoken_chunks(SPOKEN_DELTAS), spoken_chunks(["Back to the ratio then."])]
+    reasoning = FakeReasoning(log, [], speaker.received, turns=turns)
+    barge = asyncio.Event()
+    resume = asyncio.Event()
+    source = ScriptedSource(
+        [EndOfTurn(text=CONCEPT_TEXT), barge, SpeechStarted(), resume, EndOfTurn(text=SECOND_TEXT)]
+    )
+    pace = HeldPace(log)
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        FakeSearch(log, found()),
+        speaker,
+        page,
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+        pace,
+    )
+    loop._lesson.adopt(LESSON)
+    assert loop._lesson.scene_tag(1) is None
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(speaker.held.wait(), HANG_GUARD_S)
+    turn = turn_task()
+    await pull_past(source, barge)
+    hold.set()
+    await asyncio.wait_for(asyncio.wait([turn]), HANG_GUARD_S)
+    await asyncio.wait_for(pace.held.wait(), HANG_GUARD_S)
+
+    page.arrival("transcript").clear()
+    resume.set()
+    await asyncio.wait_for(page.arrival("transcript").wait(), HANG_GUARD_S)
+    assert ("start_turn", SECOND_TEXT) not in log
+
+    with caplog.at_level(logging.WARNING, logger="tutor.session"):
+        pace.release_once()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert "lesson.sync_timeout epoch=1 barrier=1" in session_messages(caplog)
+    assert loop._lesson.sent == []
+    assert loop._lesson.acked == Cursor(scene=0, step=0)
+    assert ("start_turn", SECOND_TEXT) in log
+    await loop.aclose()
+
+
+async def test_a_barge_in_with_nothing_in_flight_syncs_the_page_and_waits_for_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold, hold_at=1)
+    page = FakePage(log, syncs=False)
+    turns = [spoken_chunks(SPOKEN_DELTAS), spoken_chunks(["Back to the ratio then."])]
+    reasoning = FakeReasoning(log, [], speaker.received, turns=turns)
+    barge = asyncio.Event()
+    source = ScriptedSource(
+        [EndOfTurn(text=CONCEPT_TEXT), barge, SpeechStarted(), EndOfTurn(text=SECOND_TEXT)]
+    )
+    pace = HeldPace(log)
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        FakeSearch(log, found()),
+        speaker,
+        page,
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+        pace,
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(speaker.held.wait(), HANG_GUARD_S)
+        turn = turn_task()
+        barge.set()
+        await asyncio.wait_for(asyncio.wait([turn]), HANG_GUARD_S)
+        hold.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert turn.cancelled()
+    (sync,) = sent(log, "lesson.sync")
+    steps = [name for name, _ in log]
+    assert log.index(("send_json", sync)) < steps.index("flush_playout")
+    assert pace.waits == []
+    assert log.index(("start_turn", SECOND_TEXT)) > log.index(("send_json", sync))
+    assert page.syncs_seen == [sync]
+    assert "lesson.sync epoch=1 barrier=1 waiting=False reason=barge_in" in session_messages(caplog)
+    await loop.aclose()
+
+
+async def test_a_second_barge_in_before_the_page_syncs_waits_for_the_newer_barrier(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold, hold_at=1)
+    page = FakePage(log, syncs=False)
+    turns = [spoken_chunks(SPOKEN_DELTAS), spoken_chunks(["Back to the ratio then."])]
+    reasoning = FakeReasoning(log, [], speaker.received, turns=turns)
+    barge = asyncio.Event()
+    again = asyncio.Event()
+    resume = asyncio.Event()
+    source = ScriptedSource(
+        [
+            EndOfTurn(text=CONCEPT_TEXT),
+            barge,
+            SpeechStarted(),
+            again,
+            SpeechStarted(),
+            resume,
+            EndOfTurn(text=SECOND_TEXT),
+        ]
+    )
+    loop = TurnLoop(
+        concept_cfg(),
+        source,
+        FakeSearch(log, found()),
+        speaker,
+        page,
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+        HeldPace(log),
+    )
+    loop._lesson.adopt(LESSON)
+    assert loop._lesson.scene_tag(1) is None
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(speaker.held.wait(), HANG_GUARD_S)
+    turn = turn_task()
+    await pull_past(source, barge)
+    hold.set()
+    await asyncio.wait_for(asyncio.wait([turn]), HANG_GUARD_S)
+    await pull_past(source, again)
+    assert [without_seq(sync)["barrier"] for sync in sent(log, "lesson.sync")] == [1, 2]
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        page.reply(
+            {
+                "type": "lesson.synced",
+                "epoch": 1,
+                "barrier": 1,
+                "scene_id": None,
+                "step": 0,
+                "revision": 0,
+                "last_cue": 0,
+            }
+        )
+        assert [entry.cue_id for entry in loop._lesson.sent] == [1]
+        page.arrival("transcript").clear()
+        resume.set()
+        await asyncio.wait_for(page.arrival("transcript").wait(), HANG_GUARD_S)
+        assert ("start_turn", SECOND_TEXT) not in log
+        page.answer_sync()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+
+    messages = session_messages(caplog)
+    assert "lesson.synced_ignored epoch=1 barrier=1" in messages
+    assert "lesson.synced epoch=1 barrier=2 scene_id=None step=0 revision=0 last_cue=0" in messages
+    assert ("start_turn", SECOND_TEXT) in log
+    assert loop._lesson.sent == []
+    await loop.aclose()
+
+
+async def test_a_failed_ack_is_answered_with_a_sync_before_the_next_prompt(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log, syncs=False)
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    after = asyncio.Event()
+    done = asyncio.Event()
+    source = ScriptedSource([after, EndOfTurn(text=CONCEPT_TEXT), done])
+    loop = concept_loop(log, source, speaker, reasoning, transport=page)
+    loop._lesson.adopt(LESSON)
+    assert loop._lesson.scene_tag(1) is None
+    running = asyncio.create_task(loop.run())
+    await asyncio.wait_for(page.arrival("lesson.attach").wait(), HANG_GUARD_S)
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        page.reply(page_ack(1, "failed", "runtime", None, 0, 0))
+        (sync,) = sent(log, "lesson.sync")
+        assert log[-1] == ("send_json", sync)
+        assert without_seq(sync) == {"type": "lesson.sync", "epoch": 1, "barrier": 1}
+        assert loop._lesson.resync and loop._lesson.sent == []
+        assert loop._lesson.dropped == ["<scene 1>: runtime"]
+
+        page.arrival("transcript").clear()
+        await pull_past(source, after)
+        await asyncio.wait_for(page.arrival("transcript").wait(), HANG_GUARD_S)
+        assert ("start_turn", CONCEPT_TEXT) not in log
+        page.answer_sync()
+        await asyncio.wait_for(asyncio.wait([turn_task()]), HANG_GUARD_S)
+
+    assert ("start_turn", CONCEPT_TEXT) in log
+    assert not loop._lesson.resync
+    messages = session_messages(caplog)
+    assert "lesson.ack cue_id=1 outcome=failed reason=runtime" in messages
+    assert "lesson.sync epoch=1 barrier=1 waiting=True reason=failed" in messages
+    done.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await loop.aclose()
+
+
+async def test_a_restore_checkpoint_is_answered_with_one_sync_until_the_page_answers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log, syncs=False)
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    loop = concept_loop(log, ScriptedSource([]), speaker, reasoning, transport=page)
+    loop._lesson.adopt(LESSON)
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        page.reply(RESTORE)
+        page.reply({**RESTORE, "revision": 4})
+
+    (sync,) = sent(log, "lesson.sync")
+    assert without_seq(sync) == {"type": "lesson.sync", "epoch": 1, "barrier": 1}
+    assert loop._lesson.resync
+    assert "lesson.sync epoch=1 barrier=1 waiting=True reason=restore" in session_messages(caplog)
+    page.scene_id, page.step, page.revision = "ratio", 1, 4
+    page.answer_sync()
+    assert not loop._lesson.resync
+    assert loop._lesson.acked == Cursor(scene=1, step=1) and loop._lesson.revision == 4
+    await loop.aclose()
+
+
+async def test_a_barge_in_while_a_sync_is_still_owed_waits_for_the_page(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log, syncs=False)
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    pace = HeldPace(log)
+    loop = TurnLoop(
+        concept_cfg(),
+        ScriptedSource([]),
+        FakeSearch(log, found()),
+        speaker,
+        page,
+        reasoning,
+        FakeRegistry(log),
+        FakeClock(),
+        pace,
+    )
+    loop._lesson.adopt(LESSON)
+    page.reply(RESTORE)
+    await asyncio.wait_for(pace.held.wait(), HANG_GUARD_S)
+    (bound,) = [task for task in asyncio.all_tasks() if task.get_name() == "lesson-sync-bound"]
+    pace.release_once()
+    await asyncio.wait_for(asyncio.wait([bound]), HANG_GUARD_S)
+    assert loop._lesson.resync
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        page.reply({"type": "say", "text": CONCEPT_TEXT})
+        await asyncio.wait_for(page.arrival("transcript").wait(), HANG_GUARD_S)
+        assert ("start_turn", CONCEPT_TEXT) not in log
+        page.scene_id, page.step, page.revision = "ratio", 1, 3
+        page.answer_sync()
+        await asyncio.wait_for(asyncio.wait([turn_task()]), HANG_GUARD_S)
+
+    assert "lesson.sync epoch=1 barrier=2 waiting=True reason=barge_in" in session_messages(caplog)
+    assert ("start_turn", CONCEPT_TEXT) in log
+    assert not loop._lesson.resync
     await loop.aclose()
 
 

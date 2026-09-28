@@ -936,3 +936,15 @@ async def test_a_cue_reaches_the_connection_with_its_tag_nested_and_a_seq() -> N
         {"type": "lesson.attach", "epoch": 1, "seq": 1},
         {**STEP_CUE.model_dump(mode="json"), "seq": 2},
     ]
+
+
+def test_push_nowait_sends_a_sync_with_the_next_seq_only_when_it_goes_out() -> None:
+    connection = FakeConnection()
+    channel = VisualChannel(connection)
+    assert channel.push_nowait(LessonSync(epoch=1, barrier=1)) is True
+    connection.open = False
+    assert channel.push_nowait(LessonSync(epoch=1, barrier=2)) is False
+    connection.open = True
+    assert channel.push_nowait(LessonSync(epoch=1, barrier=3)) is True
+    assert [body["seq"] for body in connection.sent] == [1, 2]
+    assert [body["barrier"] for body in connection.sent] == [1, 3]

@@ -109,6 +109,10 @@ class FakeTransport:
             for handler in self.handlers:
                 handler(report)
 
+    def send_json_nowait(self, payload: dict[str, object]) -> bool:
+        self.sent.append(payload)
+        return True
+
     def on_json(self, handler: Callable[[dict[str, object]], None]) -> None:
         self.handlers.append(handler)
 
@@ -134,11 +138,17 @@ class FakeConnection:
     def __init__(self) -> None:
         self.sent: list[dict[str, object]] = []
         self.raises: BaseException | None = None
+        self.open = True
 
     async def send_json(self, payload: dict[str, object]) -> None:
         if self.raises is not None:
             raise self.raises
         self.sent.append(payload)
+
+    def send_json_nowait(self, payload: dict[str, object]) -> bool:
+        if self.open:
+            self.sent.append(payload)
+        return self.open
 
 
 def search_result(path: str, lines: list[int]) -> SearchResult:

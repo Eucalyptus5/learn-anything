@@ -113,6 +113,12 @@ class Connection:
         await self._channel_ready.wait()
         self._channel.send(json.dumps(payload))
 
+    def send_json_nowait(self, payload: dict[str, object]) -> bool:
+        if not self._channel_ready.is_set() or self._channel.readyState != "open":
+            return False
+        self._channel.send(json.dumps(payload))
+        return True
+
     def on_json(self, handler: Callable[[dict[str, object]], None]) -> None:
         self._handlers.append(handler)
 

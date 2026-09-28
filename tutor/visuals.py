@@ -323,3 +323,11 @@ class VisualChannel:
         self._seq += 1
         body["seq"] = self._seq
         await self._connection.send_json(body)
+
+    def push_nowait(self, payload: LessonSync) -> bool:
+        body = payload.model_dump(mode="json")
+        body["seq"] = self._seq + 1
+        if not self._connection.send_json_nowait(body):
+            return False
+        self._seq += 1
+        return True
