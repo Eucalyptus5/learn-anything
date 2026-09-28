@@ -43,16 +43,23 @@ def split_clauses(text: str, min_words: int, max_words: int) -> tuple[list[str],
     return clauses, text[start:]
 
 
-async def clause_chunks(
-    tokens: AsyncIterator[str],
+async def clause_chunks[T](
+    tokens: AsyncIterator[str | T],
     *,
     first_min_words: int = 3,
     min_words: int = 8,
     max_words: int = 12,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[str | T]:
     buffer = ""
     released = False
     async for token in tokens:
+        if not isinstance(token, str):
+            if remainder := buffer.strip():
+                released = True
+                yield remainder
+            buffer = ""
+            yield token
+            continue
         buffer += token
         if not released:
             first, _ = split_clauses(buffer, first_min_words, max_words)
@@ -131,9 +138,13 @@ class Scrubber:
         return nxt + 1
 
 
-async def spoken_text(tokens: AsyncIterator[str], scrubber: Scrubber) -> AsyncIterator[str]:
+async def spoken_text[T](
+    tokens: AsyncIterator[str | T], scrubber: Scrubber
+) -> AsyncIterator[str | T]:
     async for token in tokens:
-        if text := scrubber.feed(token):
+        if not isinstance(token, str):
+            yield token
+        elif text := scrubber.feed(token):
             yield text
     if tail := scrubber.flush():
         yield tail

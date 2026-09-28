@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from tutor.chunker import Scrubber, clause_chunks, split_clauses, spoken_text
+from tutor.tags import RawTag
 
 
 def test_splits_on_period_followed_by_whitespace() -> None:
@@ -373,3 +374,50 @@ async def test_spoken_text_feeds_the_chunker_clean_clauses() -> None:
     ]
     clauses = [clause async for clause in clause_chunks(spoken_text(_stream(pieces), Scrubber()))]
     assert clauses == ["The pool is a free list.", "The acquire path takes a slot from it."]
+
+
+async def tokens(*items: str | RawTag) -> AsyncIterator[str | RawTag]:
+    for item in items:
+        yield item
+
+
+async def test_a_tag_token_flushes_the_clause_before_it_whatever_its_length() -> None:
+    out = [
+        item
+        async for item in clause_chunks(
+            tokens("It falls", RawTag("step 2"), " and then it rises again, slowly.")
+        )
+    ]
+    assert out == ["It falls", RawTag("step 2"), "and then it rises again, slowly."]
+
+
+async def test_a_tag_token_with_nothing_before_it_passes_alone() -> None:
+    out = [
+        item
+        async for item in clause_chunks(
+            tokens(RawTag("scene 1"), "Here is the curve, and here is its slope.")
+        )
+    ]
+    assert out == [RawTag("scene 1"), "Here is the curve,", "and here is its slope."]
+
+
+async def test_adjacent_tag_tokens_pass_in_order_with_no_empty_clause() -> None:
+    out = [
+        item
+        async for item in clause_chunks(
+            tokens("Done here.", RawTag("step 2"), " ", RawTag("step 3"), " Now.")
+        )
+    ]
+    assert out == ["Done here.", RawTag("step 2"), RawTag("step 3"), "Now."]
+
+
+async def test_spoken_text_passes_a_tag_token_through_and_never_scrubs_it() -> None:
+    scrubber = Scrubber()
+    out = [
+        item
+        async for item in spoken_text(
+            tokens("Look **here**", RawTag("set lr 0.9"), " now"), scrubber
+        )
+    ]
+    assert out == ["Look here", RawTag("set lr 0.9"), " now"]
+    assert scrubber.dropped == Counter({"bold": 2})
