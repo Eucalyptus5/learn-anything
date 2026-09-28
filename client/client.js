@@ -1,4 +1,5 @@
-import { entries, mount, onPayload, receive, reset, show, stepScene, theme } from "/visuals.js";
+import { blank, entries, mount, onPayload, receive, reset, show, stepScene, theme } from "/visuals.js";
+import { createCues } from "/cues.js";
 
 const app = document.querySelector(".app");
 const welcome = document.querySelector(".welcome");
@@ -22,6 +23,8 @@ const you = reply.querySelector(".you");
 const said = reply.querySelector(".said");
 const say = document.getElementById("say");
 const empty = document.querySelector(".side .empty");
+const lessonHead = document.querySelector(".lesson-head");
+const lessonList = document.querySelector(".lesson");
 const historyList = document.querySelector(".history");
 const sessionLine = document.querySelector(".session");
 const sessionSubject = sessionLine.querySelector("b");
@@ -56,6 +59,17 @@ let pendingTurn = "";
 let currentTitle = "";
 let historyCount = 0;
 let pendingState = null;
+let rows = [];
+
+const cues = createCues({
+  setTimer: (run, ms) => setTimeout(run, ms),
+  clearTimer: (timer) => clearTimeout(timer),
+  send: (message) => {
+    if (channel !== null && channel.readyState === "open") sendJson(message);
+  },
+  apply: (position) => showPosition(position),
+  version: () => 0,
+});
 
 function render() {
   debug.textContent = [
@@ -86,6 +100,7 @@ export function sendJson(obj) {
 function dropHeld() {
   for (const timer of held) clearTimeout(timer);
   held.clear();
+  cues.drop("barrier");
   pendingState = null;
 }
 
@@ -140,6 +155,11 @@ function begin() {
   historyCount = 0;
   thread.replaceChildren();
   turns.length = 0;
+  rows = [];
+  lessonList.replaceChildren();
+  lessonHead.hidden = true;
+  canvas.classList.add("preparing");
+  canvasTitle.textContent = "Preparing a lesson on " + card.subject;
   liveText.textContent = "listening";
   phaseText.textContent = "teach";
   phaseChip.dataset.phase = "teach";
@@ -426,6 +446,54 @@ onPayload("step", (payload) => {
   held.add(timer);
 });
 
+onPayload("attach", (payload) => {
+  cues.attach(payload.epoch);
+});
+
+onPayload("cue", (payload) => {
+  cues.hold(payload);
+});
+
+onPayload("sync", (payload) => {
+  cues.sync(payload);
+});
+
+function markCurrent() {
+  const current = cues.position().scene_id;
+  for (const item of lessonList.children) {
+    if (item.dataset.id === current) item.setAttribute("aria-current", "step");
+    else item.removeAttribute("aria-current");
+  }
+}
+
+function showPosition({ scene_id, tag }) {
+  if (tag.kind === "scene") {
+    blank();
+    canvasTitle.textContent = rows.find((row) => row.id === scene_id)?.title ?? "";
+  }
+  markCurrent();
+}
+
+onPayload("lesson", (payload) => {
+  rows = payload.scenes;
+  const current = cues.position().scene_id ?? payload.current;
+  lessonList.replaceChildren(
+    ...rows.map((scene) => {
+      const item = document.createElement("li");
+      item.textContent = scene.title;
+      item.dataset.id = scene.id;
+      item.dataset.status = scene.status;
+      if (scene.id === current) item.setAttribute("aria-current", "step");
+      return item;
+    }),
+  );
+  lessonHead.hidden = rows.length === 0;
+  if (rows.length > 0 && canvas.classList.contains("preparing")) {
+    canvas.classList.remove("preparing");
+    canvasTitle.textContent = rows.find((row) => row.id === current)?.title ?? "";
+  }
+});
+
 onPayload("history", (items, current) => {
   historyList.replaceChildren(
     ...items.map(({ i, title }) => {
@@ -458,6 +526,10 @@ onJson("visual.pending", receive);
 onJson("scene.push", receive);
 onJson("scene.show", receive);
 onJson("scene.step", receive);
+onJson("lesson.attach", receive);
+onJson("lesson.cue", receive);
+onJson("lesson.sync", receive);
+onJson("lesson.state", receive);
 onOpen(reset);
 onOpen(begin);
 onOpen(sendTheme);

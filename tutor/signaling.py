@@ -84,6 +84,9 @@ def create_app(
     async def visuals(request: web.Request) -> web.FileResponse:
         return web.FileResponse(client_root / "visuals.js")
 
+    async def cues(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(client_root / "cues.js")
+
     async def lesson(request: web.Request) -> web.FileResponse:
         return web.FileResponse(client_root / "lesson.js")
 
@@ -149,6 +152,7 @@ def create_app(
     app.router.add_get("/client.js", script)
     app.router.add_get("/frame.html", frame)
     app.router.add_get("/visuals.js", visuals)
+    app.router.add_get("/cues.js", cues)
     app.router.add_get("/lesson.js", lesson)
     app.router.add_get("/visual_check.html", visual_check)
     app.router.add_get("/scene_review.html", scene_review)

@@ -11,7 +11,8 @@ LESSON = CLIENT_ROOT / "lesson.js"
 INDEX = CLIENT_ROOT / "index.html"
 VISUAL_CHECK = CLIENT_ROOT / "visual_check.html"
 SCENE_REVIEW = CLIENT_ROOT / "scene_review.html"
-GUARDED = [CLIENT, VISUALS, FRAME, LESSON]
+CUES = CLIENT_ROOT / "cues.js"
+GUARDED = [CLIENT, VISUALS, FRAME, LESSON, CUES]
 HOST_POLICY = {
     "default-src": ["'none'"],
     "script-src": ["'self'", "'unsafe-inline'"],
@@ -90,7 +91,7 @@ def test_the_theme_is_sent_on_open_and_on_change() -> None:
 
 
 def test_captions_and_transcript_use_text_content_only() -> None:
-    for path in (CLIENT, VISUALS, LESSON):
+    for path in (CLIENT, VISUALS, LESSON, CUES):
         for sink in HTML_SINKS:
             assert not sink.search(path.read_text()), (path.name, sink.pattern)
     client = CLIENT.read_text()
@@ -661,9 +662,7 @@ def test_a_step_is_held_for_its_lead_and_reaches_the_frame_only_through_step_sce
     assert "postMessage" not in client
     for kind in ("scene.push", "scene.show", "scene.step"):
         assert f'onJson("{kind}", receive)' in client, kind
-    assert client.startswith(
-        'import { entries, mount, onPayload, receive, reset, show, stepScene, theme } from "/visuals.js";'
-    )
+    assert "postMessage" not in CUES.read_text()
     ready = re.search(r'onPayload\("ready", \(report\) => \{(.*?)\n\}\);', client, re.DOTALL)
     assert ready is not None
     assert 'sendJson({ type: "scene.ready", ...report })' in ready[1]
@@ -751,3 +750,343 @@ def test_the_review_page_reads_files_locally_and_checks_them_through_the_host() 
     )
     assert change is not None
     assert "clearTimeout(timer)" in change[1] and "reset();" in change[1]
+
+
+CUE_HARNESS = """
+const timers = new Map();
+let nextTimer = 0;
+const sent = [];
+const applied = [];
+const cues = createCues({
+  setTimer: (run, ms) => {
+    nextTimer += 1;
+    timers.set(nextTimer, { run, ms });
+    return nextTimer;
+  },
+  clearTimer: (id) => timers.delete(id),
+  send: (message) => sent.push(message),
+  apply: (position) => applied.push(position),
+  version: () => 0,
+});
+function elapse(id) {
+  const timer = timers.get(id);
+  timers.delete(id);
+  timer.run();
+}
+function cue(fields) {
+  return {
+    type: "lesson.cue", seq: 1, epoch: 1, barrier: 0, chunk_id: 1, scene_id: null,
+    revision: 0, lead_ms: 400, audio_ms: 900, ...fields,
+  };
+}
+const OPEN = { kind: "scene", n: 1, scene_id: "ratio" };
+"""
+
+
+def run_cues(probe: str) -> dict[str, object]:
+    report = (
+        "\nconsole.log(JSON.stringify({ sent, applied, held: cues.held(), "
+        "timers: [...timers.keys()], position: cues.position() }));"
+    )
+    source = CUES.read_text() + CUE_HARNESS + probe + report
+    run = subprocess.run(
+        ["node", "--input-type=module", "-e", source], capture_output=True, text=True, check=True
+    )
+    return json.loads(run.stdout)
+
+
+def ack(
+    cue_id: int,
+    outcome: str,
+    reason: str | None,
+    scene: str | None,
+    step: int,
+    revision: int,
+    barrier: int = 0,
+) -> dict[str, object]:
+    return {
+        "type": "lesson.ack",
+        "epoch": 1,
+        "barrier": barrier,
+        "cue_id": cue_id,
+        "outcome": outcome,
+        "reason": reason,
+        "scene_id": scene,
+        "step": step,
+        "revision": revision,
+    }
+
+
+def test_a_cue_fires_at_its_lead_acks_its_position_and_the_settled_page_checkpoints() -> None:
+    out = run_cues("""
+cues.attach(1);
+cues.hold(cue({ cue_id: 1, tag: OPEN }));
+cues.hold(cue({ cue_id: 2, chunk_id: 2, scene_id: "ratio", revision: 1, tag: { kind: "step", n: 2 } }));
+elapse(1);
+elapse(2);
+""")
+    assert out["sent"] == [
+        ack(1, "fired", None, "ratio", 1, 1),
+        ack(2, "fired", None, "ratio", 2, 2),
+        {
+            "type": "lesson.checkpoint",
+            "epoch": 1,
+            "scene_id": "ratio",
+            "version": 0,
+            "step": 2,
+            "revision": 2,
+        },
+    ]
+    assert [(p["scene_id"], p["step"]) for p in out["applied"]] == [("ratio", 1), ("ratio", 2)]
+    assert out["held"] == [] and out["timers"] == []
+
+
+def test_a_later_timer_fires_the_earlier_held_cue_first() -> None:
+    out = run_cues("""
+cues.attach(1);
+cues.hold(cue({ cue_id: 1, lead_ms: 900, tag: OPEN }));
+cues.hold(cue({ cue_id: 2, lead_ms: 300, scene_id: "ratio", revision: 1, tag: { kind: "step", n: 2 } }));
+elapse(2);
+""")
+    assert [(m["cue_id"], m["outcome"]) for m in out["sent"] if m["type"] == "lesson.ack"] == [
+        (1, "fired"),
+        (2, "fired"),
+    ]
+    assert out["timers"] == []
+
+
+def test_a_cue_the_page_cannot_take_is_dropped_with_its_reason() -> None:
+    out = run_cues("""
+cues.attach(1);
+cues.hold(cue({ cue_id: 1, epoch: 2, tag: OPEN }));
+cues.hold(cue({ cue_id: 2, barrier: 1, tag: OPEN }));
+cues.hold(cue({ cue_id: 3, revision: 4, tag: OPEN }));
+cues.hold(cue({ cue_id: 4, tag: OPEN }));
+cues.hold(cue({ cue_id: 5, scene_id: "clip", revision: 1, tag: { kind: "step", n: 2 } }));
+cues.hold(cue({ cue_id: 6, scene_id: "ratio", revision: 1, tag: { kind: "step", n: 1 } }));
+elapse(6);
+""")
+    acks = [
+        (m["cue_id"], m["outcome"], m["reason"]) for m in out["sent"] if m["type"] == "lesson.ack"
+    ]
+    assert acks == [
+        (1, "dropped", "stale_epoch"),
+        (2, "dropped", "stale_barrier"),
+        (3, "dropped", "stale_revision"),
+        (4, "fired", None),
+        (5, "dropped", "stale_revision"),
+        (6, "dropped", "range"),
+    ]
+    assert out["position"] == {"scene_id": "ratio", "step": 1, "revision": 1}
+
+
+def test_a_sync_drops_every_held_cue_then_reports_the_page_and_adopts_the_barrier() -> None:
+    out = run_cues("""
+cues.attach(1);
+cues.hold(cue({ cue_id: 1, tag: OPEN }));
+elapse(1);
+cues.hold(cue({ cue_id: 2, scene_id: "ratio", revision: 1, tag: { kind: "step", n: 2 } }));
+cues.hold(cue({ cue_id: 3, scene_id: "ratio", revision: 2, tag: { kind: "step", n: 3 } }));
+cues.sync({ epoch: 2, barrier: 1 });
+cues.sync({ epoch: 1, barrier: 1 });
+cues.hold(cue({ cue_id: 4, scene_id: "ratio", revision: 1, tag: { kind: "step", n: 2 } }));
+cues.hold(cue({ cue_id: 5, barrier: 1, scene_id: "ratio", revision: 1, tag: { kind: "step", n: 2 } }));
+elapse(5);
+""")
+    assert [m["type"] for m in out["sent"]] == [
+        "lesson.ack",
+        "lesson.checkpoint",
+        "lesson.ack",
+        "lesson.ack",
+        "lesson.synced",
+        "lesson.ack",
+        "lesson.ack",
+        "lesson.checkpoint",
+    ]
+    assert out["sent"][2] == ack(2, "dropped", "barrier", "ratio", 1, 1)
+    assert out["sent"][3] == ack(3, "dropped", "barrier", "ratio", 1, 1)
+    assert out["sent"][4] == {
+        "type": "lesson.synced",
+        "epoch": 1,
+        "barrier": 1,
+        "scene_id": "ratio",
+        "step": 1,
+        "revision": 1,
+        "last_cue": 1,
+    }
+    assert out["sent"][5] == ack(4, "dropped", "stale_barrier", "ratio", 1, 1)
+    assert out["sent"][6] == ack(5, "fired", None, "ratio", 2, 2, barrier=1)
+    assert out["timers"] == []
+
+
+def test_a_drop_acks_every_held_cue_and_an_attach_starts_the_page_clean() -> None:
+    out = run_cues("""
+cues.attach(1);
+cues.hold(cue({ cue_id: 1, tag: OPEN }));
+elapse(1);
+cues.hold(cue({ cue_id: 2, scene_id: "ratio", revision: 1, tag: { kind: "step", n: 2 } }));
+cues.drop("barrier");
+cues.attach(2);
+""")
+    assert out["sent"][-1] == ack(2, "dropped", "barrier", "ratio", 1, 1)
+    assert out["held"] == [] and out["timers"] == []
+    assert out["position"] == {"scene_id": None, "step": 0, "revision": 0}
+
+
+def test_after_a_restore_every_cue_is_refused_until_the_next_sync() -> None:
+    out = run_cues("""
+cues.attach(1);
+cues.hold(cue({ cue_id: 1, tag: OPEN }));
+elapse(1);
+cues.hold(cue({ cue_id: 2, scene_id: "ratio", revision: 1, tag: { kind: "step", n: 2 } }));
+elapse(2);
+cues.restore({ scene_id: "ratio", step: 1, revision: 2 });
+cues.hold(cue({ cue_id: 3, scene_id: "ratio", revision: 2, tag: { kind: "step", n: 2 } }));
+elapse(3);
+cues.sync({ epoch: 1, barrier: 1 });
+cues.hold(cue({ cue_id: 4, barrier: 1, scene_id: "ratio", revision: 2, tag: { kind: "step", n: 2 } }));
+elapse(4);
+""")
+    assert [m["type"] for m in out["sent"]] == [
+        "lesson.ack",
+        "lesson.checkpoint",
+        "lesson.ack",
+        "lesson.checkpoint",
+        "lesson.checkpoint",
+        "lesson.ack",
+        "lesson.synced",
+        "lesson.ack",
+        "lesson.checkpoint",
+    ]
+    assert out["sent"][4] == {
+        "type": "lesson.checkpoint",
+        "epoch": 1,
+        "scene_id": "ratio",
+        "version": 0,
+        "step": 1,
+        "revision": 2,
+    }
+    assert out["sent"][5] == ack(3, "dropped", "stale_revision", "ratio", 1, 2)
+    assert out["sent"][6] == {
+        "type": "lesson.synced",
+        "epoch": 1,
+        "barrier": 1,
+        "scene_id": "ratio",
+        "step": 1,
+        "revision": 2,
+        "last_cue": 2,
+    }
+    assert out["sent"][7] == ack(4, "fired", None, "ratio", 2, 3, barrier=1)
+    assert out["timers"] == []
+
+
+def test_every_lesson_payload_reaches_its_listener_through_all_three_layers() -> None:
+    visuals = VISUALS.read_text()
+    client = CLIENT.read_text()
+    keys = re.search(r"const KEYS = \{(.*?)\n\};", visuals, re.DOTALL)
+    validate = re.search(r"export function validate\(payload\) \{(.*?)\n\}", visuals, re.DOTALL)
+    receive = re.search(r"export function receive\(payload\) \{(.*?)\n\}", visuals, re.DOTALL)
+    assert keys is not None and validate is not None and receive is not None
+    assert '"lesson.attach": ["type", "seq", "epoch"]' in keys[1]
+    assert (
+        '"lesson.cue": ["type", "seq", "epoch", "barrier", "cue_id", "chunk_id", "scene_id", '
+        '"revision", "lead_ms", "audio_ms", "tag"]'
+    ) in keys[1]
+    assert '"lesson.sync": ["type", "seq", "epoch", "barrier"]' in keys[1]
+    assert '"lesson.state": ["type", "seq", "scenes", "current"]' in keys[1]
+    for kind, listener in (
+        ("lesson.attach", "attach"),
+        ("lesson.cue", "cue"),
+        ("lesson.sync", "sync"),
+        ("lesson.state", "lesson"),
+    ):
+        assert f'case "{kind}":' in validate[1], kind
+        assert re.search(
+            rf'case "{re.escape(kind)}":\s*listeners\.get\("{listener}"\)\?\.\(payload\);',
+            receive[1],
+        ), kind
+        assert f'onJson("{kind}", receive)' in client, kind
+    cue_case = re.search(r'case "lesson\.cue":(.*?)return true;', validate[1], re.DOTALL)
+    assert cue_case is not None
+    for check in (
+        "cueTag(payload.tag)",
+        "nonNegative(payload.barrier)",
+        "nonNegative(payload.chunk_id)",
+        "nonNegative(payload.lead_ms)",
+        "nonNegative(payload.audio_ms)",
+    ):
+        assert check in cue_case[1], check
+
+
+def test_the_page_holds_cues_in_the_scheduler_and_every_drop_trigger_acks() -> None:
+    client = CLIENT.read_text()
+    assert client.startswith(
+        'import { blank, entries, mount, onPayload, receive, reset, show, stepScene, theme } from "/visuals.js";\n'
+        'import { createCues } from "/cues.js";'
+    )
+    drop = re.search(r"function dropHeld\(\) \{(.*?)\n\}", client, re.DOTALL)
+    assert drop is not None and 'cues.drop("barrier")' in drop[1]
+    for name, call in (
+        ("attach", "cues.attach(payload.epoch)"),
+        ("cue", "cues.hold(payload)"),
+        ("sync", "cues.sync(payload)"),
+    ):
+        handler = re.search(
+            rf'onPayload\("{name}", \(payload\) => \{{(.*?)\n\}}\);', client, re.DOTALL
+        )
+        assert handler is not None and call in handler[1], name
+    send = re.search(r"send: \(message\) => \{(.*?)\},", client, re.DOTALL)
+    assert send is not None and 'channel.readyState === "open"' in send[1]
+    cues = CUES.read_text()
+    for banned in ("document", "window", "setTimeout", "postMessage", "innerHTML"):
+        assert banned not in cues, banned
+
+
+def test_the_lesson_list_sits_above_the_visuals_strip_and_is_written_as_text() -> None:
+    index = INDEX.read_text()
+    client = CLIENT.read_text()
+    assert index.index('<ol class="lesson">') < index.index("<h3>Visuals</h3>")
+    lesson = re.search(r'onPayload\("lesson", \(payload\) => \{(.*?)\n\}\);', client, re.DOTALL)
+    assert lesson is not None
+    assert "item.textContent = scene.title" in lesson[1]
+    assert "item.dataset.status = scene.status" in lesson[1]
+    assert "cues.position().scene_id" in lesson[1]
+    assert '"Preparing a lesson on " + card.subject' in client
+    sheet = re.search(r"<style>(.*?)</style>", index, re.DOTALL)
+    assert sheet is not None
+    reduced = re.search(
+        r"@media \(prefers-reduced-motion: reduce\) \{(.*?)\n  \}", sheet[1], re.DOTALL
+    )
+    assert reduced is not None
+    assert '.lesson li[data-status="building"]::before { animation: none; }' in reduced[1]
+
+
+def test_the_check_page_probes_the_lesson_payloads() -> None:
+    text = VISUAL_CHECK.read_text()
+    good = re.search(r"const good = \[(.*?)\n\];", text, re.DOTALL)
+    hostile = re.search(r"const hostile = \[(.*?)\n\];", text, re.DOTALL)
+    assert good is not None and hostile is not None
+    for name in (
+        '"lesson.attach"',
+        '"lesson.cue step"',
+        '"lesson.cue scene"',
+        '"lesson.sync"',
+        '"lesson.state"',
+    ):
+        assert name in good[1], name
+    for name in (
+        '"lesson.cue extra key"',
+        '"lesson.cue tag kind set"',
+        '"lesson.cue step n 6"',
+        '"lesson.cue scene n 13"',
+        '"lesson.cue scene_id Bad"',
+        '"lesson.cue barrier -1"',
+        '"lesson.cue epoch 0"',
+        '"lesson.cue chunk_id -1"',
+        '"lesson.cue audio_ms 1.5"',
+        '"lesson.sync barrier 0"',
+        '"lesson.state thirteen scenes"',
+        '"lesson.state status drawn"',
+        '"lesson.state current Bad"',
+    ):
+        assert name in hostile[1], name

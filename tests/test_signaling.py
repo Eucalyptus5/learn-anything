@@ -18,6 +18,7 @@ SCRIPT = "export const ready = true;\n"
 FRAME = "<!doctype html><title>frame</title><div id=d></div>"
 VISUALS = "export const visuals = true;\n"
 LESSON = "window.lesson = {};\n"
+CUES = "export function createCues() {}\n"
 VISUAL_CHECK = "<!doctype html><title>visual check</title><div id=canvas></div>"
 SCENE_REVIEW = "<!doctype html><title>scene review</title><div id=canvas></div>"
 BENCH_MERMAID = "<!doctype html><title>mermaid bench</title><div id=canvas></div>"
@@ -60,6 +61,7 @@ async def client(tmp_path: Path) -> AsyncIterator[TestClient]:
     (tmp_path / "frame.html").write_text(FRAME)
     (tmp_path / "visuals.js").write_text(VISUALS)
     (tmp_path / "lesson.js").write_text(LESSON)
+    (tmp_path / "cues.js").write_text(CUES)
     (tmp_path / "visual_check.html").write_text(VISUAL_CHECK)
     (tmp_path / "scene_review.html").write_text(SCENE_REVIEW)
     (tmp_path / "bench_mermaid.html").write_text(BENCH_MERMAID)
@@ -150,6 +152,13 @@ async def test_the_lesson_helper_is_served(client: TestClient) -> None:
     assert helper.status == 200
     assert await helper.text() == LESSON
     assert "Content-Security-Policy" not in helper.headers
+
+
+async def test_the_cue_scheduler_is_served_as_a_script_with_no_policy(client: TestClient) -> None:
+    response = await client.get("/cues.js")
+    assert response.status == 200
+    assert await response.text() == CUES
+    assert "Content-Security-Policy" not in response.headers
 
 
 async def test_the_scene_review_page_is_served(client: TestClient) -> None:

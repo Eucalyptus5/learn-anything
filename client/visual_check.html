@@ -41,6 +41,11 @@ const good = [
   ["scene.push", { type: "scene.push", seq: 12, scene_id: "turn-4", title: "Clipped objective", html: "<p>x</p>", steps: ["The ratio axis", "The clip band", "The flat region"] }],
   ["scene.show", { type: "scene.show", seq: 13, scene_id: "turn-4", at: 1 }],
   ["scene.step", { type: "scene.step", seq: 14, scene_id: "turn-4", n: 2, lead_ms: 1200 }],
+  ["lesson.attach", { type: "lesson.attach", seq: 15, epoch: 1 }],
+  ["lesson.cue step", { type: "lesson.cue", seq: 16, epoch: 1, barrier: 0, cue_id: 2, chunk_id: 3, scene_id: "ratio", revision: 1, lead_ms: 400, audio_ms: 900, tag: { kind: "step", n: 2 } }],
+  ["lesson.cue scene", { type: "lesson.cue", seq: 17, epoch: 1, barrier: 0, cue_id: 1, chunk_id: 0, scene_id: null, revision: 0, lead_ms: 0, audio_ms: 900, tag: { kind: "scene", n: 1, scene_id: "ratio" } }],
+  ["lesson.sync", { type: "lesson.sync", seq: 18, epoch: 1, barrier: 1 }],
+  ["lesson.state", { type: "lesson.state", seq: 19, scenes: [{ id: "ratio", title: "The ratio", status: "built" }, { id: "clip", title: "The clip", status: "building" }], current: "ratio" }],
 ];
 
 const hostile = [
@@ -84,6 +89,19 @@ const hostile = [
   ["scene.show at 0", { type: "scene.show", seq: 5, scene_id: "s", at: 0 }],
   ["scene.step n 0", { type: "scene.step", seq: 5, scene_id: "s", n: 0, lead_ms: 0 }],
   ["scene.step lead_ms -1", { type: "scene.step", seq: 5, scene_id: "s", n: 1, lead_ms: -1 }],
+  ["lesson.cue extra key", { type: "lesson.cue", seq: 5, epoch: 1, barrier: 0, cue_id: 2, chunk_id: 3, scene_id: "ratio", revision: 1, lead_ms: 400, audio_ms: 900, tag: { kind: "step", n: 2 }, extra: true }],
+  ["lesson.cue tag kind set", { type: "lesson.cue", seq: 5, epoch: 1, barrier: 0, cue_id: 2, chunk_id: 3, scene_id: "ratio", revision: 1, lead_ms: 400, audio_ms: 900, tag: { kind: "set", n: 2 } }],
+  ["lesson.cue step n 6", { type: "lesson.cue", seq: 5, epoch: 1, barrier: 0, cue_id: 2, chunk_id: 3, scene_id: "ratio", revision: 1, lead_ms: 400, audio_ms: 900, tag: { kind: "step", n: 6 } }],
+  ["lesson.cue scene n 13", { type: "lesson.cue", seq: 5, epoch: 1, barrier: 0, cue_id: 1, chunk_id: 0, scene_id: null, revision: 0, lead_ms: 0, audio_ms: 900, tag: { kind: "scene", n: 13, scene_id: "ratio" } }],
+  ["lesson.cue scene_id Bad", { type: "lesson.cue", seq: 5, epoch: 1, barrier: 0, cue_id: 2, chunk_id: 3, scene_id: "Bad", revision: 1, lead_ms: 400, audio_ms: 900, tag: { kind: "step", n: 2 } }],
+  ["lesson.cue barrier -1", { type: "lesson.cue", seq: 5, epoch: 1, barrier: -1, cue_id: 2, chunk_id: 3, scene_id: "ratio", revision: 1, lead_ms: 400, audio_ms: 900, tag: { kind: "step", n: 2 } }],
+  ["lesson.cue epoch 0", { type: "lesson.cue", seq: 5, epoch: 0, barrier: 0, cue_id: 2, chunk_id: 3, scene_id: "ratio", revision: 1, lead_ms: 400, audio_ms: 900, tag: { kind: "step", n: 2 } }],
+  ["lesson.cue chunk_id -1", { type: "lesson.cue", seq: 5, epoch: 1, barrier: 0, cue_id: 2, chunk_id: -1, scene_id: "ratio", revision: 1, lead_ms: 400, audio_ms: 900, tag: { kind: "step", n: 2 } }],
+  ["lesson.cue audio_ms 1.5", { type: "lesson.cue", seq: 5, epoch: 1, barrier: 0, cue_id: 2, chunk_id: 3, scene_id: "ratio", revision: 1, lead_ms: 400, audio_ms: 1.5, tag: { kind: "step", n: 2 } }],
+  ["lesson.sync barrier 0", { type: "lesson.sync", seq: 5, epoch: 1, barrier: 0 }],
+  ["lesson.state thirteen scenes", { type: "lesson.state", seq: 5, scenes: Array(13).fill({ id: "ratio", title: "The ratio", status: "built" }), current: "ratio" }],
+  ["lesson.state status drawn", { type: "lesson.state", seq: 5, scenes: [{ id: "ratio", title: "The ratio", status: "drawn" }, { id: "clip", title: "The clip", status: "building" }], current: "ratio" }],
+  ["lesson.state current Bad", { type: "lesson.state", seq: 5, scenes: [{ id: "ratio", title: "The ratio", status: "built" }, { id: "clip", title: "The clip", status: "building" }], current: "Bad" }],
 ];
 
 let accepted = 0;

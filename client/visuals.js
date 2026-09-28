@@ -2,6 +2,7 @@ const KINDS = new Set(["flowchart", "sequence"]);
 const STATES = new Set(["listening", "thinking", "speaking"]);
 const PHASES = new Set(["teach", "concrete", "interrogate"]);
 const SCENE_ID = /^[a-z][a-z0-9-]{0,31}$/;
+const STATUSES = new Set(["planned", "building", "built", "failed", "done"]);
 const KEYS = {
   "diagram.push": ["type", "seq", "id", "kind", "source", "title"],
   "diagram.clear": ["type", "seq"],
@@ -14,12 +15,18 @@ const KEYS = {
   "scene.push": ["type", "seq", "scene_id", "title", "html", "steps"],
   "scene.show": ["type", "seq", "scene_id", "at"],
   "scene.step": ["type", "seq", "scene_id", "n", "lead_ms"],
+  "lesson.attach": ["type", "seq", "epoch"],
+  "lesson.cue": ["type", "seq", "epoch", "barrier", "cue_id", "chunk_id", "scene_id", "revision", "lead_ms", "audio_ms", "tag"],
+  "lesson.sync": ["type", "seq", "epoch", "barrier"],
+  "lesson.state": ["type", "seq", "scenes", "current"],
 };
 const CAPS = { id: 64, source: 8000, html: 64000, path: 4096, title: 80, turn_id: 32 };
 const TEXT_CAPS = { caption: 2000, transcript: 4000 };
 const SCENE_HTML_CAP = 200000;
 const STEP_CAP = 120;
 const STEPS_MAX = 8;
+const STEP_MAX = 5;
+const SCENES_MAX = 12;
 const ERROR_CAP = 500;
 const FADE_MS = 450;
 const listeners = new Map();
@@ -58,6 +65,35 @@ function stepList(value) {
     value.length >= 1 &&
     value.length <= STEPS_MAX &&
     value.every((say) => typeof say === "string" && say !== "" && [...say].length <= STEP_CAP)
+  );
+}
+
+function nonNegative(value) {
+  return Number.isInteger(value) && value >= 0;
+}
+
+function exactKeys(value, expected) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === expected.length && expected.every((key) => keys.includes(key));
+}
+
+function cueTag(tag) {
+  if (exactKeys(tag, ["kind", "n"]) && tag.kind === "step") {
+    return Number.isInteger(tag.n) && tag.n >= 1 && tag.n <= STEP_MAX;
+  }
+  if (exactKeys(tag, ["kind", "n", "scene_id"]) && tag.kind === "scene") {
+    return Number.isInteger(tag.n) && tag.n >= 1 && tag.n <= SCENES_MAX && sceneId(tag.scene_id);
+  }
+  return false;
+}
+
+function sceneRow(row) {
+  return (
+    exactKeys(row, ["id", "title", "status"]) &&
+    sceneId(row.id) &&
+    cappedString(row, "title") &&
+    STATUSES.has(row.status)
   );
 }
 
@@ -126,6 +162,31 @@ export function validate(payload) {
       if (!sceneId(payload.scene_id)) return reject("bad scene_id");
       if (!positiveInteger(payload.n)) return reject("bad n");
       if (!Number.isInteger(payload.lead_ms) || payload.lead_ms < 0) return reject("bad lead_ms");
+      return true;
+    case "lesson.attach":
+      if (!positiveInteger(payload.epoch)) return reject("bad epoch");
+      return true;
+    case "lesson.cue":
+      if (!positiveInteger(payload.epoch)) return reject("bad epoch");
+      if (!nonNegative(payload.barrier)) return reject("bad barrier");
+      if (!positiveInteger(payload.cue_id)) return reject("bad cue_id");
+      if (!nonNegative(payload.chunk_id)) return reject("bad chunk_id");
+      if (payload.scene_id !== null && !sceneId(payload.scene_id)) return reject("bad scene_id");
+      if (!nonNegative(payload.revision)) return reject("bad revision");
+      if (!nonNegative(payload.lead_ms)) return reject("bad lead_ms");
+      if (!nonNegative(payload.audio_ms)) return reject("bad audio_ms");
+      if (!cueTag(payload.tag)) return reject("bad tag");
+      return true;
+    case "lesson.sync":
+      if (!positiveInteger(payload.epoch)) return reject("bad epoch");
+      if (!positiveInteger(payload.barrier)) return reject("bad barrier");
+      return true;
+    case "lesson.state":
+      if (!Array.isArray(payload.scenes) || payload.scenes.length > SCENES_MAX) {
+        return reject("bad scenes");
+      }
+      if (!payload.scenes.every(sceneRow)) return reject("bad scene row");
+      if (payload.current !== null && !sceneId(payload.current)) return reject("bad current");
       return true;
   }
 }
@@ -256,6 +317,18 @@ export function receive(payload) {
     case "scene.step":
       listeners.get("step")?.(payload);
       break;
+    case "lesson.attach":
+      listeners.get("attach")?.(payload);
+      break;
+    case "lesson.cue":
+      listeners.get("cue")?.(payload);
+      break;
+    case "lesson.sync":
+      listeners.get("sync")?.(payload);
+      break;
+    case "lesson.state":
+      listeners.get("lesson")?.(payload);
+      break;
     case "state":
     case "caption":
     case "transcript":
@@ -279,6 +352,11 @@ export function show(i) {
 
 export function entries() {
   return history.map((h) => ({ title: h.title, payload: h.payload }));
+}
+
+export function blank() {
+  unmountApp();
+  post({ seq: 0, clear: true });
 }
 
 export function theme(name) {

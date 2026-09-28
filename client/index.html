@@ -158,6 +158,67 @@
     box-shadow: 0 0 0 1.5px var(--accent);
     background: var(--accent);
   }
+  .lesson {
+    display: flex;
+    flex-direction: column;
+    margin: 0 0 20px;
+    padding: 0;
+    list-style: none;
+  }
+  .lesson:empty { display: none; }
+  .lesson li {
+    position: relative;
+    padding: 7px 12px 7px 32px;
+    border-radius: 10px;
+    font-size: 14px;
+    line-height: 1.4;
+    color: var(--ink-2);
+  }
+  .lesson li::before {
+    content: "";
+    position: absolute;
+    left: 15px;
+    top: 14px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    box-shadow: 0 0 0 1.5px var(--ink-3);
+    background: var(--ground);
+  }
+  .lesson li::after {
+    content: "";
+    position: absolute;
+    left: 17.5px;
+    top: 24px;
+    bottom: -9px;
+    width: 1px;
+    background: var(--hair-strong);
+  }
+  .lesson li:last-child::after { display: none; }
+  .lesson li[data-status="building"]::before {
+    box-shadow: 0 0 0 1.5px var(--accent);
+    animation: building 2s ease-in-out infinite;
+  }
+  @keyframes building {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+  .lesson li[data-status="built"]::before { background: var(--ink-3); }
+  .lesson li[data-status="done"] { color: var(--ink-3); }
+  .lesson li[data-status="done"]::before {
+    box-shadow: 0 0 0 1.5px var(--ink-2);
+    background: var(--ink-2);
+  }
+  .lesson li[data-status="failed"] { color: var(--ink-3); }
+  .lesson li[data-status="failed"]::before { box-shadow: 0 0 0 1.5px var(--hair-strong); }
+  .lesson li[aria-current="step"] {
+    color: var(--ink);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+  .lesson li[aria-current="step"]::before {
+    box-shadow: 0 0 0 1.5px var(--accent);
+    background: var(--accent);
+  }
   .side-foot { margin-top: auto; }
   .session {
     padding: 12px 12px 0;
@@ -469,12 +530,15 @@
     .canvas iframe.landing { opacity: 1; transform: none; }
     .canvas iframe.checking { opacity: 0; }
     .canvas.drawing { animation: none; box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent), var(--lift); }
+    .lesson li[data-status="building"]::before { animation: none; }
   }
 </style>
 
 <div class="app">
   <aside class="side">
     <div class="wordmark">Learn anything</div>
+    <h3 class="lesson-head" hidden>Lesson</h3>
+    <ol class="lesson"></ol>
     <h3>Visuals</h3>
     <p class="empty">What the tutor draws during the session collects here.</p>
     <div class="history"></div>
