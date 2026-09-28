@@ -5401,6 +5401,40 @@ async def test_a_page_message_is_handled_apart_from_a_say(
     assert speaker.utterances == [SPOKEN_CLAUSES]
 
 
+async def test_an_ack_of_this_epoch_reaches_the_lesson_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), speaker.received)
+    transport = LoggingTransport(log)
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT]), speaker, reasoning, transport=transport)
+    (handler,) = transport.handlers
+    ack = {
+        "type": "lesson.ack",
+        "epoch": 1,
+        "barrier": 0,
+        "cue_id": 9,
+        "outcome": "fired",
+        "reason": None,
+        "scene_id": "ratio",
+        "step": 2,
+        "revision": 1,
+    }
+
+    with caplog.at_level(logging.INFO):
+        handler(ack)
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    lesson = [record.getMessage() for record in caplog.records if record.name == "tutor.lesson"]
+    assert "lesson.ack_unknown cue_id=9 outcome=fired" in lesson
+    assert not any(line.startswith("lesson.ack_ignored") for line in session_messages(caplog))
+    assert ("flush_playout", None) not in log
+    assert [prompt.user_text for prompt in reasoning.prompts] == [CONCEPT_TEXT]
+    assert speaker.utterances == [SPOKEN_CLAUSES]
+
+
 async def test_a_checkpoint_from_the_attached_page_is_retained() -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
