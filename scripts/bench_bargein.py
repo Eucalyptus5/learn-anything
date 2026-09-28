@@ -187,7 +187,6 @@ class Bench:
         checked = pending.ledger_since
         substance = False
 
-        # model_text() parses the outcome tail, so it runs once per enqueued buffer, not per poll.
         def armed() -> bool:
             nonlocal checked, substance
             if pending.turn_id in seen:
@@ -268,7 +267,7 @@ def report(cfg: Settings, args: argparse.Namespace, samples: list[Sample], bench
     print(
         "t_c: perf_counter read just before SpeechStarted is injected while the interrupted turn "
         "is mid-answer: a buffer synthesized from a model-authored clause is already enqueued, "
-        "the synthesizer is inside a synthesize call, and no turn.outcome has been logged."
+        "the synthesizer is inside a synthesize call, and no turn.spoken has been logged."
     )
     print(
         "flush latency: t_c to the loop's flush_playout call. last audio frame: t_c to the last "

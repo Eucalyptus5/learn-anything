@@ -1,12 +1,10 @@
 """End to end turn latency through the real stack: scripted text in, timestamped 48 kHz frames
 out of the playout track. Reports time to first sound, time to substance, the visual's landing
 and validity, and the cost per turn. Without ``--root`` the turns are a concept lesson on PPO;
-with it they walk the fixture repo, the only tree searched. Text only on the wire. ``--history``
-takes one or more of stripped, head and head-tail and runs one fresh session per arm, rewriting
-the history the model sees on the retained arms; each turn's head and tail text and classes are
-appended to the capture file (``--capture``, default ``scratch/bench/replies.jsonl``). ``--soak
-MINUTES`` runs the same turns for a stated number of minutes while sampling power, thermal
-pressure, cluster frequency, process RSS and swap.
+with it they walk the fixture repo, the only tree searched. Text only on the wire. Each turn's
+reply length is appended to the capture file (``--capture``, default
+``scratch/bench/replies.jsonl``). ``--soak MINUTES`` runs the same turns for a stated number of
+minutes while sampling power, thermal pressure, cluster frequency, process RSS and swap.
 """
 
 import argparse
@@ -32,16 +30,14 @@ sys.path.insert(0, str(REPO))
 
 from scripts.bench_llm import summarize
 from tutor.app import Models, build_loop, load_models
-from tutor.brief import BRIEF_END, BRIEF_LIMIT, BRIEF_MARKER, BriefSplitter, VisualBrief
 from tutor.chunker import Scrubber
 from tutor.config import Settings, settings
 from tutor.constants import TTS_SAMPLE_RATE, WEBRTC_FRAME_SAMPLES, WEBRTC_SAMPLE_RATE
 from tutor.cost import TurnUsage, UsageLedger, turn_cost_usd
 from tutor.input_path import EndOfTurn, InputEvent
-from tutor.pedagogy import TurnOutcome, outcome_object
-from tutor.prompt import Message, TurnPrompt
+from tutor.prompt import TurnPrompt
 from tutor.reasoning import ReasoningClient, TurnChunk, TurnStream
-from tutor.session import OUTCOME_MARKER, OutcomeSplitter, TurnLoop
+from tutor.session import TurnLoop
 from tutor.signaling import SessionRequest
 from tutor.transport import Connection
 from tutor.tts import KokoroSynthesizer
@@ -81,22 +77,7 @@ PPO_UTTERANCES = (
     "just tell me",
 )
 PUSH_TYPES = frozenset({"scene.show"})
-ARMS = ("stripped", "head", "head-tail")
 CAPTURE_DIR = REPO / "scratch" / "bench"
-TAIL_LIMIT = 600
-HEAD_CLASSES = ("at_start", "late", "malformed", "absent")
-TAIL_CLASSES = (
-    "ok",
-    "wrapped",
-    "signal",
-    "settling",
-    "settling_positions",
-    "not_json",
-    "no_marker",
-)
-TAIL_FAULTS = ("signal", "settling", "settling_positions")
-TAIL_FLAGS = ("prefixed", "trailing")
-SIGNALS = ("covered", "follow_up", "correct", "misconception", "told")
 
 
 def utterances_for(root: Path | None) -> tuple[str, ...]:
@@ -127,16 +108,7 @@ def model_text(streams: Sequence[Sequence[str]]) -> str:
     for n, deltas in enumerate(streams):
         if n:
             pieces.append("\n")
-        head = BriefSplitter()
-        splitter = OutcomeSplitter()
-        pieces.extend(
-            text for text in (splitter.feed(head.feed(delta)) for delta in deltas) if text
-        )
-        if text := splitter.feed(head.finish()):
-            pieces.append(text)
-        tail, _ = splitter.finish()
-        if tail:
-            pieces.append(tail)
+        pieces.extend(deltas)
     scrubber = Scrubber()
     scrubbed = [text for text in (scrubber.feed(piece) for piece in pieces) if text]
     if flushed := scrubber.flush():
@@ -160,140 +132,18 @@ def floored(pcm: np.ndarray) -> np.ndarray:
     return np.where(pcm == 0, 1, pcm).astype(np.int16)
 
 
-class HeadRead(NamedTuple):
-    kind: str
-    text: str | None
-
-
-class TailRead(NamedTuple):
-    kind: str
-    flags: frozenset[str]
-    faults: frozenset[str]
-    text: str | None
-    signal: str | None
-
-
-class Retained(NamedTuple):
-    head: str | None
-    tail: str | None
-
-
-def classify_head(reply: str) -> HeadRead:
-    splitter = BriefSplitter()
-    splitter.feed(reply)
-    splitter.finish()
-    at = reply.find(BRIEF_MARKER)
-    if at < 0:
-        return HeadRead("absent", None)
-    close = reply.find(BRIEF_END, at)
-    if close >= 0:
-        text = reply[at : close + len(BRIEF_END)]
-    else:
-        body = reply[at + len(BRIEF_MARKER) :]
-        stripped = body.lstrip()
-        try:
-            _, end = json.JSONDecoder().raw_decode(stripped)
-        except json.JSONDecodeError:
-            text = reply[at : at + BRIEF_LIMIT]
-        else:
-            text = reply[at : at + len(BRIEF_MARKER) + len(body) - len(stripped) + end]
-    if not reply.lstrip().startswith(BRIEF_MARKER):
-        return HeadRead("late", text)
-    return HeadRead("at_start" if splitter.brief is not None else "malformed", text)
-
-
-def classify_tail(reply: str) -> TailRead:
-    head = BriefSplitter()
-    released = head.feed(reply) + head.finish()
-    at = released.find(OUTCOME_MARKER)
-    if at < 0:
-        return TailRead("no_marker", frozenset(), frozenset(), None, None)
-    tail = released[at + len(OUTCOME_MARKER) :].strip()
-    body: dict | None = None
-    flags: set[str] = set()
-    brace = tail.find("{")
-    if brace >= 0:
-        with contextlib.suppress(json.JSONDecodeError):
-            decoded, end = json.JSONDecoder().raw_decode(tail, brace)
-            if isinstance(decoded, dict):
-                body = decoded
-                if brace:
-                    flags.add("prefixed")
-                if end < len(tail):
-                    flags.add("trailing")
-    with contextlib.suppress(ValidationError):
-        outcome = TurnOutcome.model_validate_json(outcome_object(tail))
-        return TailRead("ok", frozenset(flags), frozenset(), tail, outcome.signal)
-    if body is None:
-        return TailRead("not_json", frozenset(), frozenset(), tail, None)
-    try:
-        TurnOutcome.model_validate(body)
-    except ValidationError as error:
-        faults = [str(item["loc"][0]) for item in error.errors()]
-        return TailRead(faults[0], frozenset(flags), frozenset(faults), tail, None)
-    return TailRead("wrapped", frozenset(flags), frozenset(), tail, None)
-
-
-def retained_history(
-    history: list[Message], retained: Sequence[Retained], before: int, arm: str
-) -> list[Message]:
-    if arm == "stripped":
-        return history
-    turn = before - sum(1 for message in history if message.role == "user") - 1
-    rewritten: list[Message] = []
-    for message in history:
-        if message.role == "user":
-            turn += 1
-        elif message.role == "assistant":
-            kept = retained[turn - 1]
-            parts = [kept.head, message.content, kept.tail if arm == "head-tail" else None]
-            content = "\n".join(part for part in parts if part is not None)
-            message = message.model_copy(update={"content": content})
-        rewritten.append(message)
-    return rewritten
-
-
-def heads_after_first_retained(
-    heads: Sequence[str], retained: Sequence[str | None], window: int, warmup: int
-) -> tuple[int, int]:
-    seen = 0
-    at_start = 0
-    for n in range(warmup, len(heads)):
-        if any(line is not None for line in retained[max(0, n - window) : n]):
-            seen += 1
-            at_start += heads[n] == "at_start"
-    return at_start, seen
-
-
 class Capture:
     def __init__(self, path: Path, started: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._file = path.open("a", encoding="ascii")
         self._started = started
 
-    def write(
-        self,
-        arm: str,
-        turn: int,
-        utterance: int,
-        sample: bool,
-        head: HeadRead,
-        tail: TailRead,
-        reply_chars: int,
-    ) -> None:
+    def write(self, turn: int, utterance: int, sample: bool, reply_chars: int) -> None:
         line = {
             "started": self._started,
-            "arm": arm,
             "turn": turn,
             "utterance": utterance,
             "sample": sample,
-            "head_class": head.kind,
-            "head": head.text,
-            "tail_class": tail.kind,
-            "tail_flags": sorted(tail.flags),
-            "tail_faults": sorted(tail.faults),
-            "tail": tail.text,
-            "signal": tail.signal,
             "reply_chars": reply_chars,
         }
         self._file.write(json.dumps(line, ensure_ascii=True) + "\n")
@@ -306,8 +156,6 @@ class Sample(BaseModel):
     first_content_delta_ms: int | None
     stages: int
     silent: bool
-    brief: str | None
-    brief_gap_ms: int | None
     visual_landed_ms: int | None
     visual_valid: bool | None
     visual_truncated: bool
@@ -315,11 +163,6 @@ class Sample(BaseModel):
     voice_usd: float | None
     visual_usd: float | None
     utterance: int
-    head: str
-    tail: str
-    tail_flags: list[str]
-    tail_faults: list[str]
-    signal: str | None
 
 
 class Enqueued(NamedTuple):
@@ -528,12 +371,9 @@ class ScriptedSource:
 
 class TurnRecord:
     def __init__(self) -> None:
-        self.turn = 0
         self.streams: list[list[str]] = []
         self.requested: float | None = None
         self.first_spoken_ms: int | None = None
-        self.brief: VisualBrief | None = None
-        self.brief_at: float | None = None
         self.voice_usage: TurnUsage | None = None
         self.visual_usage: TurnUsage | None = None
         self.visual_first_chunk_ms: int | None = None
@@ -578,17 +418,12 @@ class MeteredStream:
         record = self._record
         voice = self._kind == "voice"
         deltas: list[str] = []
-        head = BriefSplitter()
         if voice:
             record.streams.append(deltas)
         async for chunk in self._inner:
             if voice and chunk.kind == "spoken":
                 if record.first_spoken_ms is None:
                     record.first_spoken_ms = int((time.perf_counter() - record.requested) * 1000)
-                head.feed(chunk.text)
-                if head.brief is not None and record.brief is None:
-                    record.brief = head.brief
-                    record.brief_at = time.perf_counter()
                 deltas.append(chunk.text)
             yield chunk
         if self._kind == "visual":
@@ -609,17 +444,14 @@ class MeteredStream:
 
 
 class MeteredReasoning:
-    def __init__(self, inner: ReasoningClient, arm: str = "stripped") -> None:
+    def __init__(self, inner: ReasoningClient) -> None:
         self._inner = inner
-        self.arm = arm
-        self.retained: list[Retained] = []
         self.ledger = UsageLedger()
         self.ledgers = {"voice": UsageLedger(), "visual": UsageLedger(), "planner": UsageLedger()}
         self.record = TurnRecord()
 
-    def begin(self, turn: int = 0) -> TurnRecord:
+    def begin(self) -> TurnRecord:
         self.record = TurnRecord()
-        self.record.turn = turn
         return self.record
 
     def start_turn(
@@ -643,11 +475,6 @@ class MeteredReasoning:
             kind = "visual"
         if kind == "visual":
             record.visual_task = asyncio.current_task()
-        prompt = prompt.model_copy(
-            update={
-                "history": retained_history(prompt.history, self.retained, record.turn, self.arm)
-            }
-        )
         inner = self._inner.start_turn(
             prompt,
             tools=tools,
@@ -735,7 +562,7 @@ class OutcomeWatch(logging.Filter):
         self.event = asyncio.Event()
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.msg.startswith(("turn.outcome ", "turn.failed ")):
+        if record.msg.startswith(("turn.spoken ", "turn.failed ")):
             self.seen.add(str(record.args[0]))
             self.event.set()
         return True
@@ -788,7 +615,6 @@ class Bench:
         root: Path | None,
         subject: str,
         starting_from: str,
-        arm: str = "stripped",
         capture: Capture | None = None,
         silent: bool = False,
     ) -> "Bench":
@@ -796,7 +622,7 @@ class Bench:
         loaded = await asyncio.to_thread(load_models)
         synth = TaggedSynth(SilentSynth() if silent else loaded.synth)
         models = Models(partial=loaded.partial, final=loaded.final, synth=synth)
-        reasoning = MeteredReasoning(ReasoningClient(cfg), arm)
+        reasoning = MeteredReasoning(ReasoningClient(cfg))
         transport = BenchTransport(synth)
         source = ScriptedSource()
         loop = build_loop(cfg, models, reasoning, source, transport, request)
@@ -825,14 +651,14 @@ class Bench:
         ledger_since = len(transport.ledger)
         pushes_since = len(transport.pushes)
         self._dispatched += 1
-        record = self.reasoning.begin(turn=self._dispatched)
+        record = self.reasoning.begin()
         self._synth.last = None
         turn_id = f"turn-{self._dispatched}"
 
         t0 = time.perf_counter()
         self._source.inject(EndOfTurn(text=text))
         await self._watch.wait(turn_id)
-        outcome_at = len(transport.frames)
+        spoken_at = len(transport.frames)
 
         played = transport.ledger[ledger_since:]
         model = model_text(record.streams)
@@ -841,26 +667,15 @@ class Bench:
         needed = 1 if m is None else substance_frame_index(lengths, m) + 1
         await transport.wait_frames(
             lambda: (
-                len(transport.real_times_since(since)) >= needed or transport.idle_since(outcome_at)
+                len(transport.real_times_since(since)) >= needed or transport.idle_since(spoken_at)
             )
         )
 
         await settle_visual(turn_id, self._scene_timeout_s)
 
         reply = "\n".join("".join(deltas) for deltas in record.streams)
-        head = classify_head(reply)
-        tail = classify_tail(reply)
         if self._capture is not None:
-            self._capture.write(
-                self.reasoning.arm, self._dispatched, utterance, sample, head, tail, len(reply)
-            )
-        head_line = None
-        if record.brief is not None:
-            head_line = BRIEF_MARKER + record.brief.model_dump_json() + BRIEF_END
-        tail_line = None
-        if tail.kind != "no_marker":
-            tail_line = OUTCOME_MARKER + tail.text[:TAIL_LIMIT]
-        self.reasoning.retained.append(Retained(head_line, tail_line))
+            self._capture.write(self._dispatched, utterance, sample, len(reply))
 
         real_times = transport.real_times_since(since)
         first_sound = real_times[0] if real_times else None
@@ -871,7 +686,6 @@ class Bench:
         result = None
         if task is not None and task.done() and not task.cancelled() and task.exception() is None:
             result = task.result()
-        brief_at = record.brief_at
         voice, visual = record.voice_usage, record.visual_usage
         if task is None:
             visual_usd = 0.0
@@ -885,10 +699,6 @@ class Bench:
             first_content_delta_ms=record.first_spoken_ms,
             stages=max(sum(1 for entry in before if entry.text is not None) - 1, 0),
             silent=m is None,
-            brief=record.brief.kind if record.brief is not None else None,
-            brief_gap_ms=(
-                None if m is None or brief_at is None else int((played[m].at - brief_at) * 1000)
-            ),
             visual_landed_ms=None if not pushes else int((pushes[0].at - t0) * 1000),
             visual_valid=None if task is None else result is not None and is_valid(result),
             visual_truncated=result is not None and is_truncated(result),
@@ -896,11 +706,6 @@ class Bench:
             voice_usd=None if voice is None else turn_cost_usd(voice, list_price=True),
             visual_usd=visual_usd,
             utterance=utterance,
-            head=head.kind,
-            tail=tail.kind,
-            tail_flags=sorted(tail.flags),
-            tail_faults=sorted(tail.faults),
-            signal=tail.signal,
         )
 
     async def aclose(self) -> None:
@@ -925,7 +730,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", type=Path, default=None)
     parser.add_argument("--starting-from", default=STARTING_FROM)
     parser.add_argument("--model", default=None)
-    parser.add_argument("--history", nargs="+", choices=ARMS, default=["stripped"])
     parser.add_argument("--capture", type=Path, default=None)
     parser.add_argument("--silent-synth", action="store_true", default=False)
     return parser
@@ -943,9 +747,7 @@ def report(
     cfg: Settings,
     args: argparse.Namespace,
     samples: list[Sample],
-    warmups: list[Sample],
     reasoning: MeteredReasoning,
-    arm: str,
 ) -> None:
     print(
         "time to first sound: first 48 kHz frame carrying the first synthesized clause leaving "
@@ -956,17 +758,13 @@ def report(
         "time to substance: frame carrying the first sample synthesized from a model-authored "
         "clause; the lead-in and stage sentences do not count. Frame granularity 20 ms."
     )
-    print(
-        "first content delta: the model's first spoken delta after the first request; it is the "
-        "head token when a brief is present."
-    )
+    print("first content delta: the model's first spoken delta after the first request.")
     print(
         "a visual lands when its scene.show reaches Connection.send_json, the harness answering "
         "each scene.push with a passing scene.ready since no page is attached, after the "
-        "EndOfTurn; brief to first clause runs from the head closing to the first "
-        "model clause reaching Connection.play. Visuals are serialized: each turn waits for its "
-        "own visual task, up to scene_timeout_s, before the next turn is injected, so a visual "
-        "never runs under the following turn's voice call and nothing is superseded."
+        "EndOfTurn. Visuals are serialized: each turn waits for its own visual task, up to "
+        "scene_timeout_s, before the next turn is injected, so a visual never runs under the "
+        "following turn's voice call and nothing is superseded."
     )
     print(
         "a one-LSB floor is applied to every buffer before playout so an all-zero frame is exactly "
@@ -978,7 +776,7 @@ def report(
     )
     synth_field = "  synth=silent" if args.silent_synth else ""
     print(
-        f"model={cfg.reasoning_model}  arm={arm}{synth_field}  samples={len(samples)} "
+        f"model={cfg.reasoning_model}{synth_field}  samples={len(samples)} "
         f"(plus {WARMUP} discarded warm-ups)  "
         f"subject={subject_for(args.root, args.subject)!r}  root={args.root}  "
         f"starting_from={args.starting_from!r}  scene_timeout_s={cfg.scene_timeout_s}  "
@@ -1003,9 +801,6 @@ def report(
     landed = [s for s in samples if s.visual_landed_ms is not None]
     summarize("visual landing", [s.visual_landed_ms for s in landed])
     measured("audio length, those turns", [s.audio_ms for s in landed])
-    measured(
-        "brief to first clause", [s.brief_gap_ms for s in samples if s.brief_gap_ms is not None]
-    )
     priced = [s for s in samples if s.voice_usd is not None and s.visual_usd is not None]
     summarize_usd("cost per turn (list)", [s.voice_usd + s.visual_usd for s in priced])
     summarize_usd(
@@ -1020,43 +815,11 @@ def report(
         print(f"stage sentences before substance median={int(statistics.median(stages))}")
     silent = sum(1 for s in samples if s.silent)
     print(f"silent turns {silent}/{len(samples)}")
-    briefed = sum(1 for s in samples if s.brief is not None)
-    calls = [s for s in samples if s.brief in ("diagram", "app")]
-    print(f"turns with a brief {briefed}/{len(samples)}")
+    calls = [s for s in samples if s.visual_valid is not None]
     print(f"visual calls {len(calls)}/{len(samples)}")
     print(f"visuals landed {len(landed)}/{len(calls)}")
     print(f"visuals valid {sum(1 for s in calls if s.visual_valid)}/{len(calls)}")
     print(f"visuals truncated {sum(1 for s in calls if s.visual_truncated)}/{len(calls)}")
-    n = len(samples)
-    heads = Counter(s.head for s in samples)
-    print(f"arm={arm} heads " + " ".join(f"{kind}={heads[kind]}/{n}" for kind in HEAD_CLASSES))
-    warm = sum(1 for s in warmups if s.head == "at_start")
-    print(f"arm={arm} heads on warm-ups {warm}/{len(warmups)}")
-    kept, saw = heads_after_first_retained(
-        [s.head for s in [*warmups, *samples]],
-        [r.head for r in reasoning.retained],
-        cfg.history_turns,
-        len(warmups),
-    )
-    print(f"arm={arm} heads after first retained head {kept}/{saw}")
-    by_utterance = " ".join(
-        f"{u}:{sum(1 for s in samples if s.utterance == u and s.head == 'at_start')}"
-        f"/{sum(1 for s in samples if s.utterance == u)}"
-        for u in range(len(utterances_for(args.root)))
-    )
-    print(f"arm={arm} heads by utterance {by_utterance}")
-    tails = Counter(s.tail for s in samples)
-    print(f"arm={arm} tails " + " ".join(f"{kind}={tails[kind]}/{n}" for kind in TAIL_CLASSES))
-    faults = Counter(fault for s in samples for fault in s.tail_faults)
-    print(f"arm={arm} tail faults " + " ".join(f"{f}={faults[f]}" for f in TAIL_FAULTS))
-    flags = Counter(flag for s in samples for flag in s.tail_flags)
-    print(f"arm={arm} tail flags " + " ".join(f"{f}={flags[f]}/{n}" for f in TAIL_FLAGS))
-    signals = Counter(s.signal for s in samples if s.tail == "ok")
-    print(
-        f"arm={arm} signals "
-        + " ".join(f"{signal}={signals[signal]}" for signal in SIGNALS)
-        + f" null={signals[None]}"
-    )
     print(ledger_line("", reasoning.ledger))
     print(ledger_line("voice ", reasoning.ledgers["voice"]))
     print(ledger_line("visual ", reasoning.ledgers["visual"]))
@@ -1150,8 +913,7 @@ def report_soak(
 def turn_line(sample: Sample) -> str:
     return (
         f"first_sound_ms={sample.first_sound_ms} substance_ms={sample.substance_ms} "
-        f"stages={sample.stages} silent={sample.silent} brief={sample.brief} "
-        f"head={sample.head} tail={sample.tail} "
+        f"stages={sample.stages} silent={sample.silent} "
         f"visual_landed_ms={sample.visual_landed_ms} visual_valid={sample.visual_valid} "
         f"visual_truncated={sample.visual_truncated} audio_ms={sample.audio_ms}"
     )
@@ -1209,29 +971,27 @@ async def main() -> int:
         CAPTURE_DIR / "replies.jsonl" if args.capture is None else args.capture, started
     )
     total = WARMUP + args.samples
-    for arm in args.history:
-        bench = await Bench.boot(
-            cfg,
-            root,
-            subject_for(root, args.subject),
-            args.starting_from,
-            arm,
-            capture,
-            args.silent_synth,
-        )
-        samples: list[Sample] = []
-        warmups: list[Sample] = []
-        try:
-            print(f"arm={arm} start {await machine_state()}", flush=True)
-            for n in range(total):
-                sample = await bench.turn(
-                    utterances[n % len(utterances)], n % len(utterances), n >= WARMUP
-                )
-                (samples if n >= WARMUP else warmups).append(sample)
-                print(f"arm={arm} turn={n + 1}/{total} {turn_line(sample)}", file=sys.stderr)
-        finally:
-            await bench.aclose()
-        report(cfg, args, samples, warmups, bench.reasoning, arm)
+    bench = await Bench.boot(
+        cfg,
+        root,
+        subject_for(root, args.subject),
+        args.starting_from,
+        capture,
+        args.silent_synth,
+    )
+    samples: list[Sample] = []
+    try:
+        print(f"start {await machine_state()}", flush=True)
+        for n in range(total):
+            sample = await bench.turn(
+                utterances[n % len(utterances)], n % len(utterances), n >= WARMUP
+            )
+            if n >= WARMUP:
+                samples.append(sample)
+            print(f"turn={n + 1}/{total} {turn_line(sample)}", file=sys.stderr)
+    finally:
+        await bench.aclose()
+    report(cfg, args, samples, bench.reasoning)
     return 0
 
 
