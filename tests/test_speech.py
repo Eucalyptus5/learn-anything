@@ -617,7 +617,9 @@ async def test_one_utterance_logs_a_first_audio_span_and_one_synthesize_span_per
         assert f"words={len(chunk.split())}" in message
 
     for record in records:
-        assert record.levelno == logging.DEBUG
+        assert record.levelno == (
+            logging.INFO if record.getMessage().startswith("tts.first_audio ") else logging.DEBUG
+        )
         assert SPAN_PATTERN.match(record.getMessage())
 
 

@@ -47,7 +47,7 @@ class Speaker:
             backlog = self._transport.playout_backlog_s()
             await self._transport.play(audio)
             if first:
-                logger.debug("tts.first_audio words=%d ms=%d", words, _elapsed_ms(start))
+                logger.info("tts.first_audio words=%d ms=%d", words, _elapsed_ms(start))
                 first = False
             await on_play(chunk, int(backlog * 1000), audio_ms)
 
