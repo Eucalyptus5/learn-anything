@@ -979,7 +979,7 @@ def test_every_lesson_payload_reaches_its_listener_through_all_three_layers() ->
 def test_the_page_holds_cues_in_the_scheduler_and_every_drop_trigger_acks() -> None:
     client = CLIENT.read_text()
     assert client.startswith(
-        'import { blank, entries, mount, onPayload, receive, reset, show, stepScene, theme } from "/visuals.js";\n'
+        'import { blank, entries, land, mount, onPayload, receive, reset, show, stepScene, theme } from "/visuals.js";\n'
         'import { createCues } from "/cues.js";'
     )
     drop = re.search(r"function dropHeld\(\) \{(.*?)\n\}", client, re.DOTALL)
@@ -998,6 +998,28 @@ def test_the_page_holds_cues_in_the_scheduler_and_every_drop_trigger_acks() -> N
     cues = CUES.read_text()
     for banned in ("document", "window", "setTimeout", "postMessage", "innerHTML"):
         assert banned not in cues, banned
+
+
+def test_a_checked_scene_lands_when_its_cue_fires_or_late_at_the_pages_step() -> None:
+    visuals = VISUALS.read_text()
+    client = CLIENT.read_text()
+    land = re.search(r"export function land\(sceneId, at\) \{(.*?)\n\}", visuals, re.DOTALL)
+    assert land is not None
+    assert "checking.reported" in land[1]
+    assert "checking.payload.scene_id !== sceneId" in land[1]
+    assert "promote(at)" in land[1]
+    show = re.search(
+        r"function showPosition\(\{ scene_id, step, tag \}\) \{(.*?)\n\}", client, re.DOTALL
+    )
+    assert show is not None
+    assert "land(scene_id, 1)" in show[1] and "blank()" in show[1]
+    assert "stepScene(step)" in show[1]
+    ready = re.search(r'onPayload\("ready", \(report\) => \{(.*?)\n\}\);', client, re.DOTALL)
+    assert ready is not None
+    assert "cues.position()" in ready[1] and "land(scene_id, step)" in ready[1]
+    assert 'sendJson({ type: "scene.ready", ...report })' in ready[1]
+    assert "version: (sceneId) =>" in client
+    assert visuals.count("postMessage(") == 2
 
 
 def test_the_lesson_list_sits_above_the_visuals_strip_and_is_written_as_text() -> None:

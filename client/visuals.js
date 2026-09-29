@@ -349,6 +349,14 @@ export function blank() {
   post({ seq: 0, clear: true });
 }
 
+export function land(sceneId, at) {
+  if (checking === null || !checking.reported || checking.payload.scene_id !== sceneId) {
+    return false;
+  }
+  promote(at);
+  return true;
+}
+
 export function theme(name) {
   post({ seq: ++themeSeq, theme: name });
 }

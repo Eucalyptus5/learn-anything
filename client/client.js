@@ -1,4 +1,4 @@
-import { blank, entries, mount, onPayload, receive, reset, show, stepScene, theme } from "/visuals.js";
+import { blank, entries, land, mount, onPayload, receive, reset, show, stepScene, theme } from "/visuals.js";
 import { createCues } from "/cues.js";
 
 const app = document.querySelector(".app");
@@ -56,6 +56,7 @@ let replyTurn = "";
 let currentTitle = "";
 let pendingState = null;
 let rows = [];
+let shown = null;
 
 const cues = createCues({
   setTimer: (run, ms) => setTimeout(run, ms),
@@ -64,7 +65,7 @@ const cues = createCues({
     if (channel !== null && channel.readyState === "open") sendJson(message);
   },
   apply: (position) => showPosition(position),
-  version: () => 0,
+  version: (sceneId) => (sceneId !== null && sceneId === shown ? 1 : 0),
 });
 
 function render() {
@@ -147,6 +148,7 @@ function begin() {
   thread.replaceChildren();
   turns.length = 0;
   rows = [];
+  shown = null;
   lessonList.replaceChildren();
   lessonHead.hidden = true;
   canvas.classList.add("preparing");
@@ -415,6 +417,10 @@ onPayload("ready", (report) => {
   if (channel !== null && channel.readyState === "open") {
     sendJson({ type: "scene.ready", ...report });
   }
+  const { scene_id, step } = cues.position();
+  if (report.ok && report.scene_id === scene_id && shown !== scene_id && land(scene_id, step)) {
+    shown = scene_id;
+  }
 });
 
 onPayload("step", (payload) => {
@@ -446,10 +452,13 @@ function markCurrent() {
   }
 }
 
-function showPosition({ scene_id, tag }) {
+function showPosition({ scene_id, step, tag }) {
   if (tag.kind === "scene") {
-    blank();
+    shown = land(scene_id, 1) ? scene_id : null;
+    if (shown === null) blank();
     canvasTitle.textContent = rows.find((row) => row.id === scene_id)?.title ?? "";
+  } else if (shown === scene_id) {
+    stepScene(step);
   }
   markCurrent();
 }
