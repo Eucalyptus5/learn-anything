@@ -39,7 +39,6 @@ from tutor.visuals import (
     UngroundedVisual,
     VisualChannel,
     VisualPayload,
-    VisualPending,
 )
 
 _adapter = TypeAdapter(VisualPayload)
@@ -58,10 +57,9 @@ _VALID_SHAPES = [
     {"type": "diagram.clear"},
     {"type": "source.highlight", "path": "src/pool.py", "start_line": 3, "end_line": 9},
     {"type": "app.push", "id": "a1", "html": "<p>hi</p>", "title": "reader"},
-    {"type": "state", "state": "thinking", "phase": "teach"},
+    {"type": "state", "state": "thinking"},
     {"type": "caption", "turn_id": "turn-1", "text": "PPO clips.", "lead_ms": 0},
     {"type": "transcript", "turn_id": "turn-1", "text": "teach me ppo"},
-    {"type": "visual.pending", "turn_id": "turn-1", "title": "Clipped objective"},
     {
         "type": "scene.push",
         "scene_id": "turn-4",
@@ -128,7 +126,7 @@ def test_a_title_over_eighty_characters_is_rejected() -> None:
 @pytest.mark.parametrize(
     ("payload", "tag"),
     [
-        (TurnState(state="thinking", phase="teach"), "state"),
+        (TurnState(state="thinking"), "state"),
         (Caption(turn_id="turn-1", text="PPO clips.", lead_ms=1200), "caption"),
         (LearnerText(turn_id="turn-1", text="teach me ppo"), "transcript"),
     ],
@@ -146,14 +144,17 @@ def test_state_caption_and_transcript_round_trip_through_json(
     assert restored == payload
 
 
-def test_an_unknown_state_or_phase_is_rejected() -> None:
+def test_an_unknown_state_is_rejected() -> None:
     with pytest.raises(ValidationError):
-        TurnState(state="idle", phase="teach")
+        TurnState(state="idle")
     with pytest.raises(ValidationError):
-        TurnState(state="thinking", phase="review")
+        _channel_adapter.validate_python({"type": "state", "state": "thinking", "x": 1})
+
+
+def test_a_state_carrying_a_phase_is_rejected_as_an_extra_key() -> None:
     with pytest.raises(ValidationError):
         _channel_adapter.validate_python(
-            {"type": "state", "state": "thinking", "phase": "teach", "x": 1}
+            {"type": "state", "state": "thinking", "phase": "teach", "interrupted": False}
         )
 
 
@@ -176,14 +177,14 @@ async def test_state_pushes_carry_seq_in_order() -> None:
     connection = FakeConnection()
     channel = VisualChannel(connection)
 
-    await channel.push(TurnState(state="thinking", phase="teach"))
+    await channel.push(TurnState(state="thinking"))
     await channel.push(Caption(turn_id="turn-1", text="PPO clips.", lead_ms=0))
     await channel.push(
         DiagramPush(id="d1", kind="flowchart", source="graph TD; A-->B", title="reader")
     )
 
     assert connection.sent == [
-        {"type": "state", "state": "thinking", "phase": "teach", "interrupted": False, "seq": 1},
+        {"type": "state", "state": "thinking", "interrupted": False, "seq": 1},
         {"type": "caption", "turn_id": "turn-1", "text": "PPO clips.", "lead_ms": 0, "seq": 2},
         {
             "type": "diagram.push",
@@ -211,33 +212,15 @@ def test_a_caption_requires_a_non_negative_lead() -> None:
 
 
 def test_a_state_is_not_interrupted_unless_said_so() -> None:
-    assert TurnState(state="listening", phase="teach").interrupted is False
+    assert TurnState(state="listening").interrupted is False
 
-    dumped = TurnState(state="listening", phase="teach", interrupted=True).model_dump(mode="json")
+    dumped = TurnState(state="listening", interrupted=True).model_dump(mode="json")
 
-    assert dumped == {"type": "state", "state": "listening", "phase": "teach", "interrupted": True}
+    assert dumped == {"type": "state", "state": "listening", "interrupted": True}
     assert _channel_adapter.validate_python(dumped).interrupted is True
     with pytest.raises(ValidationError):
         _channel_adapter.validate_python(
-            {"type": "state", "state": "listening", "phase": "teach", "interrupted": "maybe"}
-        )
-
-
-def test_a_pending_visual_round_trips_and_allows_an_empty_title() -> None:
-    for title in ("Clipped objective", ""):
-        payload = VisualPending(turn_id="turn-1", title=title)
-        dumped = payload.model_dump(mode="json")
-        assert dumped == {"type": "visual.pending", "turn_id": "turn-1", "title": title}
-        assert _channel_adapter.validate_python(dumped) == payload
-    assert len(VisualPending(turn_id="turn-1", title="t" * 80).title) == 80
-
-    with pytest.raises(ValidationError):
-        VisualPending(turn_id="turn-1", title="t" * 81)
-    with pytest.raises(ValidationError):
-        VisualPending(turn_id="t" * 33, title="t")
-    with pytest.raises(ValidationError):
-        _channel_adapter.validate_python(
-            {"type": "visual.pending", "turn_id": "turn-1", "title": "t", "x": 1}
+            {"type": "state", "state": "listening", "interrupted": "maybe"}
         )
 
 

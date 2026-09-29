@@ -9,7 +9,7 @@ from aiohttp import web
 from tutor import signaling
 from tutor.config import Settings, settings
 from tutor.input_path import InputPath
-from tutor.prompt import SYSTEM_PROMPT
+from tutor.prompt import LESSON_PROMPT
 from tutor.reasoning import ReasoningClient
 from tutor.session import TurnLoop, TurnLoopConfig
 from tutor.signaling import SessionRequest
@@ -56,7 +56,7 @@ def build_loop(
 ) -> TurnLoop:
     speaker = Speaker(models.synth, transport)
     loop_cfg = TurnLoopConfig(
-        system=SYSTEM_PROMPT,
+        system=LESSON_PROMPT,
         subject=request.subject,
         starting_from=request.starting_from,
         root=request.folder,

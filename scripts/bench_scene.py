@@ -13,6 +13,7 @@ import statistics
 import sys
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 from pydantic import BaseModel, ValidationError
 
@@ -28,7 +29,6 @@ from scripts.bench_turn import (
     summarize_series,
     summarize_usd,
 )
-from tutor.brief import VisualBrief
 from tutor.config import Settings, settings
 from tutor.cost import turn_cost_usd
 from tutor.reasoning import ReasoningClient
@@ -39,8 +39,14 @@ SUBJECT = "PPO"
 LESSON_TAG = '<script src="/lesson.js">'
 GSAP_TAG = '<script src="/vendor/gsap.min.js">'
 OUT_DIR = REPO / "scratch" / "bench" / "scenes"
-BRIEF = VisualBrief(
-    kind="app",
+
+
+class Brief(NamedTuple):
+    title: str
+    show: str
+
+
+BRIEF = Brief(
     title="Clipped objective",
     show=(
         "the clipped surrogate objective against the probability ratio from 0.5 to 1.5 for "
@@ -66,7 +72,7 @@ class BuildSample(BaseModel):
 
 async def one_build(
     reasoning: MeteredReasoning,
-    brief: VisualBrief,
+    brief: Brief,
     max_tokens: int,
     effort: str,
     model: str | None = None,
@@ -74,7 +80,11 @@ async def one_build(
     record = reasoning.begin()
     t0 = time.perf_counter()
     outcome = await run_scene_build(
-        reasoning, scene_prompt(SUBJECT, brief, "light"), max_tokens, effort, model=model
+        reasoning,
+        scene_prompt(SUBJECT, brief.title, brief.show, "light"),
+        max_tokens,
+        effort,
+        model=model,
     )
     build_ms = int((time.perf_counter() - t0) * 1000)
     draft = outcome if isinstance(outcome, SceneDraft) else None

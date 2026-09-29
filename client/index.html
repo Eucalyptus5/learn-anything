@@ -269,18 +269,6 @@
     font-size: 13px;
     color: var(--ink-2);
   }
-  .chip.phase i {
-    display: inline-block;
-    width: 5px;
-    height: 5px;
-    margin-right: -4px;
-    border-radius: 50%;
-    background: var(--hair-strong);
-  }
-  .chip.phase i:nth-child(3) { margin-right: 3px; }
-  .chip.phase[data-phase="teach"] i:nth-child(1),
-  .chip.phase[data-phase="concrete"] i:nth-child(2),
-  .chip.phase[data-phase="interrogate"] i:nth-child(3) { background: var(--ink); }
   .chip.live {
     margin-left: auto;
     background: color-mix(in srgb, var(--accent) 12%, transparent);
@@ -351,15 +339,9 @@
     background: transparent;
     transition: opacity 450ms cubic-bezier(.2,.7,.2,1), transform 450ms cubic-bezier(.2,.7,.2,1);
   }
-  .canvas.drawing iframe { opacity: 0.6; }
   .canvas iframe.landing { opacity: 0; transform: translateY(10px); }
   .canvas iframe.leaving { opacity: 0; pointer-events: none; }
   .canvas iframe.checking { opacity: 0; pointer-events: none; transform: translateY(10px); }
-  .canvas.drawing { animation: drawing 2s ease-in-out infinite; }
-  @keyframes drawing {
-    0%, 100% { box-shadow: 0 0 0 1px var(--hair), var(--lift); }
-    50% { box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent), var(--lift); }
-  }
   .canvas .highlight { grid-row: 3; font: 12px/1.6 var(--mono); color: var(--ink-3); }
   .canvas .highlight:empty { display: none; }
 
@@ -529,7 +511,6 @@
     .canvas iframe { transition: none; }
     .canvas iframe.landing { opacity: 1; transform: none; }
     .canvas iframe.checking { opacity: 0; }
-    .canvas.drawing { animation: none; box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent), var(--lift); }
     .lesson li[data-status="building"]::before { animation: none; }
   }
 </style>
@@ -573,7 +554,6 @@
     </div>
     <div class="bar" hidden>
       <h2></h2>
-      <span class="chip phase" data-phase="teach"><i></i><i></i><i></i><span>teach</span></span>
       <span class="chip live"><span class="bars"><i></i><i></i><i></i></span><span>listening</span></span>
     </div>
     <pre class="debug" hidden></pre>

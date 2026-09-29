@@ -13,8 +13,6 @@ import pytest
 from tests.fakes import FakeSynthesizer, FakeTransport
 from tests.test_input_path import CANONICAL, FakeVad, scripted_frames
 from tests.test_session import (
-    BRIEFED_DELTAS,
-    SCENE_CALL,
     SPOKEN_DELTAS,
     STARTING_FROM,
     FakeReasoning,
@@ -24,7 +22,7 @@ from tutor import app
 from tutor.app import Models, Sessions, build_loop
 from tutor.config import Settings
 from tutor.input_path import EndOfTurn, InputEvent, InputPath
-from tutor.prompt import SYSTEM_PROMPT
+from tutor.prompt import LESSON_PROMPT
 from tutor.session import TurnLoop
 from tutor.signaling import SessionRequest
 
@@ -210,7 +208,7 @@ async def test_build_loop_runs_a_concept_turn_from_the_session_request(tmp_path:
     await asyncio.wait_for(loop.run(), HANG_GUARD_S)
 
     (prompt,) = reasoning.prompts
-    assert prompt.system.startswith(SYSTEM_PROMPT)
+    assert prompt.system.startswith(LESSON_PROMPT)
     assert "Subject: PPO" in prompt.system
     assert prompt.tool_context == []
     assert prompt.user_text == USER_TEXT
@@ -223,27 +221,6 @@ async def test_build_loop_runs_a_concept_turn_from_the_session_request(tmp_path:
         "text": USER_TEXT,
         "seq": 2,
     }
-
-
-async def test_build_loop_hands_the_scene_model_to_the_visual_call_only(tmp_path: Path) -> None:
-    cfg = settings_for(tmp_path, SCENE_MODEL="draw-1")
-    log: list[tuple[str, object]] = []
-    transport = FakeTransport()
-    reasoning = FakeReasoning(
-        log, spoken_chunks(BRIEFED_DELTAS), asyncio.Event(), visual=[SCENE_CALL]
-    )
-    request = SessionRequest(subject="PPO", starting_from=STARTING_FROM)
-
-    loop = build_loop(
-        cfg, fake_models(), reasoning, EndOfTurnSource([USER_TEXT]), transport, request
-    )
-    await asyncio.wait_for(loop.run(), HANG_GUARD_S)
-    visuals = [task for task in asyncio.all_tasks() if task.get_name() == "turn-1-visual"]
-    await asyncio.wait_for(asyncio.gather(*visuals), HANG_GUARD_S)
-    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
-
-    assert reasoning.models == [None, "draw-1"]
-    assert [p["scene_id"] for p in transport.sent if p["type"] == "scene.show"] == ["turn-1"]
 
 
 async def test_session_ends_on_its_own_when_the_frames_end(

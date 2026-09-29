@@ -11,8 +11,6 @@ const note = composer.querySelector(".note");
 const connectButton = composer.querySelector(".connect");
 const bar = document.querySelector(".bar");
 const heading = bar.querySelector("h2");
-const phaseChip = bar.querySelector(".chip.phase");
-const phaseText = phaseChip.lastElementChild;
 const liveText = bar.querySelector(".chip.live").lastElementChild;
 const debug = document.querySelector(".debug");
 const stage = document.querySelector(".stage");
@@ -55,9 +53,7 @@ let statsTimer = null;
 let mic = null;
 let card = null;
 let replyTurn = "";
-let pendingTurn = "";
 let currentTitle = "";
-let historyCount = 0;
 let pendingState = null;
 let rows = [];
 
@@ -106,8 +102,6 @@ function dropHeld() {
 
 function applyState(payload) {
   liveText.textContent = payload.state;
-  phaseText.textContent = payload.phase;
-  phaseChip.dataset.phase = payload.phase;
   reply.classList.toggle("speaking", payload.state === "speaking");
 }
 
@@ -149,10 +143,7 @@ function begin() {
   startTurn("");
   say.value = "";
   reply.classList.remove("speaking");
-  canvas.classList.remove("drawing");
-  pendingTurn = "";
   currentTitle = "";
-  historyCount = 0;
   thread.replaceChildren();
   turns.length = 0;
   rows = [];
@@ -161,8 +152,6 @@ function begin() {
   canvas.classList.add("preparing");
   canvasTitle.textContent = "Preparing a lesson on " + card.subject;
   liveText.textContent = "listening";
-  phaseText.textContent = "teach";
-  phaseChip.dataset.phase = "teach";
   welcome.hidden = true;
   bar.hidden = false;
   stage.hidden = false;
@@ -188,7 +177,7 @@ function download(name, type, text) {
 function markdown() {
   const lines = [`# ${card.subject}`, ""];
   turns.forEach((turn, i) => {
-    lines.push(`## turn ${i + 1} (${turn.phase})`, "");
+    lines.push(`## turn ${i + 1}`, "");
     lines.push(`**you:** ${turn.learner}`, "");
     lines.push(`**tutor:** ${turn.tutor.join(" ")}`, "");
   });
@@ -370,7 +359,6 @@ dark.addEventListener("change", () => {
 });
 
 onPayload("state", (payload) => {
-  if (payload.state === "thinking") turns[turns.length - 1].phase = payload.phase;
   if (payload.interrupted) dropHeld();
   pendingState = null;
   if (payload.state === "listening" && !payload.interrupted && held.size > 0) {
@@ -408,7 +396,7 @@ onPayload("caption", (payload) => {
 });
 
 onPayload("transcript", (payload) => {
-  turns.push({ turn_id: payload.turn_id, phase: null, learner: payload.text, tutor: [] });
+  turns.push({ turn_id: payload.turn_id, learner: payload.text, tutor: [] });
   startTurn(payload.turn_id);
   you.textContent = payload.text;
   const line = document.createElement("p");
@@ -416,19 +404,6 @@ onPayload("transcript", (payload) => {
   line.textContent = payload.text;
   thread.append(line);
   thread.scrollTop = thread.scrollHeight;
-});
-
-onPayload("pending", (payload) => {
-  if (payload.title !== "") {
-    pendingTurn = payload.turn_id;
-    canvasTitle.textContent = payload.title;
-    canvas.classList.add("drawing");
-    return;
-  }
-  if (payload.turn_id !== pendingTurn) return;
-  pendingTurn = "";
-  canvas.classList.remove("drawing");
-  canvasTitle.textContent = currentTitle;
 });
 
 onPayload("ready", (report) => {
@@ -505,13 +480,8 @@ onPayload("history", (items, current) => {
     }),
   );
   empty.hidden = items.length > 0;
-  if (items.length > historyCount || current < 0) {
-    pendingTurn = "";
-    canvas.classList.remove("drawing");
-  }
-  historyCount = items.length;
   currentTitle = current >= 0 ? items[current].title : "";
-  if (pendingTurn === "") canvasTitle.textContent = currentTitle;
+  canvasTitle.textContent = currentTitle;
 });
 
 mount(canvas);
@@ -522,7 +492,6 @@ onJson("app.push", receive);
 onJson("state", receive);
 onJson("caption", receive);
 onJson("transcript", receive);
-onJson("visual.pending", receive);
 onJson("scene.push", receive);
 onJson("scene.show", receive);
 onJson("scene.step", receive);

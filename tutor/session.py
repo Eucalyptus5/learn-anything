@@ -8,12 +8,10 @@ from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, Field, ValidationError
 
-from tutor.brief import BRIEF_END, BRIEF_MARKER, BriefSplitter, VisualBrief
 from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.input_path import EndOfTurn, InputPath, PartialTranscript, SpeechStarted
 from tutor.lead_in import lead_in_sentence, lead_in_stages
-from tutor.lesson import LessonState
-from tutor.pedagogy import PedagogyState, TurnOutcome, parse_outcome
+from tutor.lesson import LessonState, lesson_block
 from tutor.prompt import (
     SEARCH_CODE_TOOL,
     Message,
@@ -22,7 +20,6 @@ from tutor.prompt import (
     TurnPrompt,
 )
 from tutor.reasoning import ReasoningClient, TurnChunk
-from tutor.scene import run_scene_build, scene_prompt
 from tutor.speech import Chunk, OnPlay, Speaker
 from tutor.tags import Marker, RawTag, TagSplitter, parse_marker, tag_name
 from tutor.tools.models import SearchBudget, SearchResult
@@ -43,11 +40,9 @@ from tutor.visuals import (
     SceneCue,
     ScenePush,
     SceneReady,
-    SceneShow,
     ThemeMessage,
     TurnState,
     VisualChannel,
-    VisualPending,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,23 +55,8 @@ TURN_TOOLS: list[dict[str, object]] = [SEARCH_CODE_TOOL, *VOICE_VISUAL_TOOLS]
 VISUAL_TOOL_NAMES = frozenset(tool["function"]["name"] for tool in VOICE_VISUAL_TOOLS)
 SPOKEN_DEPTH = 32
 BAD_ARGUMENTS = "search_code takes a query string and a non-empty list of glob strings"
-OUTCOME_MARKER = "<outcome>"
-TAIL_LIMIT = 600
 NO_REPORT = "the page sent no report"
 LESSON_SYNC_TIMEOUT_S = 5.0  # a control bound on the page's answer, not a measured latency
-OUTCOME_INSTRUCTION = (
-    f"End every reply with a line holding exactly {OUTCOME_MARKER} followed by one JSON object "
-    'with "signal" (one of covered, follow_up, correct, misconception, told, or null), '
-    '"settling" (one sentence naming the counterexample or case that settles a misconception) '
-    'and "settling_positions" (a list of objects with "path" and "line") naming where a '
-    "misconception is settled. Nothing after the marker is spoken."
-)
-CONCEPT_OUTCOME_INSTRUCTION = (
-    f"End every reply with a line holding exactly {OUTCOME_MARKER} followed by one JSON object "
-    'with "signal" (one of covered, follow_up, correct, misconception, told, or null) and '
-    '"settling" (one sentence naming the counterexample or case that settles a misconception). '
-    "Nothing after the marker is spoken."
-)
 
 
 def _elapsed_ms(start: float, now: float) -> int:
@@ -141,35 +121,6 @@ async def _put_all(queue: asyncio.Queue[str | RawTag | None], items: list[str | 
             await queue.put(item)
 
 
-class OutcomeSplitter:
-    def __init__(self) -> None:
-        self._held = ""
-        self._tail: str | None = None
-        self.tail: str | None = None
-
-    def feed(self, delta: str) -> str:
-        if self._tail is not None:
-            self._tail += delta
-            return ""
-        text = self._held + delta
-        at = text.find(OUTCOME_MARKER)
-        if at >= 0:
-            self._held = ""
-            self._tail = text[at + len(OUTCOME_MARKER) :]
-            return text[:at]
-        prefixes = range(1, len(OUTCOME_MARKER))
-        held = max((n for n in prefixes if text.endswith(OUTCOME_MARKER[:n])), default=0)
-        self._held = text[len(text) - held :]
-        return text[: len(text) - held]
-
-    def finish(self) -> tuple[str, TurnOutcome]:
-        if self._tail is None:
-            held, self._held = self._held, ""
-            return held, TurnOutcome()
-        self.tail = self._tail.strip()
-        return "", parse_outcome(self.tail)
-
-
 class TurnLoopConfig(BaseModel):
     system: str
     subject: str
@@ -191,9 +142,8 @@ class Speculation:
     def __init__(self, text: str) -> None:
         self.text = text
         self.claimed = False
-        self.brief: VisualBrief | None = None
         self.grounded: asyncio.Future[Grounded] = asyncio.get_running_loop().create_future()
-        self.task: asyncio.Task[TurnOutcome]
+        self.task: asyncio.Task[None]
 
     def live(self) -> bool:
         if not self.task.done():
@@ -224,22 +174,17 @@ class TurnLoop:
         self._registry = registry
         self._clock = clock
         self._pace = pace
-        self._pedagogy = PedagogyState()
         self._transcript = Transcript(cfg.history_turns)
         self._turns: set[asyncio.Task[None]] = set()
-        self._drains: dict[str, asyncio.Task[TurnOutcome]] = {}
+        self._drains: dict[str, asyncio.Task[None]] = {}
         self._pumps: dict[str, asyncio.Task[None]] = {}
         self._stagers: dict[str, asyncio.Task[None]] = {}
         self._staging: dict[str, tuple[asyncio.Queue[Clause | None], asyncio.Event]] = {}
         self._due: dict[str, dict[int, list[Marker]]] = {}
         self._played: dict[str, Played] = {}
         self._speculations: dict[str, Speculation] = {}
-        self._visual_tasks: dict[str, asyncio.Task[str]] = {}
         self._results: dict[str, list[SearchResult]] = {}
-        self._briefs: dict[str, VisualBrief | None] = {}
-        self._tails: dict[str, str] = {}
         self._ready: dict[str, asyncio.Future[SceneReady]] = {}
-        self._landed_turn = 0
         self._chunk_id = 0
         self._theme = "light"
         self._dispatched = 0
@@ -363,10 +308,8 @@ class TurnLoop:
         previous = self._speculations.get(turn_id)
         if previous is not None and previous.text == text and previous.live():
             return
-        if previous is not None:
-            if not previous.task.cancelling():
-                previous.task.cancel()
-            self._tails.pop(turn_id, None)
+        if previous is not None and not previous.task.cancelling():
+            previous.task.cancel()
         speculation = Speculation(text)
         speculation.task = asyncio.create_task(
             self._speculate(turn_id, speculation, None if previous is None else previous.task),
@@ -432,9 +375,6 @@ class TurnLoop:
             drain = self._drains.get(turn.get_name())
             if drain is not None:
                 drain.cancel()
-            visual = self._visual_tasks.get(turn.get_name())
-            if visual is not None and not visual.cancelling():
-                visual.cancel()
             turn.cancel()
         # Playout outlives the turn task, so what is queued drops even with no turn in flight.
         self._transport.flush_playout()
@@ -469,13 +409,6 @@ class TurnLoop:
             if not task.cancelling():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        # A drain already on the ready queue can still start a visual while the turns unwind,
-        # so the visuals are cancelled only once every turn is done.
-        visuals = list(self._visual_tasks.values())
-        for task in visuals:
-            if not task.cancelling():
-                task.cancel()
-        await asyncio.gather(*visuals, return_exceptions=True)
         background = list(self._background)
         if self._sync_wait is not None:
             background.append(self._sync_wait)
@@ -484,8 +417,8 @@ class TurnLoop:
         await asyncio.gather(*background, return_exceptions=True)
 
     async def _speculate(
-        self, turn_id: str, speculation: Speculation, previous: asyncio.Task[TurnOutcome] | None
-    ) -> TurnOutcome:
+        self, turn_id: str, speculation: Speculation, previous: asyncio.Task[None] | None
+    ) -> None:
         if previous is not None:
             await asyncio.gather(previous, return_exceptions=True)
         await self._settled.wait()
@@ -499,7 +432,7 @@ class TurnLoop:
                 "turn.speculation turn_id=%s ms=%d", turn_id, _elapsed_ms(start, self._clock())
             )
             tools = [SEARCH_CODE_TOOL] if self._cfg.root is not None else []
-            return await self._drain(turn_id, prompt, queue, tools)
+            await self._drain(turn_id, prompt, queue, tools)
         except asyncio.CancelledError:
             if not speculation.claimed:
                 self._registry.abandon(turn_id)
@@ -509,7 +442,6 @@ class TurnLoop:
                 speculation.grounded.cancel()
             if not speculation.claimed:
                 self._results.pop(turn_id, None)
-                self._briefs.pop(turn_id, None)
 
     async def _claim(self, turn_id: str, user_text: str) -> asyncio.Future[Grounded] | None:
         speculation = self._speculations.pop(turn_id, None)
@@ -520,14 +452,11 @@ class TurnLoop:
         ):
             speculation.claimed = True
             self._drains[turn_id] = speculation.task
-            if speculation.brief is not None:
-                self._start_visual(turn_id, speculation.brief)
             return speculation.grounded
         if speculation is not None:
             if not speculation.task.cancelling():
                 speculation.task.cancel()
             await asyncio.gather(speculation.task, return_exceptions=True)
-            self._tails.pop(turn_id, None)
         self._registry.open_turn(turn_id)
         return None
 
@@ -535,11 +464,8 @@ class TurnLoop:
         starting = (
             f"Starting from: {self._cfg.starting_from}\n\n" if self._cfg.starting_from else ""
         )
-        instruction = CONCEPT_OUTCOME_INSTRUCTION if self._cfg.root is None else OUTCOME_INSTRUCTION
-        system = (
-            f"{self._cfg.system}\n\nSubject: {self._cfg.subject}\n\n{starting}"
-            f"{self._pedagogy.prompt_directive()}\n\n{instruction}"
-        )
+        block = lesson_block(self._lesson, True, list(self._lesson.dropped))
+        system = f"{self._cfg.system}\n\nSubject: {self._cfg.subject}\n\n{starting}{block}"
         return TurnPrompt(
             system=system,
             history=self._transcript.history(before=turn_id),
@@ -550,7 +476,7 @@ class TurnLoop:
     def _state(
         self, state: Literal["listening", "thinking", "speaking"], interrupted: bool = False
     ) -> TurnState:
-        return TurnState(state=state, phase=str(self._pedagogy.phase), interrupted=interrupted)
+        return TurnState(state=state, interrupted=interrupted)
 
     def _caption(self, turn_id: str, barrier: int) -> OnPlay:
         async def on_play(chunk: Chunk, lead_ms: int, audio_ms: int) -> None:
@@ -631,11 +557,11 @@ class TurnLoop:
                 # A cancelled turn must not cancel the future the speculation is about to
                 # resolve, or set_result() raises inside the speculation.
                 prompt, queue = await asyncio.shield(grounded)
+            self._lesson.dropped.clear()
             await self._speaker.speak(
                 self._utterance(turn_id, prompt, queue, barrier), self._caption(turn_id, barrier)
             )
-            outcome = await self._report_drain(turn_id)
-            tail = self._tails.pop(turn_id, None)
+            await self._await_drain(turn_id)
         except asyncio.CancelledError:
             # The drain has to stop before the id is cleared, or a late record() finds no turn.
             await self._stop_turn(turn_id)
@@ -654,34 +580,24 @@ class TurnLoop:
         finally:
             await self._stop_turn(turn_id)
         logger.info("turn.spoken turn_id=%s ms=%d", turn_id, _elapsed_ms(start, self._clock()))
-        if self._cfg.root is None:
-            outcome = outcome.model_copy(update={"settling_positions": []})
-        phase = self._pedagogy.advance(outcome)
-        if tail is not None:
-            self._transcript.tail(turn_id, OUTCOME_MARKER + tail)
-        logger.info("turn.outcome turn_id=%s signal=%s phase=%s", turn_id, outcome.signal, phase)
         await self._visuals.push(self._state("listening"))
 
-    async def _report_drain(self, turn_id: str) -> TurnOutcome:
+    async def _await_drain(self, turn_id: str) -> None:
         drain = self._drains.get(turn_id)
         if drain is None:
-            return TurnOutcome()
+            return
         if not drain.done():
             await asyncio.gather(drain, return_exceptions=True)
         del self._drains[turn_id]
         error = drain.exception()
         if error is not None:
             logger.error("turn.reasoning_failed turn_id=%s error=%s", turn_id, type(error).__name__)
-            return TurnOutcome()
-        return drain.result()
 
     async def _stop_turn(self, turn_id: str) -> None:
         self._staging.pop(turn_id, None)
         self._due.pop(turn_id, None)
         self._played.pop(turn_id, None)
         self._results.pop(turn_id, None)
-        self._briefs.pop(turn_id, None)
-        self._tails.pop(turn_id, None)
         await self._stop(self._pumps, turn_id)
         await self._stop(self._stagers, turn_id)
         await self._stop(self._drains, turn_id)
@@ -793,6 +709,7 @@ class TurnLoop:
                         marker,
                         len(item.text),
                     )
+                    self._lesson.dropped.append(f"<{tag_name(item)}>: {marker}")
                 else:
                     markers.append(marker)
                 continue
@@ -831,38 +748,25 @@ class TurnLoop:
         prompt: TurnPrompt,
         queue: asyncio.Queue[str | RawTag | None],
         tools: Sequence[dict[str, object]],
-    ) -> TurnOutcome:
+    ) -> None:
         try:
             calls: list[TurnChunk] = []
-            head = BriefSplitter()
-            splitter = OutcomeSplitter()
             tags = TagSplitter()
             stream = self._reasoning.start_turn(
                 prompt, tools=list(tools) or None, max_tokens=self._cfg.tool_round_max_tokens
             )
             async for chunk in stream:
                 if chunk.kind == "spoken":
-                    text = head.feed(chunk.text)
-                    if head.brief is not None and turn_id not in self._briefs:
-                        self._briefs[turn_id] = head.brief
-                        if self._cfg.root is None:
-                            self._brief(turn_id)
-                    await _put_all(queue, tags.feed(splitter.feed(text)))
+                    await _put_all(queue, tags.feed(chunk.text))
                 elif chunk.kind == "tool_call":
                     calls.append(chunk)
-            await _put_all(queue, tags.feed(splitter.feed(head.finish())))
-            text, outcome = splitter.finish()
-            await _put_all(queue, [*tags.feed(text), *tags.finish()])
+            await _put_all(queue, tags.finish())
             answerable = [call for call in calls if call.tool_call_id and call.tool_name]
             if len(answerable) != len(calls):
                 logger.warning("turn.tool_call_incomplete turn_id=%s", turn_id)
             if answerable:
                 await queue.put("\n")
-                outcome = await self._follow_up(turn_id, prompt, answerable, queue)
-            else:
-                if splitter.tail is not None:
-                    self._tails[turn_id] = splitter.tail[:TAIL_LIMIT]
-                self._brief(turn_id)
+                await self._follow_up(turn_id, prompt, answerable, queue)
         except BaseException:
             # Nothing consumes the queue once the turn unwinds, so the sentinel takes a slot
             # instead of waiting for one.
@@ -871,7 +775,6 @@ class TurnLoop:
             queue.put_nowait(None)
             raise
         await queue.put(None)
-        return outcome
 
     async def _follow_up(
         self,
@@ -879,106 +782,18 @@ class TurnLoop:
         prompt: TurnPrompt,
         calls: list[TurnChunk],
         queue: asyncio.Queue[str | RawTag | None],
-    ) -> TurnOutcome:
+    ) -> None:
         exchange = [_assistant_calls(calls)]
         for call in calls:
             answer = await self._answer(turn_id, call)
             exchange.append(Message(role="tool", content=answer, tool_call_id=call.tool_call_id))
-        head = BriefSplitter()
-        splitter = OutcomeSplitter()
         tags = TagSplitter()
         follow_up = prompt.model_copy(update={"tool_exchange": exchange})
-        self._brief(turn_id)
         # The follow-up carries no tools, so the model cannot open a round this loop will not serve.
         async for chunk in self._reasoning.start_turn(follow_up):
             if chunk.kind == "spoken":
-                text = head.feed(chunk.text)
-                if head.brief is not None and turn_id not in self._briefs:
-                    self._briefs[turn_id] = head.brief
-                    self._brief(turn_id)
-                await _put_all(queue, tags.feed(splitter.feed(text)))
-        await _put_all(queue, tags.feed(splitter.feed(head.finish())))
-        text, outcome = splitter.finish()
-        await _put_all(queue, [*tags.feed(text), *tags.finish()])
-        if splitter.tail is not None:
-            self._tails[turn_id] = splitter.tail[:TAIL_LIMIT]
-        return outcome
-
-    def _brief(self, turn_id: str) -> None:
-        brief = self._briefs.get(turn_id)
-        if brief is None:
-            return
-        self._briefs[turn_id] = None
-        speculation = self._speculations.get(turn_id)
-        if speculation is not None and not speculation.claimed:
-            speculation.brief = brief
-            return
-        self._start_visual(turn_id, brief)
-
-    def _start_visual(self, turn_id: str, brief: VisualBrief) -> None:
-        self._transcript.head(turn_id, f"{BRIEF_MARKER}{brief.model_dump_json()}{BRIEF_END}")
-        if brief.kind == "none":
-            return
-        task = asyncio.create_task(self._visual(turn_id, brief), name=f"{turn_id}-visual")
-        self._visual_tasks[turn_id] = task
-        task.add_done_callback(lambda done: self._visual_done(turn_id, done))
-
-    async def _visual(self, turn_id: str, brief: VisualBrief) -> str:
-        number = int(turn_id.removeprefix("turn-"))
-        await self._visuals.push(VisualPending(turn_id=turn_id, title=brief.title))
-        shown = False
-        try:
-            async with asyncio.timeout(self._cfg.scene_timeout_s):
-                result = await self._scene(turn_id, brief, lambda: number > self._landed_turn)
-            shown = result == "scene: sent"
-        except TimeoutError:
-            logger.info("scene.timeout turn_id=%s", turn_id)
-            return "scene: timeout"
-        finally:
-            if not shown:
-                await self._settle(turn_id)
-        if shown:
-            self._landed_turn = max(self._landed_turn, number)
-        return result
-
-    async def _scene(self, turn_id: str, brief: VisualBrief, may_land: Callable[[], bool]) -> str:
-        error = ""
-        for attempt in (1, 2):
-            if not may_land():
-                return "scene: superseded"
-            draft = await run_scene_build(
-                self._reasoning,
-                scene_prompt(self._cfg.subject, brief, self._theme, error),
-                self._cfg.scene_max_tokens,
-                self._cfg.scene_effort,
-                model=self._cfg.scene_model or None,
-            )
-            if isinstance(draft, str):
-                return draft
-            if not may_land():
-                return "scene: superseded"
-            push = ScenePush(
-                scene_id=turn_id, title=brief.title, html=draft.html, steps=draft.steps
-            )
-            ready = await self._check(turn_id, push)
-            if ready.ok:
-                await self._visuals.push(SceneShow(scene_id=turn_id, at=1))
-                logger.info(
-                    "scene.shown turn_id=%s attempt=%d steps=%d", turn_id, attempt, ready.steps
-                )
-                return "scene: sent"
-            if ready.error == NO_REPORT:
-                logger.info("scene.no_report turn_id=%s attempt=%d", turn_id, attempt)
-                return "scene: superseded" if not may_land() else "scene: error: no report"
-            logger.info(
-                "scene.check_failed turn_id=%s attempt=%d steps=%d chars=%d",
-                turn_id,
-                attempt,
-                ready.steps,
-                len(ready.error),
-            )
-            error = ready.error
-        return "scene: error: check failed twice"
+                await _put_all(queue, tags.feed(chunk.text))
+        await _put_all(queue, tags.finish())
 
     async def _check(self, turn_id: str, push: ScenePush) -> SceneReady:
         waiting: asyncio.Future[SceneReady] = asyncio.get_running_loop().create_future()
@@ -991,27 +806,6 @@ class TurnLoop:
             return SceneReady(scene_id=turn_id, ok=False, steps=0, error=NO_REPORT)
         finally:
             self._ready.pop(turn_id, None)
-
-    async def _settle(self, turn_id: str) -> None:
-        try:
-            await self._visuals.push(VisualPending(turn_id=turn_id, title=""))
-        except Exception as error:
-            logger.warning(
-                "visual.pending_push_failed turn_id=%s error=%s",
-                turn_id,
-                type(error).__name__,
-                exc_info=True,
-            )
-
-    def _visual_done(self, turn_id: str, task: asyncio.Task[str]) -> None:
-        self._visual_tasks.pop(turn_id, None)
-        if task.cancelled():
-            return
-        error = task.exception()
-        if error is not None:
-            logger.error("scene.failed turn_id=%s error=%s", turn_id, type(error).__name__)
-        elif task.result() == "scene: superseded":
-            logger.info("scene.superseded turn_id=%s", turn_id)
 
     async def _answer(self, turn_id: str, call: TurnChunk) -> str:
         if call.tool_name in VISUAL_TOOL_NAMES:

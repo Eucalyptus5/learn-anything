@@ -20,7 +20,7 @@ sys.path.insert(0, str(REPO))
 
 from tutor.config import settings
 from tutor.cost import TurnUsage
-from tutor.prompt import SYSTEM_PROMPT, TurnPrompt
+from tutor.prompt import LESSON_PROMPT, TurnPrompt
 from tutor.reasoning import ReasoningClient
 
 WARMUP = 1
@@ -104,7 +104,7 @@ async def run_mode(
     cache_bust: bool,
 ) -> None:
     name = f"{mode}{' +terse' if terse else ''}"
-    system_prompt = pad_to_tokens(SYSTEM_PROMPT, 1500)
+    system_prompt = pad_to_tokens(LESSON_PROMPT, 1500)
     if cache_bust:
         system_prompt = uuid.uuid4().hex + " " + system_prompt
     if terse:

@@ -166,9 +166,9 @@ def test_the_validator_names_every_channel_payload_type() -> None:
         assert re.search(rf'"{kind}": \["type", "seq", ', keys[1]), kind
     assert '"diagram.push": ["type", "seq", "id", "kind", "source", "title"]' in keys[1]
     assert '"app.push": ["type", "seq", "id", "html", "title"]' in keys[1]
-    assert '"state": ["type", "seq", "state", "phase", "interrupted"]' in keys[1]
+    assert '"state": ["type", "seq", "state", "interrupted"]' in keys[1]
     assert '"caption": ["type", "seq", "turn_id", "text", "lead_ms"]' in keys[1]
-    assert '"visual.pending": ["type", "seq", "turn_id", "title"]' in keys[1]
+    assert '"visual.pending"' not in keys[1]
     assert '"scene.push": ["type", "seq", "scene_id", "title", "html", "steps"]' in keys[1]
     assert '"scene.show": ["type", "seq", "scene_id", "at"]' in keys[1]
     assert '"scene.step": ["type", "seq", "scene_id", "n", "lead_ms"]' in keys[1]
@@ -196,25 +196,17 @@ def test_the_check_page_probes_the_lead_and_the_interrupted_flag() -> None:
         '"caption missing lead_ms"',
         '"interrupted yes"',
         '"state missing interrupted"',
-        '"visual.pending title of 81"',
-        '"visual.pending missing title"',
-        '"visual.pending turn_id of 33"',
     ):
         assert name in hostile[1], name
 
 
-def test_a_pending_visual_reaches_the_pending_listener() -> None:
-    text = VISUALS.read_text()
-    receive = re.search(r"export function receive\(payload\) \{(.*?)\n\}", text, re.DOTALL)
-    validate = re.search(r"export function validate\(payload\) \{(.*?)\n\}", text, re.DOTALL)
-    assert receive is not None and validate is not None
-    assert re.search(
-        r'case "visual\.pending":\s*listeners\.get\("pending"\)\?\.\(payload\);', receive[1]
-    )
-    case = re.search(r'case "visual\.pending":(.*?)return true;', validate[1], re.DOTALL)
-    assert case is not None
-    assert 'cappedString(payload, "turn_id")' in case[1]
-    assert 'cappedString(payload, "title")' in case[1]
+def test_no_phase_and_no_pending_title_reach_the_page() -> None:
+    for path in (CLIENT, VISUALS, INDEX, VISUAL_CHECK):
+        text = path.read_text()
+        assert "phase" not in text.lower(), path.name
+        assert "visual.pending" not in text, path.name
+    assert ".canvas.drawing" not in INDEX.read_text()
+    assert 'classList.add("drawing")' not in CLIENT.read_text()
 
 
 def test_the_caption_handler_holds_each_clause_for_its_lead() -> None:
@@ -264,7 +256,7 @@ def test_the_reply_card_replaces_the_caption_line() -> None:
     assert 'class="caption"' not in index
     assert ".caption" not in index and ".caption" not in client
     assert "max-height: 4.5em" in index
-    assert ".canvas iframe.landing" in index and ".canvas.drawing" in index
+    assert ".canvas iframe.landing" in index
 
 
 def test_the_reduced_motion_block_closes_the_stylesheet() -> None:
@@ -277,24 +269,9 @@ def test_the_reduced_motion_block_closes_the_stylesheet() -> None:
     assert reduced is not None
     assert ".canvas iframe { transition: none; }" in reduced[1]
     assert ".canvas iframe.landing { opacity: 1; transform: none; }" in reduced[1]
-    assert ".canvas.drawing { animation: none;" in reduced[1]
     assert sheet[1][reduced.end() :].strip() == ""
-    for selector in (".canvas iframe {", ".canvas iframe.landing {", ".canvas.drawing {"):
+    for selector in (".canvas iframe {", ".canvas iframe.landing {"):
         assert sheet[1].index(selector) < reduced.start(), selector
-
-
-def test_the_drawing_state_clears_on_a_landing_and_a_matching_clear_only() -> None:
-    client = CLIENT.read_text()
-    pending = re.search(r'onPayload\("pending", \(payload\) => \{(.*?)\n\}\);', client, re.DOTALL)
-    history = re.search(
-        r'onPayload\("history", \(items, current\) => \{(.*?)\n\}\);', client, re.DOTALL
-    )
-    assert pending is not None and history is not None
-    assert "payload.turn_id !== pendingTurn" in pending[1]
-    assert "items.length > historyCount || current < 0" in history[1]
-    assert 'canvas.classList.remove("drawing")' in pending[1]
-    assert 'canvas.classList.remove("drawing")' in history[1]
-    assert 'onJson("visual.pending", receive)' in client
 
 
 def test_a_new_frame_lands_with_the_landing_class_until_it_loads() -> None:
@@ -511,25 +488,6 @@ def test_export_never_renders_a_visual() -> None:
     assert "innerHTML" not in span[0]
     assert "entries()" in export_body(client)
     assert "export function entries()" in VISUALS.read_text()
-
-
-def test_only_the_thinking_state_sets_a_turns_phase() -> None:
-    client = CLIENT.read_text()
-    state = re.search(r'onPayload\("state", \(payload\) => \{(.*?)\n\}\);', client, re.DOTALL)
-    transcript = re.search(
-        r'onPayload\("transcript", \(payload\) => \{(.*?)\n\}\);', client, re.DOTALL
-    )
-    assert state is not None and transcript is not None
-    writes = [line for line in state[1].splitlines() if "turns" in line]
-    assert len(writes) == 1
-    assert writes[0].index('payload.state === "thinking"') < writes[0].index(".phase =")
-    assert '"speaking"' not in writes[0]
-    assert '"listening"' not in writes[0]
-    opened = re.search(r"turns\.push\(\{(.*?)\}\)", transcript[1], re.DOTALL)
-    assert opened is not None
-    assert "phase: null" in opened[1]
-    assert "turn_id: payload.turn_id" in opened[1]
-    assert "tutor: []" in opened[1]
 
 
 def test_the_markdown_lists_visuals_by_seq_after_the_turns_not_by_caption_range() -> None:

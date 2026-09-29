@@ -57,7 +57,6 @@ class TurnState(BaseModel):
 
     type: Literal["state"] = "state"
     state: Literal["listening", "thinking", "speaking"]
-    phase: Literal["teach", "concrete", "interrogate"]
     interrupted: bool = False
 
 
@@ -76,14 +75,6 @@ class LearnerText(BaseModel):
     type: Literal["transcript"] = "transcript"
     turn_id: str = Field(max_length=32)
     text: str = Field(max_length=4000)
-
-
-class VisualPending(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    type: Literal["visual.pending"] = "visual.pending"
-    turn_id: str = Field(max_length=32)
-    title: str = Field(max_length=80)
 
 
 SCENE_ID = r"^[a-z][a-z0-9-]{0,31}$"
@@ -247,7 +238,6 @@ ChannelPayload = Annotated[
     | TurnState
     | Caption
     | LearnerText
-    | VisualPending
     | ScenePush
     | SceneShow
     | SceneStep

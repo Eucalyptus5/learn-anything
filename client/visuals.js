@@ -1,6 +1,5 @@
 const KINDS = new Set(["flowchart", "sequence"]);
 const STATES = new Set(["listening", "thinking", "speaking"]);
-const PHASES = new Set(["teach", "concrete", "interrogate"]);
 const SCENE_ID = /^[a-z][a-z0-9-]{0,31}$/;
 const STATUSES = new Set(["planned", "building", "built", "failed", "done"]);
 const KEYS = {
@@ -8,10 +7,9 @@ const KEYS = {
   "diagram.clear": ["type", "seq"],
   "source.highlight": ["type", "seq", "path", "start_line", "end_line"],
   "app.push": ["type", "seq", "id", "html", "title"],
-  "state": ["type", "seq", "state", "phase", "interrupted"],
+  "state": ["type", "seq", "state", "interrupted"],
   "caption": ["type", "seq", "turn_id", "text", "lead_ms"],
   "transcript": ["type", "seq", "turn_id", "text"],
-  "visual.pending": ["type", "seq", "turn_id", "title"],
   "scene.push": ["type", "seq", "scene_id", "title", "html", "steps"],
   "scene.show": ["type", "seq", "scene_id", "at"],
   "scene.step": ["type", "seq", "scene_id", "n", "lead_ms"],
@@ -130,17 +128,12 @@ export function validate(payload) {
       return true;
     case "state":
       if (!STATES.has(payload.state)) return reject("unknown state");
-      if (!PHASES.has(payload.phase)) return reject("unknown phase");
       if (typeof payload.interrupted !== "boolean") return reject("bad interrupted");
       return true;
     case "caption":
       if (!cappedString(payload, "turn_id")) return reject("bad turn_id");
       if (!cappedString(payload, "text", TEXT_CAPS.caption)) return reject("bad text");
       if (!Number.isInteger(payload.lead_ms) || payload.lead_ms < 0) return reject("bad lead_ms");
-      return true;
-    case "visual.pending":
-      if (!cappedString(payload, "turn_id")) return reject("bad turn_id");
-      if (!cappedString(payload, "title")) return reject("bad title");
       return true;
     case "transcript":
       if (!cappedString(payload, "turn_id")) return reject("bad turn_id");
@@ -300,9 +293,6 @@ export function receive(payload) {
     case "source.highlight":
       highlight.textContent =
         payload.path + ":" + payload.start_line + "-" + payload.end_line;
-      break;
-    case "visual.pending":
-      listeners.get("pending")?.(payload);
       break;
     case "scene.push":
       check(payload);

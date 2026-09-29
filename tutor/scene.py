@@ -5,7 +5,6 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from tutor.brief import VisualBrief
 from tutor.prompt import TurnPrompt
 from tutor.reasoning import ReasoningClient
 from tutor.visuals import StepLine
@@ -81,8 +80,8 @@ SCENE_TOOLS: list[dict[str, object]] = [
 ]
 
 
-def scene_prompt(subject: str, brief: VisualBrief, theme: str, error: str = "") -> TurnPrompt:
-    user_text = f"Subject: {subject}\nTitle: {brief.title}\nShow: {brief.show}"
+def scene_prompt(subject: str, title: str, show: str, theme: str, error: str = "") -> TurnPrompt:
+    user_text = f"Subject: {subject}\nTitle: {title}\nShow: {show}"
     if error:
         user_text += RETRY.format(error=error)
     return TurnPrompt(system=f"{CONTRACT.format(theme=theme)}\n\n{GUIDE}", user_text=user_text)

@@ -75,9 +75,9 @@ def scene_call(html: str, steps: list[str]) -> TurnChunk:
     )
 
 
-def test_the_brief_validates_and_names_the_numbers() -> None:
+def test_the_fixed_picture_names_the_numbers() -> None:
     brief = bench_scene.BRIEF
-    assert brief.kind == "app" and brief.title == "Clipped objective"
+    assert brief.title == "Clipped objective"
     assert "0.5 to 1.5" in brief.show and "0.2" in brief.show
 
 

@@ -5,7 +5,6 @@ import re
 from pathlib import Path
 
 from tests.test_session import FakeReasoning, visual_call
-from tutor.brief import VisualBrief
 from tutor.reasoning import TurnChunk
 from tutor.scene import (
     CONTRACT,
@@ -19,7 +18,8 @@ from tutor.scene import (
     scene_prompt,
 )
 
-BRIEF = VisualBrief(kind="app", title="Clipped objective", show="surrogate vs ratio, epsilon 0.2")
+TITLE = "Clipped objective"
+SHOW = "surrogate vs ratio, epsilon 0.2"
 DRAFT = {"html": "<!doctype html><p>x</p>", "steps": ["The axes", "The curve", "The band"]}
 DRAFT_ARGUMENTS = json.dumps(DRAFT)
 VARIABLES = (
@@ -53,8 +53,8 @@ def test_the_guide_is_ascii_bounded_and_names_every_variable_the_helper_defines(
     assert "eight thousand" not in text and "quickly" not in text
 
 
-def test_the_prompt_is_the_contract_the_guide_the_subject_and_the_brief() -> None:
-    prompt = scene_prompt("PPO", BRIEF, "dark")
+def test_the_prompt_is_the_contract_the_guide_the_subject_the_title_and_the_show() -> None:
+    prompt = scene_prompt("PPO", TITLE, SHOW, "dark")
 
     assert prompt.system.startswith(CONTRACT.split("{", 1)[0])
     assert "The page is dark" in prompt.system
@@ -84,8 +84,8 @@ def test_the_prompt_is_the_contract_the_guide_the_subject_and_the_brief() -> Non
 
 
 def test_a_retry_carries_the_previous_error_and_nothing_else_changes() -> None:
-    first = scene_prompt("PPO", BRIEF, "light")
-    retry = scene_prompt("PPO", BRIEF, "light", error="timeline lacks labels step-3")
+    first = scene_prompt("PPO", TITLE, SHOW, "light")
+    retry = scene_prompt("PPO", TITLE, SHOW, "light", error="timeline lacks labels step-3")
 
     assert retry.system == first.system
     assert retry.user_text == first.user_text + (
@@ -134,7 +134,7 @@ async def test_a_tool_call_becomes_a_draft_and_is_logged_without_its_text(caplog
     reasoning = FakeReasoning(log, [], asyncio.Event(), visual=[call(DRAFT_ARGUMENTS)])
     with caplog.at_level(logging.INFO, logger="tutor.scene"):
         result = await run_scene_build(
-            reasoning, scene_prompt("PPO", BRIEF, "light"), 32000, "high", model="draw-1"
+            reasoning, scene_prompt("PPO", TITLE, SHOW, "light"), 32000, "high", model="draw-1"
         )
 
     assert result == SceneDraft.model_validate(DRAFT)
@@ -155,7 +155,7 @@ async def test_prose_without_a_tool_call_is_the_no_tool_string(caplog) -> None:
     )
     with caplog.at_level(logging.INFO, logger="tutor.scene"):
         result = await run_scene_build(
-            reasoning, scene_prompt("PPO", BRIEF, "light"), 32000, "high"
+            reasoning, scene_prompt("PPO", TITLE, SHOW, "light"), 32000, "high"
         )
 
     assert result == NO_TOOL_CALL
@@ -166,7 +166,9 @@ async def test_a_stream_with_neither_prose_nor_a_call_is_empty_and_one_line(capl
     log: list[tuple[str, object]] = []
     capped = FakeReasoning(log, [], asyncio.Event(), visual=[], visual_finish="length")
     with caplog.at_level(logging.INFO, logger="tutor.scene"):
-        result = await run_scene_build(capped, scene_prompt("PPO", BRIEF, "light"), 128000, "high")
+        result = await run_scene_build(
+            capped, scene_prompt("PPO", TITLE, SHOW, "light"), 128000, "high"
+        )
 
     assert result == EMPTY_REPLY == "scene: error: empty reply"
     assert [m for m in caplog.messages if m.startswith("scene.")] == ["scene.empty finish=length"]
@@ -174,7 +176,9 @@ async def test_a_stream_with_neither_prose_nor_a_call_is_empty_and_one_line(capl
     caplog.clear()
     dropped = FakeReasoning(log, [], asyncio.Event(), visual=[])
     with caplog.at_level(logging.INFO, logger="tutor.scene"):
-        result = await run_scene_build(dropped, scene_prompt("PPO", BRIEF, "light"), 128000, "high")
+        result = await run_scene_build(
+            dropped, scene_prompt("PPO", TITLE, SHOW, "light"), 128000, "high"
+        )
 
     assert result == EMPTY_REPLY
     assert [m for m in caplog.messages if m.startswith("scene.")] == ["scene.empty finish=None"]
@@ -184,7 +188,9 @@ async def test_an_unexpected_tool_and_a_truncated_stream_are_error_strings(caplo
     log: list[tuple[str, object]] = []
     other = FakeReasoning(log, [], asyncio.Event(), visual=[call("{}", "push_app")])
     with caplog.at_level(logging.WARNING, logger="tutor.scene"):
-        result = await run_scene_build(other, scene_prompt("PPO", BRIEF, "light"), 32000, "high")
+        result = await run_scene_build(
+            other, scene_prompt("PPO", TITLE, SHOW, "light"), 32000, "high"
+        )
     assert result == "scene: error: unexpected tool push_app"
     assert "scene.unexpected_tool chars=2" in caplog.messages
     assert "push_app" not in " ".join(caplog.messages)
@@ -192,7 +198,9 @@ async def test_an_unexpected_tool_and_a_truncated_stream_are_error_strings(caplo
         log, [], asyncio.Event(), visual=[call(DRAFT_ARGUMENTS[:20])], visual_finish="length"
     )
     with caplog.at_level(logging.INFO, logger="tutor.scene"):
-        result = await run_scene_build(cut, scene_prompt("PPO", BRIEF, "light"), 32000, "high")
+        result = await run_scene_build(
+            cut, scene_prompt("PPO", TITLE, SHOW, "light"), 32000, "high"
+        )
     assert result == "scene: error: truncated at 32000 tokens"
     assert "scene.truncated chars=20" in caplog.messages
 
@@ -201,7 +209,9 @@ async def test_bad_arguments_are_error_strings_that_carry_no_text(caplog) -> Non
     log: list[tuple[str, object]] = []
     broken = FakeReasoning(log, [], asyncio.Event(), visual=[call("{")])
     with caplog.at_level(logging.WARNING, logger="tutor.scene"):
-        result = await run_scene_build(broken, scene_prompt("PPO", BRIEF, "light"), 32000, "high")
+        result = await run_scene_build(
+            broken, scene_prompt("PPO", TITLE, SHOW, "light"), 32000, "high"
+        )
     assert result == "scene: error: arguments are not valid JSON"
     assert "scene.tool_arguments chars=1" in caplog.messages
 
@@ -209,7 +219,9 @@ async def test_bad_arguments_are_error_strings_that_carry_no_text(caplog) -> Non
         log, [], asyncio.Event(), visual=[call(json.dumps({"html": "<p>x</p>", "steps": ["a"]}))]
     )
     with caplog.at_level(logging.WARNING, logger="tutor.scene"):
-        result = await run_scene_build(short, scene_prompt("PPO", BRIEF, "light"), 32000, "high")
+        result = await run_scene_build(
+            short, scene_prompt("PPO", TITLE, SHOW, "light"), 32000, "high"
+        )
     assert isinstance(result, str) and result.startswith("scene: error: steps: ")
     assert "<p>" not in result
     assert "scene.rejected errors=1" in caplog.messages
@@ -221,7 +233,9 @@ async def test_bad_arguments_are_error_strings_that_carry_no_text(caplog) -> Non
         visual=[call(json.dumps({**DRAFT, "<p>secret</p>": 1}))],
     )
     with caplog.at_level(logging.WARNING, logger="tutor.scene"):
-        result = await run_scene_build(extra, scene_prompt("PPO", BRIEF, "light"), 32000, "high")
+        result = await run_scene_build(
+            extra, scene_prompt("PPO", TITLE, SHOW, "light"), 32000, "high"
+        )
     assert result == "scene: error: extra: Extra inputs are not permitted"
     assert caplog.messages.count("scene.rejected errors=1") == 2
     assert "<p>" not in " ".join(caplog.messages)
@@ -233,12 +247,16 @@ async def test_bad_arguments_are_error_strings_that_carry_no_text(caplog) -> Non
         visual=[call('{"html": "<p>x</p>", "steps": ["a", "b", "c"], "n": ' + "1" * 5000 + "}")],
     )
     with caplog.at_level(logging.WARNING, logger="tutor.scene"):
-        result = await run_scene_build(digits, scene_prompt("PPO", BRIEF, "light"), 32000, "high")
+        result = await run_scene_build(
+            digits, scene_prompt("PPO", TITLE, SHOW, "light"), 32000, "high"
+        )
     assert result == "scene: error: arguments are not valid JSON"
     assert "scene.tool_arguments chars=5053" in caplog.messages
 
     nested = FakeReasoning(log, [], asyncio.Event(), visual=[call("[" * 20000)])
     with caplog.at_level(logging.WARNING, logger="tutor.scene"):
-        result = await run_scene_build(nested, scene_prompt("PPO", BRIEF, "light"), 32000, "high")
+        result = await run_scene_build(
+            nested, scene_prompt("PPO", TITLE, SHOW, "light"), 32000, "high"
+        )
     assert result == "scene: error: arguments are not valid JSON"
     assert "scene.tool_arguments chars=20000" in caplog.messages
