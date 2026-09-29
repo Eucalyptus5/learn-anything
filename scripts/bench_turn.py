@@ -1,29 +1,35 @@
 """End to end turn latency through the real stack: scripted text in, timestamped 48 kHz frames
-out of the playout track. Reports time to first sound, time to substance, the visual's landing
-and validity, and the cost per turn. Without ``--root`` the turns are a concept lesson on PPO;
-with it they walk the fixture repo, the only tree searched. Text only on the wire. Each turn's
-reply length is appended to the capture file (``--capture``, default
-``scratch/bench/replies.jsonl``). ``--soak MINUTES`` runs the same turns for a stated number of
-minutes while sampling power, thermal pressure, cluster frequency, process RSS and swap.
+out of the playout track. Reports time to first sound, time to substance and the cost per turn.
+Without ``--root`` the turns are a concept lesson on PPO; with it they walk the fixture repo, the
+only tree searched. Text only on the wire. Each turn's reply length is appended to the capture
+file (``--capture``, default ``scratch/bench/replies.jsonl``). ``--soak MINUTES`` runs the same
+turns for a stated number of minutes while sampling power, thermal pressure, cluster frequency,
+process RSS and swap. ``--plan`` answers the planner from a fixed lesson and ``--stub-scenes``
+answers every scene build with a stub; ``--scenarios`` replays each case's setup and reads the
+tags of the one measured reply, writing it to ``--out``; ``--connect`` times connect to the first
+audio frame and to scene one checked on the real planner, builder and voice. The page is simulated.
 """
 
 import argparse
 import asyncio
 import contextlib
+import copy
+import hashlib
 import json
 import logging
 import os
+import re
 import statistics
 import sys
 import time
 from collections import Counter
-from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Sequence
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple, Self
 
 import numpy as np
 from aiortc import RTCConfiguration, RTCPeerConnection
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -35,10 +41,14 @@ from tutor.config import Settings, settings
 from tutor.constants import TTS_SAMPLE_RATE, WEBRTC_FRAME_SAMPLES, WEBRTC_SAMPLE_RATE
 from tutor.cost import TurnUsage, UsageLedger, turn_cost_usd
 from tutor.input_path import EndOfTurn, InputEvent
-from tutor.prompt import TurnPrompt
+from tutor.lesson import OPENING_TEXT, Cursor, LessonPlan, LessonState
+from tutor.planner import PLAN_TOOL
+from tutor.prompt import Message, TurnPrompt
 from tutor.reasoning import ReasoningClient, TurnChunk, TurnStream
-from tutor.session import TurnLoop
+from tutor.scene import SCENE_TOOL
+from tutor.session import TurnLoop, TurnLoopConfig
 from tutor.signaling import SessionRequest
+from tutor.tags import TAG_NAMES, TagSplitter, parse_marker, tag_name
 from tutor.transport import Connection
 from tutor.tts import KokoroSynthesizer
 
@@ -76,8 +86,13 @@ PPO_UTTERANCES = (
     "the clip makes the gradient larger past epsilon",
     "just tell me",
 )
-PUSH_TYPES = frozenset({"scene.show"})
 CAPTURE_DIR = REPO / "scratch" / "bench"
+LISTENING_OUTCOME = REPO / "scratch" / "experiments" / "12" / "listening" / "outcome.json"
+SCENE_READY_TIMEOUT_S = TurnLoopConfig.model_fields["scene_ready_timeout_s"].default
+STUB_COUNT = re.compile(r"exactly (\d+), one say line each")
+STUB_HTML = '<!doctype html><div id="stub"></div>'
+GROUPS = ("opening", "progress", "question", "answer", "boundary", "tangent")
+FLOOR = 27
 
 
 def utterances_for(root: Path | None) -> tuple[str, ...]:
@@ -108,7 +123,9 @@ def model_text(streams: Sequence[Sequence[str]]) -> str:
     for n, deltas in enumerate(streams):
         if n:
             pieces.append("\n")
-        pieces.extend(deltas)
+        tags = TagSplitter()
+        for delta in deltas:
+            pieces.extend(item for item in tags.feed(delta) if isinstance(item, str))
     scrubber = Scrubber()
     scrubbed = [text for text in (scrubber.feed(piece) for piece in pieces) if text]
     if flushed := scrubber.flush():
@@ -118,10 +135,6 @@ def model_text(streams: Sequence[Sequence[str]]) -> str:
 
 def is_model(text: str | None, model: str) -> bool:
     return text is not None and text in model
-
-
-def is_valid(result: str) -> bool:
-    return result.endswith(": sent")
 
 
 def is_truncated(result: str) -> bool:
@@ -156,25 +169,27 @@ class Sample(BaseModel):
     first_content_delta_ms: int | None
     stages: int
     silent: bool
-    visual_landed_ms: int | None
-    visual_valid: bool | None
-    visual_truncated: bool
     audio_ms: int
     voice_usd: float | None
-    visual_usd: float | None
     utterance: int
+    scenario_id: str | None = None
+    group: str | None = None
+    tags: list[str] | None = None
+    tags_valid: bool | None = None
+    placement_errors: int | None = None
+    dropped: dict[str, int] | None = None
+    progress_ok: bool | None = None
+    asked: bool | None = None
+    scene_ok: bool | None = None
+    leaked: int | None = None
+    opening: bool | None = None
+    scenario_pass: bool | None = None
 
 
 class Enqueued(NamedTuple):
     at: float
     text: str | None
     samples: int
-
-
-class Push(NamedTuple):
-    at: float
-    type: str
-    title: str
 
 
 class PowerSample(BaseModel):
@@ -379,7 +394,6 @@ class TurnRecord:
         self.visual_first_chunk_ms: int | None = None
         self.planner_usage: TurnUsage | None = None
         self.planner_first_chunk_ms: int | None = None
-        self.visual_task: asyncio.Task[str] | None = None
 
 
 def add_usage(total: TurnUsage | None, usage: TurnUsage) -> TurnUsage:
@@ -443,9 +457,34 @@ class MeteredStream:
             record.visual_usage = add_usage(record.visual_usage, usage)
 
 
+class CannedStream:
+    def __init__(self, chunks: list[TurnChunk], finish_reason: str) -> None:
+        self._chunks = chunks
+        self.finish_reason = finish_reason
+        self.usage: TurnUsage | None = None
+        self.first_chunk_ms: int | None = None
+
+    async def __aiter__(self) -> AsyncIterator[TurnChunk]:
+        for chunk in self._chunks:
+            yield chunk
+
+
+def stub_scene(prompt: TurnPrompt) -> TurnChunk:
+    count = int(STUB_COUNT.search(prompt.user_text).group(1))
+    body = {"html": STUB_HTML, "steps": [f"Step {n}" for n in range(1, count + 1)]}
+    return TurnChunk(
+        kind="tool_call", text=json.dumps(body), tool_call_id="call-scene", tool_name=SCENE_TOOL
+    )
+
+
 class MeteredReasoning:
-    def __init__(self, inner: ReasoningClient) -> None:
+    def __init__(
+        self, inner: ReasoningClient, plan: LessonPlan | None = None, stub_scenes: bool = False
+    ) -> None:
         self._inner = inner
+        self._plan = plan
+        self._stub_scenes = stub_scenes
+        self._scripted: list[str] = []
         self.ledger = UsageLedger()
         self.ledgers = {"voice": UsageLedger(), "visual": UsageLedger(), "planner": UsageLedger()}
         self.record = TurnRecord()
@@ -453,6 +492,9 @@ class MeteredReasoning:
     def begin(self) -> TurnRecord:
         self.record = TurnRecord()
         return self.record
+
+    def script(self, replies: Iterable[str]) -> None:
+        self._scripted.extend(replies)
 
     def start_turn(
         self,
@@ -462,19 +504,27 @@ class MeteredReasoning:
         max_tokens: int | None = None,
         tool_choice: str | None = None,
         model: str | None = None,
-    ) -> MeteredStream:
+    ) -> MeteredStream | CannedStream:
+        name = tools[0]["function"]["name"] if tools else None
+        kind = {PLAN_TOOL: "planner", SCENE_TOOL: "visual"}.get(name, "voice")
+        if kind == "planner" and self._plan is not None:
+            call = TurnChunk(
+                kind="tool_call",
+                text=self._plan.model_dump_json(),
+                tool_call_id="call-plan",
+                tool_name=PLAN_TOOL,
+            )
+            return CannedStream([call], "tool_calls")
+        if kind == "visual" and self._stub_scenes:
+            return CannedStream([stub_scene(prompt)], "tool_calls")
+        if kind == "voice" and self._scripted:
+            reply = self._scripted.pop(0)
+            pieces = [piece for piece in re.split(r"(?<= )", reply) if piece]
+            return CannedStream([TurnChunk(kind="spoken", text=piece) for piece in pieces], "stop")
         record = self.record
-        if record.requested is None:
+        # A build or a planner call runs beside the turn; only a voice call starts its clock.
+        if kind == "voice" and record.requested is None:
             record.requested = time.perf_counter()
-        names = {tool["function"]["name"] for tool in tools or ()}
-        if tool_choice is None:
-            kind = "voice"
-        elif "write_plan" in names:
-            kind = "planner"
-        else:
-            kind = "visual"
-        if kind == "visual":
-            record.visual_task = asyncio.current_task()
         inner = self._inner.start_turn(
             prompt,
             tools=tools,
@@ -511,9 +561,18 @@ class BenchTransport(Connection):
         self._track = pc.getSenders()[0].track
         self._synth = synth
         self.ledger: list[Enqueued] = []
-        self.pushes: list[Push] = []
         self.frames: list[tuple[float, bool]] = []
+        self.first_sound: float | None = None
         self.emitted = asyncio.Event()
+        self.checks: list[tuple[float, str, bool]] = []
+        self.simulated: Counter[str] = Counter()
+        self._held: dict[int, tuple[dict[str, object], asyncio.TimerHandle]] = {}
+        self._epoch = 0
+        self._barrier = 0
+        self._revision = 0
+        self._scene_id: str | None = None
+        self._step = 0
+        self._last_cue = 0
 
     async def play(self, pcm: np.ndarray) -> None:
         at = time.perf_counter()
@@ -521,7 +580,8 @@ class BenchTransport(Connection):
         await super().play(floored(pcm))
 
     async def send_json(self, payload: dict[str, object]) -> None:
-        if payload["type"] == "scene.push":
+        kind = payload["type"]
+        if kind == "scene.push":
             report = {
                 "type": "scene.ready",
                 "scene_id": payload["scene_id"],
@@ -529,17 +589,97 @@ class BenchTransport(Connection):
                 "steps": len(payload["steps"]),
                 "error": "",
             }
-            for handler in self._handlers:
-                handler(report)
+            self.checks.append((time.perf_counter(), str(payload["scene_id"]), True))
+            self._answer(report, "ready")
+        elif kind == "lesson.attach":
+            self._drop("barrier")
+            self._epoch = payload["epoch"]
+            self._barrier = self._revision = self._step = self._last_cue = 0
+            self._scene_id = None
+        elif kind == "lesson.cue":
+            cue_id = int(payload["cue_id"])
+            lead_s = int(payload["lead_ms"]) / 1000
+            timer = asyncio.get_running_loop().call_later(lead_s, self._due, cue_id)
+            self._held[cue_id] = (payload, timer)
+        elif kind == "lesson.sync":
+            # The page answers over the network, after the session has armed its wait.
+            asyncio.get_running_loop().call_soon(self._sync, payload)
+
+    def _answer(self, message: dict[str, object], label: str) -> None:
+        self.simulated[label] += 1
+        for handler in self._handlers:
+            handler(message)
+
+    def _ack(self, cue: dict[str, object], outcome: str, reason: str | None) -> None:
+        ack = {
+            "type": "lesson.ack",
+            "epoch": cue["epoch"],
+            "barrier": cue["barrier"],
+            "cue_id": cue["cue_id"],
+            "outcome": outcome,
+            "reason": reason,
+            "scene_id": self._scene_id,
+            "step": self._step,
+            "revision": self._revision,
+        }
+        self._answer(ack, "_".join(part for part in ("ack", outcome, reason) if part))
+
+    def _due(self, cue_id: int) -> None:
+        for held in sorted(n for n in self._held if n <= cue_id):
+            cue, timer = self._held.pop(held)
+            timer.cancel()
+            tag = cue["tag"]
+            if cue["epoch"] != self._epoch:
+                reason = "stale_epoch"
+            elif cue["barrier"] != self._barrier:
+                reason = "stale_barrier"
+            elif cue["revision"] != self._revision or cue["scene_id"] != self._scene_id:
+                reason = "stale_revision"
+            elif tag["kind"] == "step" and tag["n"] <= self._step:
+                reason = "range"
+            else:
+                reason = None
+            if reason is not None:
+                self._ack(cue, "dropped", reason)
+                continue
+            if tag["kind"] == "scene":
+                self._scene_id, self._step = tag["scene_id"], 1
+            else:
+                self._step = tag["n"]
+            self._revision += 1
+            self._last_cue = cue["cue_id"]
+            self._ack(cue, "fired", None)
+
+    def _drop(self, reason: str) -> None:
+        for held in sorted(self._held):
+            cue, timer = self._held.pop(held)
+            timer.cancel()
+            self._ack(cue, "dropped", reason)
+
+    def _sync(self, sync: dict[str, object]) -> None:
+        if sync["epoch"] != self._epoch:
             return
-        if payload["type"] in PUSH_TYPES:
-            at = time.perf_counter()
-            self.pushes.append(Push(at, str(payload["type"]), str(payload["scene_id"])))
+        self._drop("barrier")
+        self._barrier = sync["barrier"]
+        synced = {
+            "type": "lesson.synced",
+            "epoch": self._epoch,
+            "barrier": self._barrier,
+            "scene_id": self._scene_id,
+            "step": self._step,
+            "revision": self._revision,
+            "last_cue": self._last_cue,
+        }
+        self._answer(synced, "synced")
 
     async def drain(self) -> None:
         while True:
             frame = await self._track.recv()
-            self.frames.append((time.perf_counter(), bool(frame.to_ndarray().any())))
+            at = time.perf_counter()
+            real = bool(frame.to_ndarray().any())
+            self.frames.append((at, real))
+            if real and self.first_sound is None:
+                self.first_sound = at
             self.emitted.set()
 
     async def wait_frames(self, ready: Callable[[], bool]) -> None:
@@ -554,17 +694,29 @@ class BenchTransport(Connection):
     def real_times_since(self, since: int) -> list[float]:
         return [t for t, real in self.frames[since:] if real]
 
+    async def close(self) -> None:
+        for _, timer in self._held.values():
+            timer.cancel()
+        self._held.clear()
+        await super().close()
+
 
 class OutcomeWatch(logging.Filter):
     def __init__(self) -> None:
         super().__init__()
         self.seen: set[str] = set()
+        self.planned_at: float | None = None
+        self.unplanned = False
         self.event = asyncio.Event()
 
     def filter(self, record: logging.LogRecord) -> bool:
         if record.msg.startswith(("turn.spoken ", "turn.failed ")):
             self.seen.add(str(record.args[0]))
             self.event.set()
+        elif record.msg.startswith("lesson.planned ") and self.planned_at is None:
+            self.planned_at = time.perf_counter()
+        elif record.msg.startswith("planner.failed stage=connect "):
+            self.unplanned = True
         return True
 
     async def wait(self, turn_id: str) -> None:
@@ -573,13 +725,10 @@ class OutcomeWatch(logging.Filter):
             await self.event.wait()
 
 
-async def settle_visual(turn_id: str, timeout_s: float) -> bool:
-    name = f"{turn_id}-visual"
-    task = next((t for t in asyncio.all_tasks() if t.get_name() == name), None)
-    if task is None:
-        return False
-    done, _ = await asyncio.wait({task}, timeout=timeout_s)
-    return bool(done)
+class Measured(NamedTuple):
+    sample: Sample
+    reply: str
+    spoken: list[str]
 
 
 class Bench:
@@ -593,41 +742,43 @@ class Bench:
         synth: TaggedSynth,
         watch: OutcomeWatch,
         loop: TurnLoop,
-        scene_timeout_s: float,
+        started: float,
         capture: Capture | None,
     ) -> None:
         self._loop_task = loop_task
         self._drain_task = drain_task
         self._source = source
-        self._transport = transport
+        self.transport = transport
         self.reasoning = reasoning
         self._synth = synth
-        self._watch = watch
+        self.watch = watch
         self._loop = loop
-        self._scene_timeout_s = scene_timeout_s
+        self.started = started
         self._capture = capture
         self._dispatched = 0
 
     @classmethod
-    async def boot(
+    def boot(
         cls,
         cfg: Settings,
-        root: Path | None,
-        subject: str,
-        starting_from: str,
+        models: Models,
+        inner: ReasoningClient,
+        request: SessionRequest,
+        planned: bool,
+        plan: LessonPlan | None = None,
+        stub_scenes: bool = False,
+        replies: Sequence[str] = (),
         capture: Capture | None = None,
-        silent: bool = False,
     ) -> "Bench":
-        request = SessionRequest(subject=subject, folder=root, starting_from=starting_from)
-        loaded = await asyncio.to_thread(load_models)
-        synth = TaggedSynth(SilentSynth() if silent else loaded.synth)
-        models = Models(partial=loaded.partial, final=loaded.final, synth=synth)
-        reasoning = MeteredReasoning(ReasoningClient(cfg))
-        transport = BenchTransport(synth)
+        reasoning = MeteredReasoning(inner, plan, stub_scenes)
+        reasoning.script(replies)
+        transport = BenchTransport(models.synth)
         source = ScriptedSource()
-        loop = build_loop(cfg, models, reasoning, source, transport, request, planned=False)
+        loop = build_loop(cfg, models, reasoning, source, transport, request, planned=planned)
         watch = OutcomeWatch()
         logging.getLogger("tutor.session").addFilter(watch)
+        reasoning.begin()
+        started = time.perf_counter()
         loop_task = asyncio.create_task(loop.run(), name="bench-loop")
         drain_task = asyncio.create_task(transport.drain(), name="bench-drain")
         return cls(
@@ -636,28 +787,36 @@ class Bench:
             source,
             transport,
             reasoning,
-            synth,
+            models.synth,
             watch,
             loop,
-            cfg.scene_timeout_s,
+            started,
             capture,
         )
 
-    async def turn(self, text: str, utterance: int = 0, sample: bool = True) -> Sample:
-        transport = self._transport
-        transport.flush_playout()
-        since = len(transport.frames)
-        await transport.wait_frames(lambda: transport.idle_since(since))
-        ledger_since = len(transport.ledger)
-        pushes_since = len(transport.pushes)
-        self._dispatched += 1
-        record = self.reasoning.begin()
-        self._synth.last = None
-        turn_id = f"turn-{self._dispatched}"
+    @property
+    def lesson(self) -> LessonState:
+        return self._loop._lesson
 
-        t0 = time.perf_counter()
-        self._source.inject(EndOfTurn(text=text))
-        await self._watch.wait(turn_id)
+    def history(self) -> list[Message]:
+        return self._loop._transcript.history(before=f"turn-{self._dispatched + 1}")
+
+    async def turn(self, learner: str | None, utterance: int = 0, sample: bool = True) -> Measured:
+        transport = self.transport
+        if learner is None:
+            since = ledger_since = 0
+            record, t0 = self.reasoning.record, self.started
+        else:
+            transport.flush_playout()
+            since = len(transport.frames)
+            await transport.wait_frames(lambda: transport.idle_since(since))
+            ledger_since = len(transport.ledger)
+            record = self.reasoning.begin()
+            self._synth.last = None
+            t0 = time.perf_counter()
+            self._source.inject(EndOfTurn(text=learner))
+        self._dispatched += 1
+        await self.watch.wait(f"turn-{self._dispatched}")
         spoken_at = len(transport.frames)
 
         played = transport.ledger[ledger_since:]
@@ -671,8 +830,6 @@ class Bench:
             )
         )
 
-        await settle_visual(turn_id, self._scene_timeout_s)
-
         reply = "\n".join("".join(deltas) for deltas in record.streams)
         if self._capture is not None:
             self._capture.write(self._dispatched, utterance, sample, len(reply))
@@ -681,34 +838,31 @@ class Bench:
         first_sound = real_times[0] if real_times else None
         substance = substance_frame_time(lengths, m, real_times) if m is not None else None
         before = played[:m] if m is not None else played
-        pushes = transport.pushes[pushes_since:]
-        task = record.visual_task
-        result = None
-        if task is not None and task.done() and not task.cancelled() and task.exception() is None:
-            result = task.result()
-        voice, visual = record.voice_usage, record.visual_usage
-        if task is None:
-            visual_usd = 0.0
-        elif visual is None:
-            visual_usd = None
-        else:
-            visual_usd = turn_cost_usd(visual, list_price=True)
-        return Sample(
+        voice = record.voice_usage
+        measured = Sample(
             first_sound_ms=None if first_sound is None else int((first_sound - t0) * 1000),
             substance_ms=None if substance is None else int((substance - t0) * 1000),
             first_content_delta_ms=record.first_spoken_ms,
             stages=max(sum(1 for entry in before if entry.text is not None) - 1, 0),
             silent=m is None,
-            visual_landed_ms=None if not pushes else int((pushes[0].at - t0) * 1000),
-            visual_valid=None if task is None else result is not None and is_valid(result),
-            visual_truncated=result is not None and is_truncated(result),
             audio_ms=sum(entry.samples for entry in played) * 1000 // TTS_SAMPLE_RATE,
             voice_usd=None if voice is None else turn_cost_usd(voice, list_price=True),
-            visual_usd=visual_usd,
             utterance=utterance,
+        )
+        return Measured(measured, reply, [entry.text for entry in played if entry.text is not None])
+
+    async def settle(self) -> None:
+        lesson = self.lesson
+        await self.transport.wait_frames(
+            lambda: (
+                not lesson.sent
+                and lesson.next_to_build() is None
+                and lesson.committed <= lesson.built.keys() | lesson.failed
+            )
         )
 
     async def aclose(self) -> None:
+        await self._loop.aclose()
         self._source.close()
         try:
             await self._loop_task
@@ -716,10 +870,237 @@ class Bench:
             self._drain_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._drain_task
-            logging.getLogger("tutor.session").removeFilter(self._watch)
-            await self._loop.aclose()
-            await self.reasoning.aclose()
-            await self._transport.close()
+            logging.getLogger("tutor.session").removeFilter(self.watch)
+            await self.transport.close()
+
+
+class TagRead(NamedTuple):
+    tags: list[str]
+    valid: bool
+    dropped: dict[str, int]
+    placement_errors: int
+    leaked: int
+
+
+def classify_tags(
+    reply: str, spoken: list[str], state: LessonState, sentence_rule: bool
+) -> TagRead:
+    ends = ".?!" if sentence_rule else ".?!;:,"
+    probe = copy.deepcopy(state)
+    splitter = TagSplitter()
+    items = [*splitter.feed(reply), *splitter.finish()]
+    tags: list[str] = []
+    dropped: Counter[str] = Counter()
+    valid = True
+    misplaced = 0
+    at = 0
+    for item in items:
+        if isinstance(item, str):
+            continue
+        marker = parse_marker(item)
+        kind = tag_name(item)
+        if isinstance(marker, str):
+            valid = False
+            tags.append(kind)
+            dropped[f"{kind}:{marker}"] += 1
+        else:
+            tags.append(f"{marker.kind} {marker.n}")
+            check = probe.step_tag if marker.kind == "step" else probe.scene_tag
+            reason = check(marker.n)
+            if reason is not None:
+                valid = False
+                dropped[f"{marker.kind}:{reason}"] += 1
+        start = reply.index(f"<{item.text}>", at)
+        text = reply[at:start].rstrip()
+        if text and text[-1] not in ends:
+            misplaced += 1
+        at = start + len(item.text) + 2
+    leaked = sum(1 for text in spoken for name in TAG_NAMES if f"<{name}" in text.lower())
+    return TagRead(tags, valid, dict(dropped), misplaced, leaked)
+
+
+def scenario_verdict(passed: int, leaked: int, n: int, groups: dict[str, int]) -> str:
+    if n < SAMPLES:
+        return f"verdict: scenarios passed {passed}/{n}, not a qualification run"
+    line = (
+        f"verdict: scenarios passed {passed}/{n} against the floor of {FLOOR}, leaked {leaked}/{n}"
+    )
+    covered = all(groups.get(group, 0) == SAMPLES // len(GROUPS) for group in GROUPS)
+    return line + ("" if passed >= FLOOR and leaked == 0 and covered else ", FAIL")
+
+
+class SetupTurn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    learner: str | None
+    reply: str
+
+
+class Scenario(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    group: Literal["opening", "progress", "question", "answer", "boundary", "tangent"]
+    setup: list[SetupTurn]
+    target: Cursor
+    asked: list[int]
+    learner: str | None
+    sequences: list[list[str]]
+    question: bool
+    terms: list[str]
+    reveal_forbidden: list[str]
+    requires_scene: int | None
+    forbids_scene: bool
+
+
+class ScenarioResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tags: list[str]
+    tags_valid: bool
+    placement_errors: int
+    dropped: dict[str, int]
+    progress_ok: bool
+    scene_ok: bool
+    reveal_ok: bool
+    asked: bool | None
+    leaked: int
+    opening: bool
+    passed: bool
+
+
+def evaluate_scenario(
+    reply: str, spoken: list[str], state: LessonState, scenario: Scenario, sentence_rule: bool
+) -> ScenarioResult:
+    read = classify_tags(reply, spoken, state, sentence_rule)
+    scenes = [tag for tag in read.tags if tag.startswith("scene ")]
+    if scenario.requires_scene is not None:
+        scene_ok = f"scene {scenario.requires_scene}" in scenes
+    else:
+        scene_ok = not (scenario.forbids_scene and scenes)
+    said = " ".join(spoken).strip()
+    asked = None
+    if scenario.question:
+        asked = said.endswith("?") and all(term.lower() in said.lower() for term in scenario.terms)
+    progress_ok = read.tags in scenario.sequences
+    reveal_ok = not set(read.tags) & set(scenario.reveal_forbidden)
+    passed = (
+        read.valid
+        and progress_ok
+        and scene_ok
+        and reveal_ok
+        and asked is not False
+        and read.placement_errors == 0
+        and read.leaked == 0
+    )
+    return ScenarioResult(
+        tags=read.tags,
+        tags_valid=read.valid,
+        placement_errors=read.placement_errors,
+        dropped=read.dropped,
+        progress_ok=progress_ok,
+        scene_ok=scene_ok,
+        reveal_ok=reveal_ok,
+        asked=asked,
+        leaked=read.leaked,
+        opening=scenario.learner is None,
+        passed=passed,
+    )
+
+
+class Fixture(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plan_digest: str
+    cases: list[Scenario]
+
+    @model_validator(mode="after")
+    def _one_opening_first(self) -> Self:
+        ids = [case.id for case in self.cases]
+        if len(set(ids)) != len(ids):
+            raise ValueError("case ids repeat")
+        for case in self.cases:
+            learners = [turn.learner for turn in case.setup] + [case.learner]
+            if learners[0] is not None or None in learners[1:]:
+                raise ValueError(f"{case.id}: only a case's first turn is the spontaneous opening")
+        return self
+
+
+class ListeningOutcome(BaseModel):
+    sentence_boundaries_only: bool
+
+
+class HarnessError(Exception):
+    pass
+
+
+def check_setup(acked: Cursor, history: list[Message], case: Scenario) -> None:
+    if acked != case.target:
+        raise HarnessError(
+            f"{case.id}: the setup reached scene {acked.scene} step {acked.step}, "
+            f"not scene {case.target.scene} step {case.target.step}"
+        )
+    expected: list[tuple[str, str]] = []
+    for turn in case.setup:
+        learner = OPENING_TEXT if turn.learner is None else turn.learner
+        expected.append(("user", " ".join(learner.split())))
+        splitter = TagSplitter()
+        items = [*splitter.feed(turn.reply), *splitter.finish()]
+        said = " ".join("".join(item for item in items if isinstance(item, str)).split())
+        if said:
+            expected.append(("assistant", said))
+    found = [(message.role, " ".join(message.content.split())) for message in history]
+    if found != expected:
+        raise HarnessError(f"{case.id}: the transcript does not hold the setup's turns")
+
+
+def run_order(cases: list[Scenario]) -> tuple[list[Scenario], list[Scenario]]:
+    measured = sorted(cases, key=lambda case: GROUPS.index(case.group))
+    warmups = [case for case in measured if case.group != "opening"][:WARMUP]
+    return warmups, measured
+
+
+def prepare_out(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    if any(path.iterdir()):
+        raise FileExistsError(f"{path} already holds a run")
+
+
+def write_case(
+    out: Path, case_id: str, reply: str, spoken: list[str], result: ScenarioResult
+) -> None:
+    body = {"reply": reply, "spoken": spoken, "result": result.model_dump(mode="json")}
+    (out / f"{case_id}.json").write_text(json.dumps(body, indent=2, ensure_ascii=True) + "\n")
+
+
+async def run_scenarios(
+    cases: list[Scenario],
+    out: Path,
+    run_case: Callable[[Scenario], Awaitable[tuple[str, list[str], ScenarioResult]]],
+) -> list[ScenarioResult]:
+    warmups, measured = run_order(cases)
+    for case in warmups:
+        await run_case(case)
+    results: list[ScenarioResult] = []
+    for case in measured:
+        reply, spoken, result = await run_case(case)
+        write_case(out, case.id, reply, spoken, result)
+        results.append(result)
+    return results
+
+
+class ConnectSample(BaseModel):
+    plan_ms: int | None
+    plan_valid: bool
+    first_audio_frame_ms: int | None
+    scene_checked_ms: int | None
+
+
+def first_scene_checked(
+    checks: Sequence[tuple[float, str, bool]], plan: LessonPlan
+) -> float | None:
+    first = plan.scenes[0].id
+    return next((at for at, scene_id, ok in checks if ok and scene_id == first), None)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -732,7 +1113,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None)
     parser.add_argument("--capture", type=Path, default=None)
     parser.add_argument("--silent-synth", action="store_true", default=False)
+    parser.add_argument("--plan", type=Path, default=None)
+    parser.add_argument("--stub-scenes", action="store_true", default=False)
+    parser.add_argument("--scenarios", type=Path, default=None)
+    parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--connect", action="store_true", default=False)
     return parser
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    synthetic = [
+        flag
+        for flag, given in (
+            ("--silent-synth", args.silent_synth),
+            ("--stub-scenes", args.stub_scenes),
+            ("--plan", args.plan is not None),
+            ("--scenarios", args.scenarios is not None),
+        )
+        if given
+    ]
+    if args.connect and synthetic:
+        parser.error(f"--connect times the real path and takes none of {', '.join(synthetic)}")
+    if args.scenarios is not None and (
+        args.plan is None or not args.stub_scenes or args.out is None
+    ):
+        parser.error("--scenarios needs --plan, --stub-scenes and --out")
+    if args.out is not None and args.scenarios is None:
+        parser.error("--out holds the reply files of a --scenarios run")
+    return args
+
+
+def planned(args: argparse.Namespace) -> bool:
+    return args.plan is not None or args.connect
 
 
 def ledger_line(prefix: str, ledger: UsageLedger) -> str:
@@ -743,6 +1157,11 @@ def ledger_line(prefix: str, ledger: UsageLedger) -> str:
     )
 
 
+def pool(into: UsageLedger, ledger: UsageLedger) -> None:
+    into.turns += ledger.turns
+    into.total = add_usage(into.total, ledger.total)
+
+
 def report(
     cfg: Settings,
     args: argparse.Namespace,
@@ -751,20 +1170,21 @@ def report(
 ) -> None:
     print(
         "time to first sound: first 48 kHz frame carrying the first synthesized clause leaving "
-        "the playout track after the scripted EndOfTurn is injected; this is the first spoken "
-        "word. Excludes endpointing, recognition and the browser."
+        "the playout track after the scripted EndOfTurn is injected, or after the loop starts for "
+        "the spontaneous opening; this is the first spoken word. Excludes endpointing, "
+        "recognition and the browser."
     )
     print(
         "time to substance: frame carrying the first sample synthesized from a model-authored "
         "clause; the lead-in and stage sentences do not count. Frame granularity 20 ms."
     )
-    print("first content delta: the model's first spoken delta after the first request.")
+    print("first content delta: the model's first spoken delta after the turn's first voice call.")
     print(
-        "a visual lands when its scene.show reaches Connection.send_json, the harness answering "
-        "each scene.push with a passing scene.ready since no page is attached, after the "
-        "EndOfTurn. Visuals are serialized: each turn waits for its own visual task, up to "
-        "scene_timeout_s, before the next turn is injected, so a visual never runs under the "
-        "following turn's voice call and nothing is superseded."
+        "planner calls and scene builds run beside the turns, not inside them: a turn's cost is "
+        "its voice calls, and the planner and visual ledger lines carry the rest. With --plan the "
+        "planner is answered from the file and with --stub-scenes every build is a stub; neither "
+        "reaches the model. The page is simulated: it answers each scene.push with a passing "
+        "scene.ready, fires each lesson.cue after its lead and answers each lesson.sync."
     )
     print(
         "a one-LSB floor is applied to every buffer before playout so an all-zero frame is exactly "
@@ -779,7 +1199,10 @@ def report(
         f"model={cfg.reasoning_model}{synth_field}  samples={len(samples)} "
         f"(plus {WARMUP} discarded warm-ups)  "
         f"subject={subject_for(args.root, args.subject)!r}  root={args.root}  "
-        f"starting_from={args.starting_from!r}  scene_timeout_s={cfg.scene_timeout_s}  "
+        f"starting_from={args.starting_from!r}  planned={planned(args)}  plan={args.plan}  "
+        f"stub_scenes={args.stub_scenes}  "
+        f"planner_model={cfg.planner_model or cfg.reasoning_model}  "
+        f"planner_effort={cfg.planner_effort}  scene_timeout_s={cfg.scene_timeout_s}  "
         f"scene_max_tokens={cfg.scene_max_tokens}  "
         f"scene_effort={cfg.scene_effort}  scene_model={cfg.scene_model or cfg.reasoning_model}"
     )
@@ -798,31 +1221,98 @@ def report(
         "first content delta (model, from first request)",
         [s.first_content_delta_ms for s in samples if s.first_content_delta_ms is not None],
     )
-    landed = [s for s in samples if s.visual_landed_ms is not None]
-    summarize("visual landing", [s.visual_landed_ms for s in landed])
-    measured("audio length, those turns", [s.audio_ms for s in landed])
-    priced = [s for s in samples if s.voice_usd is not None and s.visual_usd is not None]
-    summarize_usd("cost per turn (list)", [s.voice_usd + s.visual_usd for s in priced])
-    summarize_usd(
-        "voice cost per turn (list)", [s.voice_usd for s in samples if s.voice_usd is not None]
-    )
-    summarize_usd(
-        "visual cost per turn (list)", [s.visual_usd for s in samples if s.visual_usd is not None]
-    )
+    measured("audio length per turn", [s.audio_ms for s in samples])
+    priced = [s.voice_usd for s in samples if s.voice_usd is not None]
+    summarize_usd("cost per turn (list)", priced)
     print(f"turns with unknown cost {len(samples) - len(priced)}/{len(samples)}")
     stages = [s.stages for s in samples if not s.silent]
     if stages:
         print(f"stage sentences before substance median={int(statistics.median(stages))}")
     silent = sum(1 for s in samples if s.silent)
     print(f"silent turns {silent}/{len(samples)}")
-    calls = [s for s in samples if s.visual_valid is not None]
-    print(f"visual calls {len(calls)}/{len(samples)}")
-    print(f"visuals landed {len(landed)}/{len(calls)}")
-    print(f"visuals valid {sum(1 for s in calls if s.visual_valid)}/{len(calls)}")
-    print(f"visuals truncated {sum(1 for s in calls if s.visual_truncated)}/{len(calls)}")
     print(ledger_line("", reasoning.ledger))
     print(ledger_line("voice ", reasoning.ledgers["voice"]))
     print(ledger_line("visual ", reasoning.ledgers["visual"]))
+    print(ledger_line("planner ", reasoning.ledgers["planner"]))
+
+
+def report_page(simulated: Counter[str]) -> None:
+    counts = " ".join(f"{label}={count}" for label, count in sorted(simulated.items()))
+    print(f"simulated page answers, no browser: {counts or 'none'}")
+
+
+def report_scenarios(samples: list[Sample], sentence_rule: bool) -> None:
+    n = len(samples)
+    print(
+        "scenario checks read each tag where the reply wrote it: a tag is placed at the reply's "
+        f"start, after another tag, or after one of {'.?!' if sentence_rule else '.?!;:,'}. "
+        "Asked is a proxy, a final question mark and every required term, case-insensitive, "
+        "not a semantic judge. The setup replies, the plan and the builds are scripted; only the "
+        "measured reply reaches the model."
+    )
+    placed = sum(1 for s in samples if s.tags_valid and s.placement_errors == 0)
+    print(f"tags valid and placed {placed}/{n}")
+    print(f"tags as scripted {sum(1 for s in samples if s.progress_ok)}/{n}")
+    asking = [s for s in samples if s.asked is not None]
+    print(f"asked, proxy {sum(1 for s in asking if s.asked)}/{len(asking)}")
+    scenes = [s for s in samples if s.group in ("boundary", "tangent")]
+    print(f"scene tags as required {sum(1 for s in scenes if s.scene_ok)}/{len(scenes)}")
+    openings = [s for s in samples if s.opening]
+    print(f"openings passed {sum(1 for s in openings if s.scenario_pass)}/{len(openings)}")
+    dropped = sum((Counter(s.dropped) for s in samples), Counter())
+    counts = " ".join(f"{key}={count}" for key, count in sorted(dropped.items()))
+    print(f"tags dropped: {counts or 'none'}")
+    groups = Counter(s.group for s in samples)
+    for group in GROUPS:
+        passed = sum(1 for s in samples if s.group == group and s.scenario_pass)
+        print(f"{group} passed {passed}/{groups[group]}")
+    leaked = sum(1 for s in samples if s.leaked)
+    passed = sum(1 for s in samples if s.scenario_pass)
+    print(scenario_verdict(passed, leaked, n, dict(groups)))
+
+
+def connect_series(label: str, values: list[int | None]) -> str:
+    observed = sorted(value for value in values if value is not None)
+    line = f"{label}: observed {len(observed)} missing {len(values) - len(observed)}"
+    if observed:
+        p95 = observed[max(0, int(len(observed) * 0.95) - 1)]
+        line += f" median={int(statistics.median(observed))}ms p95={p95}ms max={observed[-1]}ms"
+    return line
+
+
+def report_connect(cfg: Settings, samples: list[ConnectSample], bound_s: float) -> None:
+    print(
+        "connect: each sample is a fresh loop on the real planner, the interim HTML builder, the "
+        "voice and Kokoro, with t0 taken immediately before the loop's task is created. First "
+        "audio is the first non-silent frame leaving the outbound track; scene checked is the "
+        "simulated page passing the plan's first scene. Excluded: model loading before t0, "
+        "browser output, a real iframe check and frame visibility. A sample that reaches the "
+        "bound is kept with its nulls."
+    )
+    print(
+        f"planner_model={cfg.planner_model or cfg.reasoning_model}  "
+        f"planner_effort={cfg.planner_effort}  "
+        f"scene_model={cfg.scene_model or cfg.reasoning_model}  scene_effort={cfg.scene_effort}  "
+        f"voice_model={cfg.reasoning_model}  builder=interim-html  simulated page  "
+        f"bound_s={bound_s:g}  samples={len(samples)} (plus {WARMUP} discarded warm-ups)"
+    )
+    print(
+        connect_series(
+            "connect to first outbound synthesized audio frame",
+            [s.first_audio_frame_ms for s in samples],
+        )
+    )
+    print(
+        connect_series(
+            "connect to scene checked (interim HTML builder, simulated page)",
+            [s.scene_checked_ms for s in samples],
+        )
+    )
+    print(f"plan valid {sum(1 for s in samples if s.plan_valid)}/{len(samples)}")
+    complete = sum(
+        1 for s in samples if s.first_audio_frame_ms is not None and s.scene_checked_ms is not None
+    )
+    print(f"measurement complete {complete}/{len(samples)}")
 
 
 def summarize_usd(label: str, values: list[float]) -> None:
@@ -913,13 +1403,18 @@ def report_soak(
 def turn_line(sample: Sample) -> str:
     return (
         f"first_sound_ms={sample.first_sound_ms} substance_ms={sample.substance_ms} "
-        f"stages={sample.stages} silent={sample.silent} "
-        f"visual_landed_ms={sample.visual_landed_ms} visual_valid={sample.visual_valid} "
-        f"visual_truncated={sample.visual_truncated} audio_ms={sample.audio_ms}"
+        f"stages={sample.stages} silent={sample.silent} audio_ms={sample.audio_ms}"
     )
 
 
-async def soak(cfg: Settings, args: argparse.Namespace) -> int:
+async def soak(
+    cfg: Settings,
+    args: argparse.Namespace,
+    models: Models,
+    inner: ReasoningClient,
+    request: SessionRequest,
+    plan: LessonPlan | None,
+) -> int:
     sampler = await Sampler.start()
     try:
         if not await sampler.first_block():
@@ -928,19 +1423,20 @@ async def soak(cfg: Settings, args: argparse.Namespace) -> int:
                 "never under sudo as a whole"
             )
             return 2
-        root = None if args.root is None else args.root.resolve()
-        utterances = utterances_for(root)
-        bench = await Bench.boot(cfg, root, subject_for(root, args.subject), args.starting_from)
+        utterances = utterances_for(request.folder)
+        bench = Bench.boot(cfg, models, inner, request, planned(args), plan, args.stub_scenes)
         turns: list[tuple[float, Sample]] = []
         try:
+            if planned(args):
+                await bench.turn(None)
             print(f"soak start {await machine_state()}", flush=True)
             started = time.perf_counter()
             sampler.rebase()
             while (at := time.perf_counter() - started) < args.soak * 60:
                 n = len(turns)
-                sample = await bench.turn(utterances[n % len(utterances)], n % len(utterances))
-                turns.append((at, sample))
-                print(f"turn={n + 1} t={int(at)}s {turn_line(sample)}", file=sys.stderr)
+                heard = await bench.turn(utterances[n % len(utterances)], n % len(utterances))
+                turns.append((at, heard.sample))
+                print(f"turn={n + 1} t={int(at)}s {turn_line(heard.sample)}", file=sys.stderr)
             print(f"soak end {await machine_state()}", flush=True)
         finally:
             await bench.aclose()
@@ -950,8 +1446,166 @@ async def soak(cfg: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+async def run_utterances(
+    cfg: Settings,
+    args: argparse.Namespace,
+    models: Models,
+    inner: ReasoningClient,
+    request: SessionRequest,
+    plan: LessonPlan | None,
+) -> int:
+    utterances = utterances_for(request.folder)
+    started = time.strftime("%Y-%m-%dT%H:%M:%S")
+    capture = Capture(
+        CAPTURE_DIR / "replies.jsonl" if args.capture is None else args.capture, started
+    )
+    total = WARMUP + args.samples
+    bench = Bench.boot(
+        cfg, models, inner, request, planned(args), plan, args.stub_scenes, capture=capture
+    )
+    samples: list[Sample] = []
+    try:
+        print(f"start {await machine_state()}", flush=True)
+        if planned(args):
+            await bench.turn(None, sample=False)
+        for n in range(total):
+            heard = await bench.turn(
+                utterances[n % len(utterances)], n % len(utterances), n >= WARMUP
+            )
+            if n >= WARMUP:
+                samples.append(heard.sample)
+            print(f"turn={n + 1}/{total} {turn_line(heard.sample)}", file=sys.stderr)
+    finally:
+        await bench.aclose()
+    report(cfg, args, samples, bench.reasoning)
+    report_page(bench.transport.simulated)
+    return 0
+
+
+async def run_fixture(
+    cfg: Settings,
+    args: argparse.Namespace,
+    models: Models,
+    inner: ReasoningClient,
+    request: SessionRequest,
+    plan: LessonPlan,
+    fixture: Fixture,
+    sentence_rule: bool,
+) -> int:
+    runs: list[tuple[Sample, MeteredReasoning, Counter[str]]] = []
+
+    async def run_case(case: Scenario) -> tuple[str, list[str], ScenarioResult]:
+        replies = [turn.reply for turn in case.setup]
+        bench = Bench.boot(
+            cfg, models, inner, request, planned(args), plan, args.stub_scenes, replies
+        )
+        try:
+            for turn in case.setup:
+                await bench.turn(turn.learner)
+                await bench.settle()
+            check_setup(bench.lesson.acked, bench.history(), case)
+            # The opening starts on its own, so its state is taken as the plan adopted afresh.
+            if case.learner is None:
+                state = LessonState()
+                state.adopt(plan)
+            else:
+                state = copy.deepcopy(bench.lesson)
+            heard = await bench.turn(case.learner)
+        finally:
+            await bench.aclose()
+        result = evaluate_scenario(heard.reply, heard.spoken, state, case, sentence_rule)
+        fields = result.model_dump(exclude={"reveal_ok", "passed"})
+        sample = heard.sample.model_copy(
+            update={
+                **fields,
+                "scenario_id": case.id,
+                "group": case.group,
+                "scenario_pass": result.passed,
+            }
+        )
+        runs.append((sample, bench.reasoning, bench.transport.simulated))
+        print(
+            f"case={case.id} {turn_line(sample)} tags={result.tags} passed={result.passed}",
+            file=sys.stderr,
+        )
+        return heard.reply, heard.spoken, result
+
+    print(f"start {await machine_state()}", flush=True)
+    results = await run_scenarios(fixture.cases, args.out, run_case)
+    measured = runs[len(runs) - len(results) :]
+    totals = MeteredReasoning(inner)
+    for _, reasoning, _ in measured:
+        pool(totals.ledger, reasoning.ledger)
+        for kind, ledger in reasoning.ledgers.items():
+            pool(totals.ledgers[kind], ledger)
+    samples = [sample for sample, _, _ in measured]
+    report(cfg, args, samples, totals)
+    report_page(sum((simulated for _, _, simulated in measured), Counter()))
+    report_scenarios(samples, sentence_rule)
+    return 0
+
+
+async def connect_sample(
+    cfg: Settings,
+    models: Models,
+    inner: ReasoningClient,
+    request: SessionRequest,
+    bound_s: float,
+) -> ConnectSample:
+    bench = Bench.boot(cfg, models, inner, request, True)
+    transport, lesson, watch = bench.transport, bench.lesson, bench.watch
+
+    def checked() -> float | None:
+        return None if lesson.plan is None else first_scene_checked(transport.checks, lesson.plan)
+
+    # A plan that failed or a first scene given up on cannot be observed any later.
+    def settled() -> bool:
+        if transport.first_sound is None:
+            return False
+        if lesson.plan is None:
+            return watch.unplanned
+        return checked() is not None or lesson.plan.scenes[0].id in lesson.failed
+
+    def since_t0(at: float | None) -> int | None:
+        return None if at is None else int((at - bench.started) * 1000)
+
+    try:
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(bound_s):
+                await transport.wait_frames(settled)
+        return ConnectSample(
+            plan_ms=since_t0(watch.planned_at),
+            plan_valid=watch.planned_at is not None,
+            first_audio_frame_ms=since_t0(transport.first_sound),
+            scene_checked_ms=since_t0(checked()),
+        )
+    finally:
+        await bench.aclose()
+
+
+async def run_connect(
+    cfg: Settings,
+    args: argparse.Namespace,
+    models: Models,
+    inner: ReasoningClient,
+    request: SessionRequest,
+) -> int:
+    bound_s = 2 * cfg.planner_timeout_s + cfg.scene_timeout_s + SCENE_READY_TIMEOUT_S + 60
+    total = WARMUP + args.samples
+    samples: list[ConnectSample] = []
+    print(f"start {await machine_state()}", flush=True)
+    for n in range(total):
+        sample = await connect_sample(cfg, models, inner, request, bound_s)
+        if n >= WARMUP:
+            samples.append(sample)
+        fields = " ".join(f"{key}={value}" for key, value in sample.model_dump().items())
+        print(f"connect={n + 1}/{total} {fields}", file=sys.stderr)
+    report_connect(cfg, samples, bound_s)
+    return 0
+
+
 async def main() -> int:
-    args = build_parser().parse_args()
+    args = parse_args(sys.argv[1:])
     logging.basicConfig(level=logging.INFO)
     try:
         cfg = settings()
@@ -961,38 +1615,39 @@ async def main() -> int:
         return 2
     if args.model:
         cfg = cfg.model_copy(update={"reasoning_model": args.model})
-    if args.soak is not None:
-        return await soak(cfg, args)
-
     root = None if args.root is None else args.root.resolve()
-    utterances = utterances_for(root)
-    started = time.strftime("%Y-%m-%dT%H:%M:%S")
-    capture = Capture(
-        CAPTURE_DIR / "replies.jsonl" if args.capture is None else args.capture, started
+    request = SessionRequest(
+        subject=subject_for(root, args.subject), folder=root, starting_from=args.starting_from
     )
-    total = WARMUP + args.samples
-    bench = await Bench.boot(
-        cfg,
-        root,
-        subject_for(root, args.subject),
-        args.starting_from,
-        capture,
-        args.silent_synth,
-    )
-    samples: list[Sample] = []
+    plan = None if args.plan is None else LessonPlan.model_validate_json(args.plan.read_text())
+    if args.scenarios is not None:
+        fixture = Fixture.model_validate_json(args.scenarios.read_text())
+        digest = hashlib.sha256(args.plan.read_bytes()).hexdigest()
+        if fixture.plan_digest != digest:
+            print(f"{args.scenarios} was written against another plan: {args.plan} is {digest}")
+            return 2
+        outcome = ListeningOutcome.model_validate_json(LISTENING_OUTCOME.read_text())
+        prepare_out(args.out)
+    loaded = await asyncio.to_thread(load_models)
+    synth = TaggedSynth(SilentSynth() if args.silent_synth else loaded.synth)
+    models = Models(partial=loaded.partial, final=loaded.final, synth=synth)
+    inner = ReasoningClient(cfg)
     try:
-        print(f"start {await machine_state()}", flush=True)
-        for n in range(total):
-            sample = await bench.turn(
-                utterances[n % len(utterances)], n % len(utterances), n >= WARMUP
+        if args.soak is not None:
+            return await soak(cfg, args, models, inner, request, plan)
+        if args.connect:
+            return await run_connect(cfg, args, models, inner, request)
+        if args.scenarios is None:
+            return await run_utterances(cfg, args, models, inner, request, plan)
+        try:
+            return await run_fixture(
+                cfg, args, models, inner, request, plan, fixture, outcome.sentence_boundaries_only
             )
-            if n >= WARMUP:
-                samples.append(sample)
-            print(f"turn={n + 1}/{total} {turn_line(sample)}", file=sys.stderr)
+        except HarnessError as error:
+            print(f"harness error: {error}")
+            return 1
     finally:
-        await bench.aclose()
-    report(cfg, args, samples, bench.reasoning)
-    return 0
+        await inner.aclose()
 
 
 if __name__ == "__main__":

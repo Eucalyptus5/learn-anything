@@ -1,18 +1,24 @@
 import ast
-import asyncio
 import importlib.util
+import inspect
 import json
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
 import numpy as np
+import pytest
 
+from tests.test_session import LESSON
 from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.config import Settings
 from tutor.cost import TurnUsage, UsageLedger
 from tutor.input_path import EndOfTurn, SpeechStarted
+from tutor.lesson import OPENING_TEXT, Cursor, LessonState
+from tutor.planner import PLAN_TOOL, PLAN_TOOLS
 from tutor.prompt import Message, TurnPrompt
 from tutor.reasoning import TurnChunk
+from tutor.scene import SCENE_TOOL, SCENE_TOOLS, planned_scene_prompt
+from tutor.visuals import LessonAck
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "bench_turn.py"
 _spec = importlib.util.spec_from_file_location("bench_turn", SCRIPT)
@@ -20,7 +26,6 @@ bench_turn = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bench_turn)
 
 TIMES = [float(n) for n in range(60)]
-HANG_GUARD_S = 30.0
 PROMPT = TurnPrompt(system="s", user_text="teach me ppo")
 
 DELTAS = [
@@ -65,6 +70,13 @@ async def test_loop_clauses_classify_as_model_and_lead_in_does_not() -> None:
     assert "`" not in model
     assert not bench_turn.is_model("The match is in src/pool.py line 12.", model)
     assert not bench_turn.is_model(None, model)
+
+
+def test_model_text_reads_a_tagged_reply_as_the_loop_speaks_it() -> None:
+    model = bench_turn.model_text([["<step 2>The band sits", "<step 3> at 0.8. <scene 2>Then"]])
+
+    assert bench_turn.is_model("The band sits at 0.8.", model)
+    assert "<" not in model
 
 
 async def test_follow_up_stream_joins_the_first_with_a_newline() -> None:
@@ -186,6 +198,33 @@ def _spoken(*texts: str) -> list[TurnChunk]:
     return [TurnChunk(kind="spoken", text=text) for text in texts]
 
 
+async def test_a_voice_stream_records_its_deltas_and_sums_its_usage() -> None:
+    first = ScriptedStream(
+        _spoken("PPO ", "clips."), usage=TurnUsage(prompt_tokens=10, completion_tokens=20)
+    )
+    second = ScriptedStream(
+        _spoken("Then it stops."), usage=TurnUsage(prompt_tokens=30, completion_tokens=5)
+    )
+    reasoning = bench_turn.MeteredReasoning(ScriptedReasoning([first, second]))
+    record = reasoning.begin()
+
+    chunks = [chunk async for chunk in reasoning.start_turn(PROMPT, tools=[], max_tokens=10)]
+    assert len(chunks) == 2
+    assert record.first_spoken_ms is not None
+    assert record.voice_usage == TurnUsage(prompt_tokens=10, completion_tokens=20)
+
+    async for _ in reasoning.start_turn(PROMPT):
+        pass
+
+    assert record.voice_usage == TurnUsage(prompt_tokens=40, completion_tokens=25)
+    assert record.visual_usage is None
+    assert record.streams == [["PPO ", "clips."], ["Then it stops."]]
+    assert reasoning.ledgers["voice"].turns == 2
+    assert reasoning.ledgers["voice"].total.prompt_tokens == 40
+    assert reasoning.ledgers["visual"].turns == 0
+    assert reasoning.ledger.turns == 2
+
+
 async def test_a_visual_stream_is_attributed_to_the_visual_ledger() -> None:
     call = TurnChunk(kind="tool_call", text="{}", tool_call_id="c", tool_name="push_diagram")
     stream = ScriptedStream(
@@ -197,11 +236,10 @@ async def test_a_visual_stream_is_attributed_to_the_visual_ledger() -> None:
     reasoning = bench_turn.MeteredReasoning(ScriptedReasoning([stream]))
     record = reasoning.begin()
 
-    metered = reasoning.start_turn(PROMPT, tools=[], max_tokens=10, tool_choice="required")
+    metered = reasoning.start_turn(PROMPT, tools=SCENE_TOOLS, max_tokens=10, tool_choice="required")
     chunks = [chunk async for chunk in metered]
 
     assert chunks == [call]
-    assert record.visual_task is asyncio.current_task()
     assert metered.finish_reason == "tool_calls"
     assert metered.first_chunk_ms == 7
     assert record.visual_first_chunk_ms == 7
@@ -213,21 +251,6 @@ async def test_a_visual_stream_is_attributed_to_the_visual_ledger() -> None:
     assert reasoning.ledgers["visual"].total.completion_tokens == 40
     assert reasoning.ledgers["voice"].turns == 0
     assert reasoning.ledger.turns == 1
-
-
-async def test_the_sample_waits_for_the_turns_visual_task() -> None:
-    gate = asyncio.Event()
-    task = asyncio.create_task(gate.wait(), name="turn-7-visual")
-    asyncio.get_running_loop().call_soon(gate.set)
-
-    settled = await bench_turn.settle_visual("turn-7", HANG_GUARD_S)
-
-    assert settled is True
-    assert task.done()
-
-
-async def test_a_turn_without_a_visual_task_settles_at_once() -> None:
-    assert await bench_turn.settle_visual("turn-8", HANG_GUARD_S) is False
 
 
 def test_summarize_usd_prints_six_decimals(capsys) -> None:
@@ -245,40 +268,6 @@ def test_summarize_usd_prints_six_decimals(capsys) -> None:
     assert empty.endswith("no samples")
 
 
-def test_a_sample_without_a_visual_reports_none(capsys) -> None:
-    cfg = Settings(_env_file=None, reasoning_api_base="http://x", reasoning_api_key="k")
-    args = bench_turn.build_parser().parse_args([])
-    sample = bench_turn.Sample(
-        first_sound_ms=900,
-        substance_ms=900,
-        first_content_delta_ms=600,
-        stages=0,
-        silent=False,
-        visual_landed_ms=None,
-        visual_valid=None,
-        visual_truncated=False,
-        audio_ms=4000,
-        voice_usd=0.0001,
-        visual_usd=0.0,
-        utterance=0,
-    )
-
-    bench_turn.report(cfg, args, [sample], bench_turn.MeteredReasoning(ScriptedReasoning([])))
-
-    lines = capsys.readouterr().out.splitlines()
-    assert "visual calls 0/1" in lines
-    assert "visuals landed 0/0" in lines
-    assert "visuals valid 0/0" in lines
-    assert "visuals truncated 0/0" in lines
-    (landing,) = [line for line in lines if line.startswith("visual landing")]
-    assert landing.endswith("no samples")
-    assert "turns with unknown cost 0/1" in lines
-    (cost,) = [line for line in lines if line.startswith("cost per turn (list)")]
-    assert "n=  1 median=0.000100" in cost
-    assert any(line.startswith("voice turns=0") for line in lines)
-    assert any(line.startswith("visual turns=0") for line in lines)
-
-
 def test_a_silent_run_reports_the_audio_lines_as_not_measured(capsys) -> None:
     cfg = Settings(_env_file=None, reasoning_api_base="http://x", reasoning_api_key="k")
     args = bench_turn.build_parser().parse_args(["--silent-synth"])
@@ -288,12 +277,8 @@ def test_a_silent_run_reports_the_audio_lines_as_not_measured(capsys) -> None:
         first_content_delta_ms=600,
         stages=0,
         silent=False,
-        visual_landed_ms=1000,
-        visual_valid=True,
-        visual_truncated=False,
         audio_ms=4000,
         voice_usd=0.0001,
-        visual_usd=0.0,
         utterance=0,
     )
 
@@ -305,7 +290,7 @@ def test_a_silent_run_reports_the_audio_lines_as_not_measured(capsys) -> None:
     for label in (
         "time to first sound",
         "time to substance",
-        "audio length, those turns",
+        "audio length per turn",
     ):
         (line,) = [line for line in lines if line.startswith(f"{label:34s}")]
         assert line.endswith("not measured")
@@ -315,8 +300,6 @@ def test_a_silent_run_reports_the_audio_lines_as_not_measured(capsys) -> None:
         if line.startswith(f"{'first content delta (model, from first request)':34s}")
     ]
     assert not delta.endswith("not measured")
-    (landing,) = [line for line in lines if line.startswith(f"{'visual landing':34s}")]
-    assert not landing.endswith("not measured")
     assert any(line.startswith("cost per turn (list)") for line in lines)
     assert any(line.startswith("turns with unknown cost") for line in lines)
     assert any(line.startswith("silent turns") for line in lines)
@@ -331,12 +314,8 @@ def test_a_kokoro_run_leaves_the_model_line_alone(capsys) -> None:
         first_content_delta_ms=600,
         stages=0,
         silent=False,
-        visual_landed_ms=1000,
-        visual_valid=True,
-        visual_truncated=False,
         audio_ms=4000,
         voice_usd=0.0001,
-        visual_usd=0.0,
         utterance=0,
     )
 
@@ -349,40 +328,7 @@ def test_a_kokoro_run_leaves_the_model_line_alone(capsys) -> None:
     assert "n=  1" in first_sound
 
 
-def test_a_visual_without_a_usage_chunk_has_an_unknown_cost(capsys) -> None:
-    cfg = Settings(_env_file=None, reasoning_api_base="http://x", reasoning_api_key="k")
-    args = bench_turn.build_parser().parse_args([])
-    sample = bench_turn.Sample(
-        first_sound_ms=900,
-        substance_ms=900,
-        first_content_delta_ms=600,
-        stages=0,
-        silent=False,
-        visual_landed_ms=None,
-        visual_valid=False,
-        visual_truncated=False,
-        audio_ms=4000,
-        voice_usd=0.0001,
-        visual_usd=None,
-        utterance=0,
-    )
-
-    bench_turn.report(cfg, args, [sample], bench_turn.MeteredReasoning(ScriptedReasoning([])))
-
-    lines = capsys.readouterr().out.splitlines()
-    assert "turns with unknown cost 1/1" in lines
-    (cost,) = [line for line in lines if line.startswith("cost per turn (list)")]
-    assert cost.endswith("no samples")
-    (voice,) = [line for line in lines if line.startswith("voice cost per turn (list)")]
-    assert "n=  1" in voice
-    (visual,) = [line for line in lines if line.startswith("visual cost per turn (list)")]
-    assert visual.endswith("no samples")
-
-
-def test_the_visual_predicates_read_the_result_string() -> None:
-    assert bench_turn.is_valid("scene: sent")
-    assert not bench_turn.is_valid("scene: error: check failed twice")
-    assert not bench_turn.is_valid("scene: timeout")
+def test_is_truncated_reads_a_scene_result() -> None:
     assert bench_turn.is_truncated("scene: error: truncated at 32000 tokens")
     assert not bench_turn.is_truncated("scene: sent")
     assert bench_turn.is_truncated("planner: error: truncated at 8000 tokens")
@@ -600,8 +546,6 @@ def test_capture_writes_one_ascii_json_line_per_turn(tmp_path) -> None:
 
 
 async def test_a_planner_stream_is_attributed_to_the_planner_ledger() -> None:
-    from tutor.planner import PLAN_TOOLS
-
     usage = TurnUsage(prompt_tokens=10, completion_tokens=20)
     chunk = TurnChunk(kind="tool_call", text="{}", tool_call_id="c", tool_name="write_plan")
     stream = ScriptedStream([chunk], usage=usage, first_chunk_ms=12)
@@ -633,6 +577,498 @@ def test_the_harness_imports_nothing_from_the_brief_or_the_phase_machine() -> No
     assert ("tutor.session", "OutcomeSplitter") not in imported
 
 
-def test_the_bench_builds_its_loop_with_no_plan() -> None:
-    source = SCRIPT.read_text()
-    assert "build_loop(cfg, models, reasoning, source, transport, request, planned=False)" in source
+async def test_the_report_counts_the_scene_builds_in_the_visual_ledger(capsys) -> None:
+    call = TurnChunk(kind="tool_call", text="{}", tool_call_id="c", tool_name=SCENE_TOOL)
+    stream = ScriptedStream([call], usage=TurnUsage(prompt_tokens=30, completion_tokens=40))
+    reasoning = bench_turn.MeteredReasoning(ScriptedReasoning([stream]))
+    async for _ in reasoning.start_turn(PROMPT, tools=SCENE_TOOLS, tool_choice="required"):
+        pass
+    cfg = Settings(_env_file=None, reasoning_api_base="http://x", reasoning_api_key="k")
+    sample = bench_turn.Sample(
+        first_sound_ms=900,
+        substance_ms=900,
+        first_content_delta_ms=600,
+        stages=0,
+        silent=False,
+        audio_ms=4000,
+        voice_usd=0.0001,
+        utterance=0,
+    )
+
+    bench_turn.report(cfg, bench_turn.parse_args([]), [sample], reasoning)
+
+    lines = capsys.readouterr().out.splitlines()
+    (visual,) = [line for line in lines if line.startswith("visual turns=")]
+    assert visual.startswith("visual turns=1 prompt_tokens=30 completion_tokens=40 ")
+    (voice,) = [line for line in lines if line.startswith("voice turns=")]
+    assert voice.startswith("voice turns=0 ")
+    assert any(line.startswith("turns=1 ") for line in lines)
+
+
+STATE = LessonState()
+STATE.adopt(LESSON)
+
+
+def state_at(scene: int, step: int) -> LessonState:
+    state = LessonState()
+    state.adopt(LESSON)
+    revision = 0
+    for n in range(1, scene + 1):
+        assert state.scene_tag(n) is None
+        revision += 1
+        state.acknowledge(
+            LessonAck(
+                epoch=1,
+                barrier=0,
+                cue_id=state.sent[0].cue_id,
+                outcome="fired",
+                reason=None,
+                scene_id=LESSON.scenes[n - 1].id,
+                step=1,
+                revision=revision,
+            )
+        )
+    for n in range(2, step + 1):
+        assert state.step_tag(n) is None
+        revision += 1
+        state.acknowledge(
+            LessonAck(
+                epoch=1,
+                barrier=0,
+                cue_id=state.sent[0].cue_id,
+                outcome="fired",
+                reason=None,
+                scene_id=LESSON.scenes[scene - 1].id,
+                step=n,
+                revision=revision,
+            )
+        )
+    return state
+
+
+def scenario(
+    group: str, target: Cursor, sequences: list[list[str]], **fields: object
+) -> "bench_turn.Scenario":
+    body = {
+        "id": f"{group}-1",
+        "group": group,
+        "setup": [],
+        "target": target.model_dump(),
+        "asked": [],
+        "learner": None if group == "opening" else "go on",
+        "sequences": sequences,
+        "question": False,
+        "terms": [],
+        "reveal_forbidden": [],
+        "requires_scene": None,
+        "forbids_scene": False,
+        **fields,
+    }
+    return bench_turn.Scenario.model_validate(body)
+
+
+def test_classify_tags_reads_validity_drops_placement_and_leaks() -> None:
+    reply = "<scene 1>The ratio compares two policies. <step 2>At one action<step 3> it is one. <set lr 0.9>"
+    spoken = ["The ratio compares two policies.", "At one action it is one."]
+    read = bench_turn.classify_tags(reply, spoken, STATE, sentence_rule=False)
+    assert read == bench_turn.TagRead(
+        tags=["scene 1", "step 2", "step 3", "set"],
+        valid=False,
+        dropped={"set:unsupported": 1},
+        placement_errors=1,
+        leaked=0,
+    )
+    assert STATE.sent == []
+
+
+def test_a_tag_after_a_comma_is_misplaced_only_under_the_sentence_rule() -> None:
+    reply = "<scene 1>The ratio, <step 2>compared at one action."
+    spoken = ["The ratio,", "compared at one action."]
+    assert bench_turn.classify_tags(reply, spoken, STATE, sentence_rule=False).placement_errors == 0
+    assert bench_turn.classify_tags(reply, spoken, STATE, sentence_rule=True).placement_errors == 1
+
+
+def test_placement_is_read_where_the_reply_wrote_each_tag() -> None:
+    reply = '<scene 1><step 2>It falls, <draw t = label "x > 1">then rises<step 2> again.'
+    assert bench_turn.classify_tags(reply, [], STATE, sentence_rule=False).placement_errors == 1
+    assert bench_turn.classify_tags(reply, [], STATE, sentence_rule=True).placement_errors == 2
+
+
+def test_any_tag_text_in_the_spoken_stream_is_a_leak() -> None:
+    read = bench_turn.classify_tags(
+        "<scene 1>Hi.", ["<scene 1>Hi.", "<set lr", "<STEP 2>"], STATE, sentence_rule=False
+    )
+    assert read.leaked == 3
+
+
+def test_a_malformed_tag_is_counted_under_its_name_alone() -> None:
+    read = bench_turn.classify_tags(
+        "<Step 2>Hi. <step2>There.", ["Hi.", "There."], STATE, sentence_rule=False
+    )
+    assert read.tags == ["step", "step"] and read.dropped == {"step:malformed": 2}
+
+
+QUESTION = {"question": True, "terms": ["ratio", "agree"], "reveal_forbidden": ["step 2"]}
+
+
+@pytest.mark.parametrize(
+    ("case", "at", "reply", "spoken", "failing"),
+    [
+        pytest.param(
+            scenario("progress", Cursor(scene=2, step=1), [["step 2", "step 3"]]),
+            (2, 1),
+            "<step 2>The band sits at 0.8 and 1.2. <step 3>Outside it the objective is flat.",
+            ["The band sits at 0.8 and 1.2.", "Outside it the objective is flat."],
+            None,
+            id="progress",
+        ),
+        pytest.param(
+            scenario("progress", Cursor(scene=2, step=1), [["step 2", "step 3"]]),
+            (2, 1),
+            "<step 3>Outside the band it is flat.",
+            ["Outside the band it is flat."],
+            ("progress_ok", False),
+            id="early-tag",
+        ),
+        pytest.param(
+            scenario("progress", Cursor(scene=2, step=1), [["step 2", "step 3"]]),
+            (2, 1),
+            "<step 2>The band sits<step 3> at 0.8 and 1.2.",
+            ["The band sits", "at 0.8 and 1.2."],
+            ("placement_errors", 1),
+            id="mid-phrase",
+        ),
+        pytest.param(
+            scenario("progress", Cursor(scene=2, step=1), [["step 2"]]),
+            (2, 1),
+            "<step 2>The band sits at 0.8 and 1.2.",
+            ["<step 2>The band sits at 0.8 and 1.2."],
+            ("leaked", 1),
+            id="leak",
+        ),
+        pytest.param(
+            scenario("question", Cursor(scene=1, step=1), [[]], **QUESTION),
+            (1, 1),
+            "Where do the two policies agree, and what is the ratio there?",
+            ["Where do the two policies agree, and what is the ratio there?"],
+            None,
+            id="question-only",
+        ),
+        pytest.param(
+            scenario("question", Cursor(scene=1, step=1), [[]], **QUESTION),
+            (1, 1),
+            "<step 2>They agree where the ratio is one. Where do they agree, and what is the ratio?",
+            ["They agree where the ratio is one.", "Where do they agree, and what is the ratio?"],
+            ("reveal_ok", False),
+            id="revealed-before-the-question",
+        ),
+        pytest.param(
+            scenario("question", Cursor(scene=1, step=1), [[]], **QUESTION),
+            (1, 1),
+            "What do you think?",
+            ["What do you think?"],
+            ("asked", False),
+            id="question-without-its-terms",
+        ),
+        pytest.param(
+            scenario("boundary", Cursor(scene=1, step=3), [["scene 2"]], requires_scene=2),
+            (1, 3),
+            "That is the ratio. <scene 2>Now the clip bounds it.",
+            ["That is the ratio.", "Now the clip bounds it."],
+            None,
+            id="boundary",
+        ),
+        pytest.param(
+            scenario("boundary", Cursor(scene=1, step=3), [["scene 2"]], requires_scene=2),
+            (1, 3),
+            "That is the ratio.",
+            ["That is the ratio."],
+            ("scene_ok", False),
+            id="boundary-not-crossed",
+        ),
+        pytest.param(
+            scenario("tangent", Cursor(scene=1, step=3), [[]], forbids_scene=True),
+            (1, 3),
+            "Good question. <scene 2>Now the clip.",
+            ["Good question.", "Now the clip."],
+            ("scene_ok", False),
+            id="tangent-opens-a-scene",
+        ),
+        pytest.param(
+            scenario("opening", Cursor(), [["scene 1"]]),
+            (0, 0),
+            "<scene 1>Start with the ratio.",
+            ["Start with the ratio."],
+            None,
+            id="opening",
+        ),
+        pytest.param(
+            scenario("opening", Cursor(), [["scene 1"]]),
+            (0, 0),
+            "Start with the ratio.",
+            ["Start with the ratio."],
+            ("progress_ok", False),
+            id="opening-without-its-scene",
+        ),
+    ],
+)
+def test_a_scenario_passes_only_when_every_applicable_check_holds(
+    case: "bench_turn.Scenario",
+    at: tuple[int, int],
+    reply: str,
+    spoken: list[str],
+    failing: tuple[str, object] | None,
+) -> None:
+    state = state_at(*at)
+    result = bench_turn.evaluate_scenario(reply, spoken, state, case, sentence_rule=False)
+    assert result.passed is (failing is None)
+    if failing is not None:
+        field, value = failing
+        assert getattr(result, field) == value
+    assert result.opening is (case.group == "opening")
+    assert state.sent == []
+
+
+def test_the_verdict_fails_under_the_floor_on_any_leak_or_missing_coverage() -> None:
+    groups = {group: 5 for group in bench_turn.GROUPS}
+    assert bench_turn.scenario_verdict(28, 0, 30, groups) == (
+        "verdict: scenarios passed 28/30 against the floor of 27, leaked 0/30"
+    )
+    assert bench_turn.scenario_verdict(26, 0, 30, groups).endswith(", FAIL")
+    assert bench_turn.scenario_verdict(30, 1, 30, groups).endswith(", FAIL")
+    assert bench_turn.scenario_verdict(30, 0, 30, {**groups, "boundary": 0}).endswith(", FAIL")
+    assert bench_turn.scenario_verdict(10, 0, 10, groups) == (
+        "verdict: scenarios passed 10/10, not a qualification run"
+    )
+
+
+def test_warm_ups_repeat_non_opening_cases_and_every_case_is_measured() -> None:
+    cases = [
+        scenario(group, Cursor(), [[]], id=f"{group}-{n}")
+        for group in reversed(bench_turn.GROUPS)
+        for n in range(5)
+    ]
+    warmups, measured = bench_turn.run_order(cases)
+    assert [case.id for case in measured] == [
+        f"{group}-{n}" for group in bench_turn.GROUPS for n in range(5)
+    ]
+    assert [case.id for case in warmups] == ["progress-0", "progress-1", "progress-2"]
+
+
+async def test_each_measured_case_is_written_once_and_the_warm_ups_are_not(tmp_path: Path) -> None:
+    cases = [
+        scenario(group, Cursor(), [[]], id=f"{group}-{n}")
+        for group in bench_turn.GROUPS
+        for n in range(5)
+    ]
+    ran: list[str] = []
+
+    async def run_case(
+        case: "bench_turn.Scenario",
+    ) -> tuple[str, list[str], "bench_turn.ScenarioResult"]:
+        ran.append(case.id)
+        result = bench_turn.evaluate_scenario("Hi.", ["Hi."], STATE, case, sentence_rule=False)
+        return "Hi.", ["Hi."], result
+
+    out = tmp_path / "runs"
+    bench_turn.prepare_out(out)
+    results = await bench_turn.run_scenarios(cases, out, run_case)
+
+    assert len(ran) == bench_turn.WARMUP + 30 and len(results) == 30
+    assert sorted(path.name for path in out.iterdir()) == sorted(
+        f"{case.id}.json" for case in cases
+    )
+    assert json.loads((out / "opening-0.json").read_text()) == {
+        "reply": "Hi.",
+        "spoken": ["Hi."],
+        "result": results[0].model_dump(mode="json"),
+    }
+
+
+def test_a_non_empty_out_is_refused(tmp_path: Path) -> None:
+    out = tmp_path / "runs"
+    bench_turn.prepare_out(out)
+    assert out.is_dir()
+    bench_turn.prepare_out(out)
+    (out / "old.json").write_text("{}")
+    with pytest.raises(FileExistsError):
+        bench_turn.prepare_out(out)
+
+
+def test_a_setup_that_misses_its_target_or_its_history_is_a_harness_error() -> None:
+    case = scenario(
+        "progress",
+        Cursor(scene=1, step=2),
+        [["step 3"]],
+        setup=[
+            {"learner": None, "reply": "<scene 1>Start with the ratio."},
+            {"learner": "they agree at one", "reply": "<step 2>Right, the ratio is one there."},
+        ],
+    )
+    history = [
+        Message(role="user", content=OPENING_TEXT),
+        Message(role="assistant", content="Start with the ratio."),
+        Message(role="user", content="they agree at one"),
+        Message(role="assistant", content="Right, the ratio is one there."),
+    ]
+    bench_turn.check_setup(state_at(1, 2).acked, history, case)
+    with pytest.raises(bench_turn.HarnessError):
+        bench_turn.check_setup(state_at(1, 1).acked, history, case)
+    with pytest.raises(bench_turn.HarnessError):
+        bench_turn.check_setup(state_at(1, 2).acked, history[:2], case)
+
+
+async def test_setup_replies_the_plan_and_stub_builds_never_reach_the_model() -> None:
+    measured = ScriptedStream(
+        _spoken("The real reply."), usage=TurnUsage(prompt_tokens=5, completion_tokens=3)
+    )
+    inner = ScriptedReasoning([measured])
+    reasoning = bench_turn.MeteredReasoning(inner, plan=LESSON, stub_scenes=True)
+    reasoning.script(["<scene 1>Start with the ratio.", "<step 2>At one action."])
+    build = planned_scene_prompt("PPO", LESSON.profile, LESSON.scenes[1], "light")
+
+    plan = [c async for c in reasoning.start_turn(PROMPT, tools=PLAN_TOOLS, tool_choice="required")]
+    stub = [c async for c in reasoning.start_turn(build, tools=SCENE_TOOLS, tool_choice="required")]
+    first = [c.text async for c in reasoning.start_turn(PROMPT)]
+    second = [c.text async for c in reasoning.start_turn(PROMPT)]
+    real = [c.text async for c in reasoning.start_turn(PROMPT)]
+
+    assert plan == [
+        TurnChunk(
+            kind="tool_call",
+            text=LESSON.model_dump_json(),
+            tool_call_id="call-plan",
+            tool_name=PLAN_TOOL,
+        )
+    ]
+    (drafted,) = stub
+    assert drafted.tool_name == SCENE_TOOL and len(json.loads(drafted.text)["steps"]) == 3
+    assert first == ["<scene ", "1>Start ", "with ", "the ", "ratio."]
+    assert "".join(second) == "<step 2>At one action."
+    assert real == ["The real reply."]
+    assert inner.prompts == [PROMPT]
+    assert reasoning.ledger.turns == 1 and reasoning.ledgers["voice"].turns == 1
+    assert reasoning.ledgers["planner"].turns == 0 and reasoning.ledgers["visual"].turns == 0
+
+
+def test_metering_is_armed_before_the_loop_runs() -> None:
+    boot = inspect.getsource(bench_turn.Bench.boot)
+    assert boot.index("reasoning.begin(") < boot.index("loop.run()")
+
+
+def test_the_loop_plans_exactly_with_a_plan_file_or_the_connect_run() -> None:
+    assert bench_turn.planned(bench_turn.parse_args([])) is False
+    assert bench_turn.planned(bench_turn.parse_args(["--silent-synth"])) is False
+    assert bench_turn.planned(bench_turn.parse_args(["--plan", "p.json"])) is True
+    assert bench_turn.planned(bench_turn.parse_args(["--connect"])) is True
+    assert "planned=planned" in inspect.getsource(bench_turn.Bench.boot)
+
+
+def test_connect_times_scene_one_by_the_plans_first_scene_id() -> None:
+    checks = [(1.0, "clip", True), (2.0, "ratio", False), (3.0, "ratio", True)]
+    assert bench_turn.first_scene_checked(checks, LESSON) == 3.0
+    assert bench_turn.first_scene_checked(checks[:2], LESSON) is None
+
+
+def test_the_connect_report_keeps_a_sample_at_its_bound_with_its_nulls(capsys) -> None:
+    cfg = Settings(_env_file=None, reasoning_api_base="http://x", reasoning_api_key="k")
+    samples = [
+        bench_turn.ConnectSample(
+            plan_ms=900, plan_valid=True, first_audio_frame_ms=2000, scene_checked_ms=40000
+        ),
+        bench_turn.ConnectSample(
+            plan_ms=None, plan_valid=False, first_audio_frame_ms=None, scene_checked_ms=None
+        ),
+    ]
+
+    bench_turn.report_connect(cfg, samples, 420.0)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert any("builder=interim-html" in line and "simulated page" in line for line in lines)
+    assert (
+        "connect to first outbound synthesized audio frame: observed 1 missing 1 "
+        "median=2000ms p95=2000ms max=2000ms"
+    ) in lines
+    assert (
+        "connect to scene checked (interim HTML builder, simulated page): observed 1 missing 1 "
+        "median=40000ms p95=40000ms max=40000ms"
+    ) in lines
+    assert "plan valid 1/2" in lines
+    assert lines[-1] == "measurement complete 1/2"
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--connect", "--silent-synth"],
+        ["--connect", "--stub-scenes"],
+        ["--connect", "--plan", "p.json"],
+        ["--connect", "--scenarios", "s.json"],
+        ["--scenarios", "s.json"],
+        ["--scenarios", "s.json", "--plan", "p.json"],
+        ["--scenarios", "s.json", "--plan", "p.json", "--stub-scenes"],
+        ["--out", "o"],
+    ],
+)
+def test_the_parser_refuses_combinations_that_would_mislabel_a_measurement(
+    flags: list[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        bench_turn.parse_args(flags)
+
+
+def test_a_stub_scene_has_the_count_the_planned_prompt_asks_for() -> None:
+    for count in (3, 4, 5):
+        prompt = TurnPrompt(
+            system="s", user_text=f"Steps, in this order, exactly {count}, one say line each:"
+        )
+        body = json.loads(bench_turn.stub_scene(prompt).text)
+        assert len(body["steps"]) == count and body["html"]
+
+
+def test_the_scenario_report_counts_each_check_over_its_own_cases(capsys) -> None:
+    kept = bench_turn.Sample(
+        first_sound_ms=900,
+        substance_ms=900,
+        first_content_delta_ms=600,
+        stages=0,
+        silent=False,
+        audio_ms=4000,
+        voice_usd=0.0001,
+        utterance=0,
+        scenario_id="question-0",
+        group="question",
+        tags=[],
+        tags_valid=True,
+        placement_errors=0,
+        dropped={},
+        progress_ok=True,
+        asked=True,
+        scene_ok=True,
+        leaked=0,
+        opening=False,
+        scenario_pass=True,
+    )
+    missed = kept.model_copy(
+        update={
+            "scenario_id": "boundary-0",
+            "group": "boundary",
+            "tags": ["step 2"],
+            "tags_valid": False,
+            "dropped": {"step:not_rising": 1},
+            "asked": None,
+            "scene_ok": False,
+            "leaked": 1,
+            "scenario_pass": False,
+        }
+    )
+
+    bench_turn.report_scenarios([kept, missed], sentence_rule=True)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "tags valid and placed 1/2" in lines
+    assert "asked, proxy 1/1" in lines
+    assert "scene tags as required 0/1" in lines
+    assert "tags dropped: step:not_rising=1" in lines
+    assert "boundary passed 0/1" in lines
+    assert lines[-1] == "verdict: scenarios passed 1/2, not a qualification run"
