@@ -224,6 +224,8 @@ class TurnLoop:
         if not cfg.planned:
             self._plan_ready.set()
         self._planner: asyncio.Task[None] | None = None
+        self._rerun_pending: str | None = None
+        self._exposed: dict[str, int] = {}
         self._closing = False
         self._hearing = False
         transport.on_json(self._on_json)
@@ -280,6 +282,8 @@ class TurnLoop:
                 "cursor.scene scene_id=%s n=%d cue_id=%d", head.tag.scene_id, head.tag.n, ack.cue_id
             )
             self._publish()
+            if head.tag.n >= 2:
+                self._rerun("boundary")
             return
         logger.info("cursor.step scene_id=%s n=%d cue_id=%d", ack.scene_id, head.tag.n, ack.cue_id)
 
@@ -391,9 +395,41 @@ class TurnLoop:
         )
         return result
 
+    async def _replan(self, stage: str) -> None:
+        snapshot, size = self._lesson.plan, self._protected()
+        result = await self._planner_call(stage, snapshot, size)
+        if isinstance(result, str):
+            logger.info("planner.rejected stage=%s reason=%s", stage, _planner_reason(result))
+            return
+        conflict = self._lesson.accept(result, size, max(self._exposed.values(), default=0))
+        if conflict is not None:
+            logger.info("planner.rejected stage=%s reason=%s", stage, conflict)
+            return
+        if snapshot is None:
+            logger.info("lesson.planned scenes=%d", len(result.scenes))
+        else:
+            logger.info("planner.accepted stage=%s scenes=%d", stage, len(self._lesson.plan.scenes))
+        self._publish()
+
+    def _rerun(self, stage: str) -> None:
+        if not self._cfg.planned or self._closing:
+            return
+        if self._planner is not None and not self._planner.done():
+            self._rerun_pending = stage
+            logger.info("planner.queued stage=%s", stage)
+            return
+        self._planner = asyncio.create_task(self._replan(stage), name="lesson-planner")
+        self._planner.add_done_callback(self._planner_done)
+
     def _planner_done(self, task: asyncio.Task[None]) -> None:
         if not task.cancelled() and task.exception() is not None:
             logger.error("planner.task_failed error=%s", type(task.exception()).__name__)
+        stage, self._rerun_pending = self._rerun_pending, None
+        if stage is not None:
+            self._rerun(stage)
+
+    def _protected(self) -> int:
+        return max(self._lesson.protected_count(), *self._exposed.values(), 0)
 
     def _adopt(self, plan: LessonPlan) -> None:
         self._lesson.adopt(plan)
@@ -557,6 +593,7 @@ class TurnLoop:
                 speculation.grounded.cancel()
             if not speculation.claimed:
                 self._results.pop(turn_id, None)
+                self._exposed.pop(turn_id, None)
 
     async def _claim(self, turn_id: str, user_text: str) -> asyncio.Future[Grounded] | None:
         speculation = self._speculations.pop(turn_id, None)
@@ -576,6 +613,11 @@ class TurnLoop:
         return None
 
     def _prompt(self, results: list[SearchResult], user_text: str, turn_id: str) -> TurnPrompt:
+        plan = self._lesson.plan
+        if plan is not None:
+            self._exposed[turn_id] = min(
+                max(self._lesson.position().scene, 1) + 1, len(plan.scenes)
+            )
         starting = (
             f"Starting from: {self._cfg.starting_from}\n\n" if self._cfg.starting_from else ""
         )
@@ -699,6 +741,9 @@ class TurnLoop:
             await self._stop_turn(turn_id)
         if opens:
             self._lesson.opened = True
+        elif not self._lesson.first_answer_done:
+            self._lesson.first_answer_done = True
+            self._rerun("first_answer")
         logger.info("turn.spoken turn_id=%s ms=%d", turn_id, _elapsed_ms(start, self._clock()))
         await self._visuals.push(self._state("listening"))
 
@@ -718,6 +763,7 @@ class TurnLoop:
         self._due.pop(turn_id, None)
         self._played.pop(turn_id, None)
         self._results.pop(turn_id, None)
+        self._exposed.pop(turn_id, None)
         await self._stop(self._pumps, turn_id)
         await self._stop(self._stagers, turn_id)
         await self._stop(self._drains, turn_id)
