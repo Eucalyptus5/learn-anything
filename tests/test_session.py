@@ -449,48 +449,6 @@ class CheckingTransport(LoggingTransport):
         asyncio.get_running_loop().call_soon(lambda: [h(report) for h in self.handlers])
 
 
-class AnsweringTransport(LoggingTransport):
-    def __init__(
-        self,
-        log: list[tuple[str, object]],
-        answers: dict[str, str],
-        holds: dict[str, asyncio.Event] | None = None,
-    ) -> None:
-        super().__init__(log)
-        self.answers = answers
-        self.holds = holds if holds is not None else {}
-        self.pushes: dict[str, asyncio.Event] = {}
-        self.deliveries: list[asyncio.Task[None]] = []
-
-    async def send_json(self, payload: dict[str, object]) -> None:
-        self._log.append(("send_json", payload))
-        if payload["type"] != "scene.push":
-            return
-        scene_id = str(payload["scene_id"])
-        self.pushes.setdefault(scene_id, asyncio.Event()).set()
-        if scene_id not in self.answers:
-            return
-        error = self.answers[scene_id]
-        report = {
-            "type": "scene.ready",
-            "scene_id": scene_id,
-            "ok": error == "",
-            "steps": len(payload["steps"]) if error == "" else 0,
-            "error": error,
-        }
-        gate = self.holds.get(scene_id)
-        if gate is None:
-            asyncio.get_running_loop().call_soon(lambda: [h(report) for h in self.handlers])
-            return
-
-        async def deliver() -> None:
-            await gate.wait()
-            for handler in self.handlers:
-                handler(report)
-
-        self.deliveries.append(asyncio.create_task(deliver()))
-
-
 def visual_call(name: str, arguments: str, call_id: str) -> TurnChunk:
     return TurnChunk(kind="tool_call", text=arguments, tool_call_id=call_id, tool_name=name)
 
