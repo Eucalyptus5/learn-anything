@@ -107,17 +107,17 @@ async def test_a_tool_call_becomes_a_plan_and_is_logged_without_its_text(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     log: list[tuple[str, object]] = []
-    reasoning = FakeReasoning(log, [], asyncio.Event(), visual=[call(PLAN_ARGUMENTS)])
+    reasoning = FakeReasoning(log, [], asyncio.Event(), plans=[[call(PLAN_ARGUMENTS)]])
     prompt = plan_prompt("PPO", STARTING, False, None, [], [])
     with caplog.at_level(logging.INFO, logger="tutor.planner"):
         result = await run_planner(reasoning, prompt, 8000, "high", model="plan-1")
 
     assert result == LessonPlan.model_validate(PLAN)
-    assert reasoning.tools == [PLAN_TOOLS]
-    assert reasoning.tool_choices == ["required"]
-    assert reasoning.max_tokens == [8000]
-    assert reasoning.efforts == ["high"]
-    assert reasoning.models == ["plan-1"]
+    assert reasoning.plan_tools == [PLAN_TOOLS]
+    assert reasoning.plan_tool_choices == ["required"]
+    assert reasoning.plan_max_tokens == [8000]
+    assert reasoning.plan_efforts == ["high"]
+    assert reasoning.plan_models == ["plan-1"]
     (line,) = [m for m in caplog.messages if m.startswith("planner.call")]
     assert re.fullmatch(r"planner\.call ms=\d+ finish=\S+ scenes=2 steps=6", line)
     assert "Knows policy" not in " ".join(caplog.messages)
@@ -128,7 +128,7 @@ async def test_prose_without_a_tool_call_is_the_no_tool_string(
 ) -> None:
     log: list[tuple[str, object]] = []
     reasoning = FakeReasoning(
-        log, [], asyncio.Event(), visual=[TurnChunk(kind="spoken", text="here is a plan")]
+        log, [], asyncio.Event(), plans=[[TurnChunk(kind="spoken", text="here is a plan")]]
     )
     prompt = plan_prompt("PPO", STARTING, False, None, [], [])
     with caplog.at_level(logging.INFO, logger="tutor.planner"):
@@ -142,7 +142,7 @@ async def test_a_stream_with_neither_prose_nor_a_call_is_empty_and_one_line(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     log: list[tuple[str, object]] = []
-    reasoning = FakeReasoning(log, [], asyncio.Event(), visual=[], visual_finish="length")
+    reasoning = FakeReasoning(log, [], asyncio.Event(), plans=[[]], plan_finish="length")
     prompt = plan_prompt("PPO", STARTING, False, None, [], [])
     with caplog.at_level(logging.INFO, logger="tutor.planner"):
         result = await run_planner(reasoning, prompt, 8000, "high")
@@ -158,9 +158,9 @@ async def test_an_unexpected_tool_and_a_truncated_stream_are_error_strings(
 ) -> None:
     log: list[tuple[str, object]] = []
     prompt = plan_prompt("PPO", STARTING, False, None, [], [])
-    other = FakeReasoning(log, [], asyncio.Event(), visual=[call(PLAN_ARGUMENTS, "write_scene")])
+    other = FakeReasoning(log, [], asyncio.Event(), plans=[[call(PLAN_ARGUMENTS, "write_scene")]])
     cut = FakeReasoning(
-        log, [], asyncio.Event(), visual=[call(PLAN_ARGUMENTS[:40])], visual_finish="length"
+        log, [], asyncio.Event(), plans=[[call(PLAN_ARGUMENTS[:40])]], plan_finish="length"
     )
     with caplog.at_level(logging.INFO, logger="tutor.planner"):
         unexpected = await run_planner(other, prompt, 8000, "high")
@@ -177,9 +177,9 @@ async def test_bad_arguments_are_error_strings_that_carry_no_text(
 ) -> None:
     log: list[tuple[str, object]] = []
     prompt = plan_prompt("PPO", STARTING, False, None, [], [])
-    broken = FakeReasoning(log, [], asyncio.Event(), visual=[call("{not json")])
+    broken = FakeReasoning(log, [], asyncio.Event(), plans=[[call("{not json")]])
     invalid = FakeReasoning(
-        log, [], asyncio.Event(), visual=[call(json.dumps({"profile": "p", "scenes": []}))]
+        log, [], asyncio.Event(), plans=[[call(json.dumps({"profile": "p", "scenes": []}))]]
     )
     with caplog.at_level(logging.INFO, logger="tutor.planner"):
         not_json = await run_planner(broken, prompt, 8000, "high")
@@ -203,8 +203,8 @@ async def test_a_plan_that_names_a_source_path_is_refused_without_its_text(
     numbered = plan()
     numbered["scenes"][0]["steps"][0] = {"show": "The number line from 0 to 1", "ask": ""}
     log: list[tuple[str, object]] = []
-    refusing = FakeReasoning(log, [], asyncio.Event(), visual=[call(json.dumps(named))])
-    keeping = FakeReasoning(log, [], asyncio.Event(), visual=[call(json.dumps(numbered))])
+    refusing = FakeReasoning(log, [], asyncio.Event(), plans=[[call(json.dumps(named))]])
+    keeping = FakeReasoning(log, [], asyncio.Event(), plans=[[call(json.dumps(numbered))]])
     prompt = plan_prompt("a client", "", True, None, [], [])
     with caplog.at_level(logging.INFO, logger="tutor.planner"):
         refused = await run_planner(refusing, prompt, 8000, "high")
@@ -225,7 +225,7 @@ async def test_a_decimal_ratio_in_a_step_is_not_refused(
         "ask": "",
     }
     log: list[tuple[str, object]] = []
-    reasoning = FakeReasoning(log, [], asyncio.Event(), visual=[call(json.dumps(ratio))])
+    reasoning = FakeReasoning(log, [], asyncio.Event(), plans=[[call(json.dumps(ratio))]])
     prompt = plan_prompt("PPO", STARTING, False, None, [], [])
     with caplog.at_level(logging.INFO, logger="tutor.planner"):
         result = await run_planner(reasoning, prompt, 8000, "high")

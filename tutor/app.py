@@ -53,6 +53,7 @@ def build_loop(
     source: InputPath,
     transport: Connection,
     request: SessionRequest,
+    planned: bool = True,
 ) -> TurnLoop:
     speaker = Speaker(models.synth, transport)
     loop_cfg = TurnLoopConfig(
@@ -65,15 +66,23 @@ def build_loop(
         scene_effort=cfg.scene_effort,
         scene_max_tokens=cfg.scene_max_tokens,
         scene_timeout_s=cfg.scene_timeout_s,
+        planned=planned,
+        planner_model=cfg.planner_model,
+        planner_effort=cfg.planner_effort,
+        planner_max_tokens=cfg.planner_max_tokens,
+        planner_timeout_s=cfg.planner_timeout_s,
     )
     return TurnLoop(loop_cfg, source, search, speaker, transport, reasoning, TurnRegistry())
 
 
 class Sessions:
-    def __init__(self, cfg: Settings, models: Models, reasoning: ReasoningClient) -> None:
+    def __init__(
+        self, cfg: Settings, models: Models, reasoning: ReasoningClient, planned: bool = True
+    ) -> None:
         self._cfg = cfg
         self._models = models
         self._reasoning = reasoning
+        self._planned = planned
         self._tasks: set[asyncio.Task[None]] = set()
         self._started = 0
 
@@ -103,7 +112,15 @@ class Sessions:
         vad = await asyncio.to_thread(SileroVad, VAD_MODEL)
         source = InputPath(connection, vad, self._models.partial, self._models.final)
         try:
-            loop = build_loop(self._cfg, self._models, self._reasoning, source, connection, request)
+            loop = build_loop(
+                self._cfg,
+                self._models,
+                self._reasoning,
+                source,
+                connection,
+                request,
+                planned=self._planned,
+            )
             try:
                 await loop.run()
             finally:

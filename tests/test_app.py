@@ -202,7 +202,9 @@ async def test_build_loop_runs_a_concept_turn_from_the_session_request(tmp_path:
     request = SessionRequest(subject="PPO", starting_from=STARTING_FROM)
 
     models = fake_models()
-    loop = build_loop(cfg, models, reasoning, EndOfTurnSource([USER_TEXT]), transport, request)
+    loop = build_loop(
+        cfg, models, reasoning, EndOfTurnSource([USER_TEXT]), transport, request, planned=False
+    )
     assert models.synth.calls == []
     assert transport.played == []
     await asyncio.wait_for(loop.run(), HANG_GUARD_S)
@@ -231,7 +233,7 @@ async def test_session_ends_on_its_own_when_the_frames_end(
     connection = FakeConnection(scripted_frames(len(CANONICAL)))
     models = fake_models()
     reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), asyncio.Event())
-    sessions = Sessions(cfg, models, reasoning)
+    sessions = Sessions(cfg, models, reasoning, planned=False)
 
     task = sessions.start(connection, REQUEST)
     await asyncio.wait_for(task, HANG_GUARD_S)
@@ -256,7 +258,7 @@ async def test_concurrent_sessions_each_get_their_own_vad(
     negative = [-frame for frame in positive]
     models = fake_models()
     reasoning = FakeReasoning(log, spoken_chunks(SPOKEN_DELTAS), asyncio.Event())
-    sessions = Sessions(cfg, models, reasoning)
+    sessions = Sessions(cfg, models, reasoning, planned=False)
 
     first = sessions.start(FakeConnection(positive), REQUEST)
     second = sessions.start(FakeConnection(negative), REQUEST)
@@ -284,7 +286,7 @@ async def test_shutdown_cancels_a_live_session_and_closes_its_collaborators(
     reasoning = FakeReasoning(
         log, spoken_chunks(SPOKEN_DELTAS), asyncio.Event(), gate=asyncio.Event()
     )
-    sessions = Sessions(cfg, models, reasoning)
+    sessions = Sessions(cfg, models, reasoning, planned=False)
 
     task = sessions.start(connection, REQUEST)
     await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
@@ -314,7 +316,7 @@ async def test_a_failing_session_is_logged_by_type_only(
             raise RuntimeError(FAKE_KEY)
 
     models.final = Exploding()
-    sessions = Sessions(cfg, models, FakeReasoningClient(cfg))
+    sessions = Sessions(cfg, models, FakeReasoningClient(cfg), planned=False)
 
     task = sessions.start(connection, REQUEST)
     await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), HANG_GUARD_S)
@@ -323,3 +325,28 @@ async def test_a_failing_session_is_logged_by_type_only(
     assert "session.failed error=RuntimeError" in caplog.messages
     assert FAKE_KEY not in caplog.text
     assert sessions.live == 0
+
+
+async def test_build_loop_plans_by_default_with_the_planner_settings(tmp_path: Path) -> None:
+    cfg = settings_for(
+        tmp_path,
+        PLANNER_MODEL="plan-1",
+        PLANNER_EFFORT="medium",
+        PLANNER_MAX_TOKENS="9000",
+        PLANNER_TIMEOUT_S="90",
+    )
+    request = SessionRequest(subject="PPO")
+    reasoning = FakeReasoning([], [], asyncio.Event())
+
+    loop = build_loop(cfg, fake_models(), reasoning, EndOfTurnSource([]), FakeTransport(), request)
+    quiet = build_loop(
+        cfg, fake_models(), reasoning, EndOfTurnSource([]), FakeTransport(), request, planned=False
+    )
+
+    assert loop._cfg.planned is True and quiet._cfg.planned is False
+    assert (
+        loop._cfg.planner_model,
+        loop._cfg.planner_effort,
+        loop._cfg.planner_max_tokens,
+        loop._cfg.planner_timeout_s,
+    ) == ("plan-1", "medium", 9000, 90.0)

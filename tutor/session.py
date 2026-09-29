@@ -11,7 +11,8 @@ from pydantic import BaseModel, Field, ValidationError
 from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.input_path import EndOfTurn, InputPath, PartialTranscript, SpeechStarted
 from tutor.lead_in import lead_in_sentence, lead_in_stages
-from tutor.lesson import LessonState, lesson_block
+from tutor.lesson import OPENING_TEXT, LessonPlan, LessonState, lesson_block
+from tutor.planner import EMPTY_REPLY, NO_TOOL_CALL, POSITION_REFUSED, plan_prompt, run_planner
 from tutor.prompt import (
     SEARCH_CODE_TOOL,
     Message,
@@ -35,6 +36,7 @@ from tutor.visuals import (
     LessonAttach,
     LessonCheckpoint,
     LessonCue,
+    LessonStatePush,
     LessonSync,
     LessonSynced,
     SceneCue,
@@ -57,10 +59,27 @@ SPOKEN_DEPTH = 32
 BAD_ARGUMENTS = "search_code takes a query string and a non-empty list of glob strings"
 NO_REPORT = "the page sent no report"
 LESSON_SYNC_TIMEOUT_S = 5.0  # a control bound on the page's answer, not a measured latency
+PLANNER_TIMEOUT = "planner: error: timeout"
+PLANNER_CALL_FAILED = "planner: error: call failed"
+PLANNER_REASONS = (
+    (NO_TOOL_CALL, "prose"),
+    (EMPTY_REPLY, "empty"),
+    (POSITION_REFUSED, "position"),
+    (PLANNER_TIMEOUT, "timeout"),
+    (PLANNER_CALL_FAILED, "call"),
+    ("planner: error: unexpected tool", "unexpected_tool"),
+    ("planner: error: truncated", "cap"),
+)
 
 
 def _elapsed_ms(start: float, now: float) -> int:
     return int((now - start) * 1000)
+
+
+def _planner_reason(result: str) -> str:
+    return next(
+        (token for prefix, token in PLANNER_REASONS if result.startswith(prefix)), "invalid"
+    )
 
 
 def _search_arguments(text: str) -> tuple[str, list[str]] | None:
@@ -136,6 +155,11 @@ class TurnLoopConfig(BaseModel):
     scene_timeout_s: float = Field(default=600.0, gt=0)
     scene_ready_timeout_s: float = Field(default=20.0, gt=0)
     speculative_reasoning: bool = False
+    planned: bool = True
+    planner_model: str = "glm-5.3"
+    planner_effort: str = "high"
+    planner_max_tokens: int = Field(default=22000, gt=0)
+    planner_timeout_s: float = Field(default=300.0, gt=0)
 
 
 class Speculation:
@@ -196,6 +220,12 @@ class TurnLoop:
         self._settled.set()
         self._sync_wait: asyncio.Task[None] | None = None
         self._background: set[asyncio.Task[None]] = set()
+        self._plan_ready = asyncio.Event()
+        if not cfg.planned:
+            self._plan_ready.set()
+        self._planner: asyncio.Task[None] | None = None
+        self._closing = False
+        self._hearing = False
         transport.on_json(self._on_json)
 
     def _on_json(self, payload: dict[str, object]) -> None:
@@ -249,6 +279,7 @@ class TurnLoop:
             logger.info(
                 "cursor.scene scene_id=%s n=%d cue_id=%d", head.tag.scene_id, head.tag.n, ack.cue_id
             )
+            self._publish()
             return
         logger.info("cursor.step scene_id=%s n=%d cue_id=%d", ack.scene_id, head.tag.n, ack.cue_id)
 
@@ -281,20 +312,99 @@ class TurnLoop:
 
     async def run(self) -> None:
         self._keep(self._visuals.push(LessonAttach(epoch=self._epoch)), "lesson-attach")
+        if self._cfg.planned:
+            self._planner = asyncio.create_task(self._plan(), name="lesson-planner")
+            self._planner.add_done_callback(self._planner_done)
         async for event in self._source.events():
             if isinstance(event, SpeechStarted):
+                self._hearing = True
                 self._interrupt()
             elif isinstance(event, PartialTranscript):
                 if self._cfg.speculative_reasoning and event.text:
                     self._prime(event.text)
             elif isinstance(event, EndOfTurn):
+                self._hearing = False
                 if any(not turn.cancelling() for turn in self._turns):
                     self._interrupt()
                 self._dispatch(event.text)
-        speculations = [speculation.task for speculation in self._speculations.values()]
-        for task in speculations:
+        self._closing = True
+        pending = [speculation.task for speculation in self._speculations.values()]
+        if self._planner is not None:
+            pending.append(self._planner)
+        for task in pending:
             task.cancel()
-        await asyncio.gather(*self._turns, *speculations, return_exceptions=True)
+        await asyncio.gather(*self._turns, *pending, return_exceptions=True)
+
+    async def _plan(self) -> None:
+        try:
+            result: LessonPlan | str = EMPTY_REPLY
+            for _ in (1, 2):
+                result = await self._planner_call("connect", None, 0)
+                if isinstance(result, LessonPlan):
+                    self._adopt(result)
+                    break
+            else:
+                logger.info("planner.failed stage=connect reason=%s", _planner_reason(result))
+        finally:
+            self._plan_ready.set()
+        if self._dispatched == 0 and not self._hearing and not self._closing:
+            self._dispatch(OPENING_TEXT)
+
+    async def _planner_call(
+        self, stage: str, snapshot: LessonPlan | None, protected: int
+    ) -> LessonPlan | str:
+        ids = [] if snapshot is None else [scene.id for scene in snapshot.scenes[:protected]]
+        transcript = self._transcript.since(self._lesson.planned_through, self._cfg.history_turns)
+        self._lesson.planned_through = self._transcript.latest()
+        prompt = plan_prompt(
+            self._cfg.subject,
+            self._cfg.starting_from,
+            self._cfg.root is not None,
+            snapshot,
+            ids,
+            transcript,
+        )
+        start = self._clock()
+        try:
+            async with asyncio.timeout(self._cfg.planner_timeout_s):
+                # A reasoning-client error comes back as the value; a cancel still propagates.
+                (result,) = await asyncio.gather(
+                    run_planner(
+                        self._reasoning,
+                        prompt,
+                        self._cfg.planner_max_tokens,
+                        self._cfg.planner_effort,
+                        model=self._cfg.planner_model or None,
+                    ),
+                    return_exceptions=True,
+                )
+        except TimeoutError:
+            result = PLANNER_TIMEOUT
+        if isinstance(result, BaseException):
+            logger.warning("planner.call_failed stage=%s error=%s", stage, type(result).__name__)
+            result = f"{PLANNER_CALL_FAILED} {type(result).__name__}"
+        logger.info(
+            "planner.result stage=%s ms=%d valid=%s",
+            stage,
+            _elapsed_ms(start, self._clock()),
+            isinstance(result, LessonPlan),
+        )
+        return result
+
+    def _planner_done(self, task: asyncio.Task[None]) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("planner.task_failed error=%s", type(task.exception()).__name__)
+
+    def _adopt(self, plan: LessonPlan) -> None:
+        self._lesson.adopt(plan)
+        logger.info("lesson.planned scenes=%d", len(plan.scenes))
+        self._publish()
+
+    def _publish(self) -> None:
+        scenes, current = self._lesson.statuses()
+        self._keep(
+            self._visuals.push(LessonStatePush(scenes=scenes, current=current)), "lesson-state"
+        )
 
     def _dispatch(self, text: str) -> None:
         self._dispatched += 1
@@ -404,6 +514,10 @@ class TurnLoop:
             logger.error("turn.failed turn_id=%s error=%s", turn.get_name(), type(error).__name__)
 
     async def aclose(self) -> None:
+        self._closing = True
+        if self._planner is not None:
+            self._planner.cancel()
+            await asyncio.gather(self._planner, return_exceptions=True)
         tasks = [*self._turns, *(speculation.task for speculation in self._speculations.values())]
         for task in tasks:
             if not task.cancelling():
@@ -421,6 +535,7 @@ class TurnLoop:
     ) -> None:
         if previous is not None:
             await asyncio.gather(previous, return_exceptions=True)
+        await self._plan_ready.wait()
         await self._settled.wait()
         start = self._clock()
         self._registry.open_turn(turn_id)
@@ -464,7 +579,7 @@ class TurnLoop:
         starting = (
             f"Starting from: {self._cfg.starting_from}\n\n" if self._cfg.starting_from else ""
         )
-        block = lesson_block(self._lesson, True, list(self._lesson.dropped))
+        block = lesson_block(self._lesson, user_text != OPENING_TEXT, list(self._lesson.dropped))
         system = f"{self._cfg.system}\n\nSubject: {self._cfg.subject}\n\n{starting}{block}"
         return TurnPrompt(
             system=system,
@@ -543,8 +658,11 @@ class TurnLoop:
     async def _turn(self, turn_id: str, user_text: str) -> None:
         start = self._clock()
         self._transcript.learner(turn_id, user_text)
-        await self._visuals.push(LearnerText(turn_id=turn_id, text=user_text))
+        if user_text != OPENING_TEXT:
+            await self._visuals.push(LearnerText(turn_id=turn_id, text=user_text))
+        await self._plan_ready.wait()
         await self._settled.wait()
+        opens = not self._lesson.opened
         barrier = self._barrier
         grounded = await self._claim(turn_id, user_text)
         self._visuals.set_grounding(self._registry, turn_id)
@@ -579,6 +697,8 @@ class TurnLoop:
             raise
         finally:
             await self._stop_turn(turn_id)
+        if opens:
+            self._lesson.opened = True
         logger.info("turn.spoken turn_id=%s ms=%d", turn_id, _elapsed_ms(start, self._clock()))
         await self._visuals.push(self._state("listening"))
 

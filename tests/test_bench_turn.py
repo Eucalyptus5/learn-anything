@@ -631,3 +631,8 @@ def test_the_harness_imports_nothing_from_the_brief_or_the_phase_machine() -> No
     }
     assert not {module for module, _ in imported} & {"tutor.brief", "tutor.pedagogy"}
     assert ("tutor.session", "OutcomeSplitter") not in imported
+
+
+def test_the_bench_builds_its_loop_with_no_plan() -> None:
+    source = SCRIPT.read_text()
+    assert "build_loop(cfg, models, reasoning, source, transport, request, planned=False)" in source

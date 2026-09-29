@@ -1048,3 +1048,12 @@ def test_the_check_page_probes_the_lesson_payloads() -> None:
         '"lesson.state current Bad"',
     ):
         assert name in hostile[1], name
+
+
+def test_a_caption_for_a_turn_with_no_learner_line_keeps_its_record() -> None:
+    client = CLIENT.read_text()
+    caption = re.search(r'onPayload\("caption", \(payload\) => \{(.*?)\n\}\);', client, re.DOTALL)
+    assert caption is not None
+    body = caption[1]
+    assert 'turn = { turn_id: payload.turn_id, learner: "", tutor: [] };' in body
+    assert body.index("if (turn === undefined) {") < body.index("turn.tutor.push(payload.text);")

@@ -369,7 +369,12 @@ onPayload("state", (payload) => {
 });
 
 onPayload("caption", (payload) => {
-  turns.find((turn) => turn.turn_id === payload.turn_id).tutor.push(payload.text);
+  let turn = turns.find((each) => each.turn_id === payload.turn_id);
+  if (turn === undefined) {
+    turn = { turn_id: payload.turn_id, learner: "", tutor: [] };
+    turns.push(turn);
+  }
+  turn.tutor.push(payload.text);
   if (payload.turn_id !== replyTurn) startTurn(payload.turn_id);
   const timer = setTimeout(() => {
     held.delete(timer);

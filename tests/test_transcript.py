@@ -63,3 +63,27 @@ def test_a_second_learner_text_for_the_same_turn_is_ignored() -> None:
 def test_the_transcript_has_no_head_or_tail() -> None:
     assert not hasattr(Transcript(10), "head")
     assert not hasattr(Transcript(10), "tail")
+
+
+def test_since_returns_the_turns_after_a_mark_open_ones_included() -> None:
+    transcript = Transcript(10)
+    transcript.learner("turn-1", "what is PPO")
+    transcript.tutor("turn-1", "A policy method.")
+    transcript.learner("turn-2", "why clip")
+    transcript.tutor("turn-2", "To bound the step,")
+    second = [
+        Message(role="user", content="why clip"),
+        Message(role="assistant", content="To bound the step,"),
+    ]
+    assert transcript.latest() == "turn-2"
+    assert Transcript(10).latest() is None
+    assert transcript.since(None, 10) == [
+        Message(role="user", content="what is PPO"),
+        Message(role="assistant", content="A policy method."),
+        *second,
+    ]
+    assert transcript.since("turn-1", 10) == second
+    assert transcript.since("turn-2", 10) == []
+    assert transcript.since(None, 1) == second
+    assert transcript.since(None, 0) == []
+    assert transcript.since("turn-9", 10) == transcript.since(None, 10)

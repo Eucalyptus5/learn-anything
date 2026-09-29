@@ -121,3 +121,8 @@ def test_parser_defaults() -> None:
 
     assert args.root.parts[-3:] == ("tests", "data", "fixture_repo")
     assert args.model is None
+
+
+def test_the_bench_builds_its_loop_with_no_plan() -> None:
+    source = SCRIPT.read_text()
+    assert "build_loop(cfg, models, reasoning, source, transport, request, planned=False)" in source

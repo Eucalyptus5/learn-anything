@@ -625,7 +625,7 @@ class Bench:
         reasoning = MeteredReasoning(ReasoningClient(cfg))
         transport = BenchTransport(synth)
         source = ScriptedSource()
-        loop = build_loop(cfg, models, reasoning, source, transport, request)
+        loop = build_loop(cfg, models, reasoning, source, transport, request, planned=False)
         watch = OutcomeWatch()
         logging.getLogger("tutor.session").addFilter(watch)
         loop_task = asyncio.create_task(loop.run(), name="bench-loop")
