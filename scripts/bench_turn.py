@@ -91,6 +91,7 @@ LISTENING_OUTCOME = REPO / "scratch" / "experiments" / "12" / "listening" / "out
 SCENE_READY_TIMEOUT_S = TurnLoopConfig.model_fields["scene_ready_timeout_s"].default
 STUB_COUNT = re.compile(r"exactly (\d+), one say line each")
 STUB_HTML = '<!doctype html><div id="stub"></div>'
+SAY_LINE_CHARS = 120  # write_scene's StepLine limit; a plan's show line may run to 300
 GROUPS = ("opening", "progress", "question", "answer", "boundary", "tangent")
 FLOOR = 27
 
@@ -470,8 +471,14 @@ class CannedStream:
 
 
 def stub_scene(prompt: TurnPrompt) -> TurnChunk:
-    count = int(STUB_COUNT.search(prompt.user_text).group(1))
-    body = {"html": STUB_HTML, "steps": [f"Step {n}" for n in range(1, count + 1)]}
+    found = STUB_COUNT.search(prompt.user_text)
+    count = int(found.group(1))
+    lines = prompt.user_text[found.end() :].splitlines()[1 : count + 1]
+    said = [
+        line.partition(". ")[2][:SAY_LINE_CHARS] or f"Step {n}" for n, line in enumerate(lines, 1)
+    ]
+    steps = [*said, *(f"Step {n}" for n in range(len(said) + 1, count + 1))]
+    body = {"html": STUB_HTML, "steps": steps}
     return TurnChunk(
         kind="tool_call", text=json.dumps(body), tool_call_id="call-scene", tool_name=SCENE_TOOL
     )
@@ -725,6 +732,17 @@ class OutcomeWatch(logging.Filter):
             await self.event.wait()
 
 
+def setup_settled(lesson: LessonState) -> bool:
+    # Only the shown scene's build reaches the prompt; one further ahead may wait for a scene
+    # that a setup short of its target never shows.
+    scene = lesson.current()
+    return (
+        not lesson.sent
+        and scene is not None
+        and (scene.id in lesson.built or scene.id in lesson.failed)
+    )
+
+
 class Measured(NamedTuple):
     sample: Sample
     reply: str
@@ -852,14 +870,7 @@ class Bench:
         return Measured(measured, reply, [entry.text for entry in played if entry.text is not None])
 
     async def settle(self) -> None:
-        lesson = self.lesson
-        await self.transport.wait_frames(
-            lambda: (
-                not lesson.sent
-                and lesson.next_to_build() is None
-                and lesson.committed <= lesson.built.keys() | lesson.failed
-            )
-        )
+        await self.transport.wait_frames(lambda: setup_settled(self.lesson))
 
     async def aclose(self) -> None:
         await self._loop.aclose()
@@ -1134,6 +1145,15 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         )
         if given
     ]
+    mixed = synthetic + [
+        flag
+        for flag, given in (("--out", args.out is not None), ("--connect", args.connect))
+        if given
+    ]
+    if args.soak is not None and mixed:
+        parser.error(
+            f"--soak runs the unplanned loop on Kokoro and takes none of {', '.join(mixed)}"
+        )
     if args.connect and synthetic:
         parser.error(f"--connect times the real path and takes none of {', '.join(synthetic)}")
     if args.scenarios is not None and (
@@ -1350,7 +1370,8 @@ def report_soak(
     ledger: UsageLedger,
 ) -> None:
     print(
-        f"soak: {args.soak} min of scripted turns through the assembled loop, every turn kept "
+        f"soak: {args.soak} min of scripted turns through the assembled loop with no plan, on "
+        "Kokoro, every turn kept "
         f"with its offset from the first turn; powermetrics sampled every {SOAK_SAMPLE_S} s "
         "alongside this process's rss and system swap."
     )
@@ -1413,7 +1434,6 @@ async def soak(
     models: Models,
     inner: ReasoningClient,
     request: SessionRequest,
-    plan: LessonPlan | None,
 ) -> int:
     sampler = await Sampler.start()
     try:
@@ -1424,11 +1444,9 @@ async def soak(
             )
             return 2
         utterances = utterances_for(request.folder)
-        bench = Bench.boot(cfg, models, inner, request, planned(args), plan, args.stub_scenes)
+        bench = Bench.boot(cfg, models, inner, request, False)
         turns: list[tuple[float, Sample]] = []
         try:
-            if planned(args):
-                await bench.turn(None)
             print(f"soak start {await machine_state()}", flush=True)
             started = time.perf_counter()
             sampler.rebase()
@@ -1551,7 +1569,7 @@ async def connect_sample(
     inner: ReasoningClient,
     request: SessionRequest,
     bound_s: float,
-) -> ConnectSample:
+) -> tuple[ConnectSample, Counter[str]]:
     bench = Bench.boot(cfg, models, inner, request, True)
     transport, lesson, watch = bench.transport, bench.lesson, bench.watch
 
@@ -1573,12 +1591,13 @@ async def connect_sample(
         with contextlib.suppress(TimeoutError):
             async with asyncio.timeout(bound_s):
                 await transport.wait_frames(settled)
-        return ConnectSample(
+        sample = ConnectSample(
             plan_ms=since_t0(watch.planned_at),
             plan_valid=watch.planned_at is not None,
             first_audio_frame_ms=since_t0(transport.first_sound),
             scene_checked_ms=since_t0(checked()),
         )
+        return sample, transport.simulated
     finally:
         await bench.aclose()
 
@@ -1593,13 +1612,16 @@ async def run_connect(
     bound_s = 2 * cfg.planner_timeout_s + cfg.scene_timeout_s + SCENE_READY_TIMEOUT_S + 60
     total = WARMUP + args.samples
     samples: list[ConnectSample] = []
+    simulated: Counter[str] = Counter()
     print(f"start {await machine_state()}", flush=True)
     for n in range(total):
-        sample = await connect_sample(cfg, models, inner, request, bound_s)
+        sample, page = await connect_sample(cfg, models, inner, request, bound_s)
         if n >= WARMUP:
             samples.append(sample)
+            simulated += page
         fields = " ".join(f"{key}={value}" for key, value in sample.model_dump().items())
         print(f"connect={n + 1}/{total} {fields}", file=sys.stderr)
+    report_page(simulated)
     report_connect(cfg, samples, bound_s)
     return 0
 
@@ -1634,7 +1656,7 @@ async def main() -> int:
     inner = ReasoningClient(cfg)
     try:
         if args.soak is not None:
-            return await soak(cfg, args, models, inner, request, plan)
+            return await soak(cfg, args, models, inner, request)
         if args.connect:
             return await run_connect(cfg, args, models, inner, request)
         if args.scenarios is None:

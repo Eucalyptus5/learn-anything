@@ -13,11 +13,11 @@ from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.config import Settings
 from tutor.cost import TurnUsage, UsageLedger
 from tutor.input_path import EndOfTurn, SpeechStarted
-from tutor.lesson import OPENING_TEXT, Cursor, LessonState
+from tutor.lesson import OPENING_TEXT, BuiltScene, Cursor, LessonState, Step
 from tutor.planner import PLAN_TOOL, PLAN_TOOLS
 from tutor.prompt import Message, TurnPrompt
 from tutor.reasoning import TurnChunk
-from tutor.scene import SCENE_TOOL, SCENE_TOOLS, planned_scene_prompt
+from tutor.scene import SCENE_TOOL, SCENE_TOOLS, SceneDraft, planned_scene_prompt
 from tutor.visuals import LessonAck
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "bench_turn.py"
@@ -1008,6 +1008,21 @@ def test_the_connect_report_keeps_a_sample_at_its_bound_with_its_nulls(capsys) -
         ["--scenarios", "s.json", "--plan", "p.json"],
         ["--scenarios", "s.json", "--plan", "p.json", "--stub-scenes"],
         ["--out", "o"],
+        ["--soak", "30", "--connect"],
+        [
+            "--soak",
+            "30",
+            "--scenarios",
+            "s.json",
+            "--plan",
+            "p.json",
+            "--stub-scenes",
+            "--out",
+            "o",
+        ],
+        ["--soak", "30", "--plan", "p.json"],
+        ["--soak", "30", "--stub-scenes"],
+        ["--soak", "30", "--silent-synth"],
     ],
 )
 def test_the_parser_refuses_combinations_that_would_mislabel_a_measurement(
@@ -1072,3 +1087,54 @@ def test_the_scenario_report_counts_each_check_over_its_own_cases(capsys) -> Non
     assert "tags dropped: step:not_rising=1" in lines
     assert "boundary passed 0/1" in lines
     assert lines[-1] == "verdict: scenarios passed 1/2, not a qualification run"
+
+
+def test_a_stub_scene_says_the_planned_prompts_show_lines() -> None:
+    steps = [*LESSON.scenes[1].steps[:2], Step(show="x" * 300)]
+    scene = LESSON.scenes[1].model_copy(update={"steps": steps})
+    prompt = planned_scene_prompt("PPO", LESSON.profile, scene, "light", "write 3 say lines")
+
+    body = json.loads(bench_turn.stub_scene(prompt).text)
+
+    assert body["steps"] == [
+        "The ratio axis from 0.5 to 2.0",
+        "The clip band at 0.8 and 1.2",
+        "x" * bench_turn.SAY_LINE_CHARS,
+    ]
+    SceneDraft.model_validate(body)
+
+
+def test_a_setup_short_of_its_scene_settles_and_then_misses_its_target() -> None:
+    case = scenario(
+        "progress",
+        Cursor(scene=1, step=1),
+        [["step 2"]],
+        setup=[{"learner": None, "reply": "<scene1>Start with the ratio."}],
+    )
+    history = [
+        Message(role="user", content=OPENING_TEXT),
+        Message(role="assistant", content="Start with the ratio."),
+    ]
+    state = state_at(0, 0)
+    state.committed = {"ratio", "clip"}
+    assert not bench_turn.setup_settled(state)
+
+    state.built["ratio"] = BuiltScene(
+        scene_id="ratio", version=1, say=["a", "b", "c"], html="<p>ratio</p>"
+    )
+
+    assert bench_turn.setup_settled(state)
+    with pytest.raises(bench_turn.HarnessError, match="progress-1"):
+        bench_turn.check_setup(state.acked, history, case)
+
+
+def test_a_setup_cue_still_waiting_on_its_ack_is_not_settled() -> None:
+    state = state_at(1, 1)
+    state.built["ratio"] = BuiltScene(
+        scene_id="ratio", version=1, say=["a", "b", "c"], html="<p>ratio</p>"
+    )
+    assert bench_turn.setup_settled(state)
+
+    assert state.step_tag(2) is None
+
+    assert not bench_turn.setup_settled(state)
