@@ -6214,3 +6214,240 @@ async def test_statuses_follow_the_queue() -> None:
 
     assert history("ratio") == ["planned", "building", "built"]
     assert history("clip") == ["planned", "building", "built"]
+
+
+RETRY_TAIL = "\n\nThe previous attempt failed its check: {error}\nWrite the whole scene again."
+BAND_ERROR = "timeline lacks labels step-3"
+
+
+async def test_a_failed_build_ahead_is_retried_once_with_its_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log, fires=True, ready={"ratio": "", "clip": BAND_ERROR})
+    reasoning = queue_reasoning(
+        log, speaker, ["<scene 1>Start with the ratio. ", "It compares two policies."]
+    )
+    stop = asyncio.Event()
+    loop = concept_loop(
+        log, ScriptedSource([stop]), speaker, reasoning, cfg=lesson_cfg(), transport=page
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(page.state_where(status_is("clip", "failed")), HANG_GUARD_S)
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    clip = builds(reasoning, "The clip")
+    assert len(clip) == 2
+    assert clip[1].user_text.endswith(RETRY_TAIL.format(error=BAND_ERROR))
+    assert "scene.failed scene_id=clip attempt=2 reason=check" in session_messages(caplog)
+    assert loop._lesson.failed == {"clip"}
+
+
+async def test_scene_one_is_retried_until_the_voice_opens_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold, hold_at=1)
+    page = FakePage(log, ready={"ratio": BAND_ERROR, "clip": ""})
+    reasoning = queue_reasoning(
+        log, speaker, ["Welcome to the lesson. ", "<scene 1>Start with the ratio."]
+    )
+    stop = asyncio.Event()
+    loop = concept_loop(
+        log, ScriptedSource([stop]), speaker, reasoning, cfg=lesson_cfg(), transport=page
+    )
+
+    with (
+        caplog.at_level(logging.INFO, logger="tutor.session"),
+        line_seen("scene.failed scene_id=ratio attempt=2") as failed,
+    ):
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(page.seen("scene.push", 2), HANG_GUARD_S)
+        await asyncio.wait_for(failed.wait(), HANG_GUARD_S)
+        assert sent(log, "lesson.cue") == []
+        hold.set()
+        await asyncio.wait_for(page.seen("lesson.cue", 1), HANG_GUARD_S)
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    ratio = builds(reasoning, "The ratio")
+    assert len(ratio) == 2
+    assert ratio[1].user_text.endswith(RETRY_TAIL.format(error=BAND_ERROR))
+    assert "scene.failed scene_id=ratio attempt=2 reason=check" in session_messages(caplog)
+    (cue,) = sent(log, "lesson.cue")
+    assert cue["tag"] == {"kind": "scene", "n": 1, "scene_id": "ratio"}
+
+
+async def test_a_build_that_fails_while_its_scene_is_taught_fails_at_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log, fires=True, ready={"ratio": "", "clip": BAND_ERROR})
+    clip_gate = asyncio.Event()
+    reasoning = queue_reasoning(log, speaker, OPENING_SCENES, visual_gates=[opened(), clip_gate])
+    stop = asyncio.Event()
+    loop = concept_loop(
+        log, ScriptedSource([stop]), speaker, reasoning, cfg=lesson_cfg(), transport=page
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(page.state_where(status_is("clip", "building")), HANG_GUARD_S)
+        await asyncio.wait_for(reasoning.build_streams[1].held.wait(), HANG_GUARD_S)
+        await asyncio.wait_for(page.state_where(lambda p: p["current"] == "clip"), HANG_GUARD_S)
+        clip_gate.set()
+        await asyncio.wait_for(page.state_where(status_is("clip", "failed")), HANG_GUARD_S)
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert len(builds(reasoning, "The clip")) == 1
+    assert "scene.failed scene_id=clip attempt=1 reason=check" in session_messages(caplog)
+
+
+async def test_a_draft_with_the_wrong_count_is_a_failed_attempt(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log, ready=READY)
+    reasoning = queue_reasoning(log, speaker, SPOKEN_DELTAS, visual=[draft_call(4)])
+    stop = asyncio.Event()
+    loop = concept_loop(
+        log, ScriptedSource([stop]), speaker, reasoning, cfg=lesson_cfg(), transport=page
+    )
+
+    with (
+        caplog.at_level(logging.INFO, logger="tutor.session"),
+        line_seen("scene.failed scene_id=clip attempt=2") as failed,
+    ):
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(failed.wait(), HANG_GUARD_S)
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert sent(log, "scene.push") == []
+    assert "scene.failed scene_id=ratio attempt=2 reason=count" in session_messages(caplog)
+    error = "write exactly 3 say lines, one per step; the draft had 4"
+    assert builds(reasoning, "The ratio")[1].user_text.endswith(RETRY_TAIL.format(error=error))
+
+
+async def test_a_draft_that_names_a_source_path_is_a_failed_attempt(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log, ready=READY)
+    named = said_call(["The ratio at one action", "see src/pool.py:12", "The band"])
+    reasoning = queue_reasoning(log, speaker, SPOKEN_DELTAS, visual=[named])
+    stop = asyncio.Event()
+    loop = concept_loop(
+        log, ScriptedSource([stop]), speaker, reasoning, cfg=lesson_cfg(), transport=page
+    )
+
+    with (
+        caplog.at_level(logging.INFO, logger="tutor.session"),
+        line_seen("scene.failed scene_id=ratio attempt=2") as failed,
+    ):
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(failed.wait(), HANG_GUARD_S)
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert "ratio" not in pushed(log)
+    assert "scene.failed scene_id=ratio attempt=2 reason=position" in session_messages(caplog)
+    error = "write no file path, symbol or line number; the scene is concept content only"
+    assert builds(reasoning, "The ratio")[1].user_text.endswith(RETRY_TAIL.format(error=error))
+
+
+async def test_a_page_that_never_reports_is_a_failed_attempt(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log, ready={})
+    reasoning = queue_reasoning(log, speaker, SPOKEN_DELTAS)
+    cfg = lesson_cfg().model_copy(update={"scene_ready_timeout_s": 0.01})
+    stop = asyncio.Event()
+    loop = concept_loop(log, ScriptedSource([stop]), speaker, reasoning, cfg=cfg, transport=page)
+
+    with (
+        caplog.at_level(logging.INFO, logger="tutor.session"),
+        line_seen("scene.failed scene_id=ratio attempt=2") as failed,
+    ):
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(failed.wait(), HANG_GUARD_S)
+        assert "ratio" not in loop._ready
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert pushed(log)[:2] == ["ratio", "ratio"]
+    assert "scene.failed scene_id=ratio attempt=2 reason=no_report" in session_messages(caplog)
+
+
+async def test_a_build_past_its_bound_is_a_failed_attempt(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log, ready=READY)
+    never = [asyncio.Event(), asyncio.Event()]
+    reasoning = queue_reasoning(log, speaker, SPOKEN_DELTAS, visual_gates=never)
+    cfg = lesson_cfg().model_copy(update={"scene_timeout_s": 0.01})
+    stop = asyncio.Event()
+    loop = concept_loop(log, ScriptedSource([stop]), speaker, reasoning, cfg=cfg, transport=page)
+
+    with (
+        caplog.at_level(logging.INFO, logger="tutor.session"),
+        line_seen("scene.failed scene_id=ratio attempt=2") as failed,
+    ):
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(failed.wait(), HANG_GUARD_S)
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert "ratio" not in pushed(log)
+    assert "scene.failed scene_id=ratio attempt=2 reason=timeout" in session_messages(caplog)
+
+
+class RatioPushFails(FakePage):
+    async def send_json(self, payload: dict[str, object]) -> None:
+        if payload["type"] == "scene.push" and payload["scene_id"] == "ratio":
+            raise ChannelClosed()
+        await super().send_json(payload)
+
+
+async def test_an_unexpected_build_error_marks_the_scene_failed_and_the_queue_moves_on(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = RatioPushFails(log, ready=READY)
+    reasoning = queue_reasoning(log, speaker, SPOKEN_DELTAS)
+    stop = asyncio.Event()
+    loop = concept_loop(
+        log, ScriptedSource([stop]), speaker, reasoning, cfg=lesson_cfg(), transport=page
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(page.seen("scene.push", 1), HANG_GUARD_S)
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert pushed(log) == ["clip"]
+    assert "scene.task_failed scene_id=ratio error=ChannelClosed" in session_messages(caplog)
+    assert "ratio" in loop._lesson.failed

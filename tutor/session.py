@@ -21,6 +21,8 @@ from tutor.prompt import (
     TurnPrompt,
 )
 from tutor.reasoning import ReasoningClient, TurnChunk
+from tutor.scene import EMPTY_REPLY as EMPTY_REPLY_SCENE
+from tutor.scene import NO_TOOL_CALL as NO_TOOL_CALL_SCENE
 from tutor.scene import draft_paths, planned_scene_prompt, run_scene_build
 from tutor.speech import Chunk, OnPlay, Speaker
 from tutor.tags import Marker, RawTag, TagSplitter, parse_marker, tag_name
@@ -71,6 +73,14 @@ PLANNER_REASONS = (
     ("planner: error: unexpected tool", "unexpected_tool"),
     ("planner: error: truncated", "cap"),
 )
+SCENE_REASONS = (
+    (NO_TOOL_CALL_SCENE, "prose"),
+    (EMPTY_REPLY_SCENE, "empty"),
+    ("scene: error: unexpected tool", "unexpected_tool"),
+    ("scene: error: truncated", "cap"),
+    ("scene: error: arguments", "arguments"),
+)
+DRAFT_POSITION = "write no file path, symbol or line number; the scene is concept content only"
 
 
 def _elapsed_ms(start: float, now: float) -> int:
@@ -81,6 +91,10 @@ def _planner_reason(result: str) -> str:
     return next(
         (token for prefix, token in PLANNER_REASONS if result.startswith(prefix)), "invalid"
     )
+
+
+def _scene_reason(result: str) -> str:
+    return next((token for prefix, token in SCENE_REASONS if result.startswith(prefix)), "rejected")
 
 
 def _search_arguments(text: str) -> tuple[str, list[str]] | None:
@@ -979,41 +993,68 @@ class TurnLoop:
                 self._lesson_changed.clear()
                 await self._lesson_changed.wait()
                 continue
-            await self._build(scene)
+            # The error returns as a value, so only its type is logged; a cancel still propagates.
+            (error,) = await asyncio.gather(self._build(scene), return_exceptions=True)
+            if isinstance(error, BaseException):
+                self._lesson.failed.add(scene.id)
+                logger.error(
+                    "scene.task_failed scene_id=%s error=%s", scene.id, type(error).__name__
+                )
+                self._publish()
 
     async def _build(self, scene: Scene) -> None:
         self._lesson.committed.add(scene.id)
         self._publish()
-        logger.info("scene.build scene_id=%s attempt=1", scene.id)
-        if not await self._attempt(scene):
-            self._lesson.failed.add(scene.id)
-            logger.info("scene.failed scene_id=%s attempt=1", scene.id)
+        error = ""
+        reason = ""
+        for attempt in (1, 2):
+            logger.info("scene.build scene_id=%s attempt=%d", scene.id, attempt)
+            failure = await self._attempt(scene, error)
+            if failure is None:
+                self._publish()
+                return
+            reason, error = failure
+            if self._lesson.being_taught(scene.id):
+                break
+        self._lesson.failed.add(scene.id)
+        logger.info("scene.failed scene_id=%s attempt=%d reason=%s", scene.id, attempt, reason)
         self._publish()
 
-    async def _attempt(self, scene: Scene) -> bool:
+    async def _attempt(self, scene: Scene, error: str) -> tuple[str, str] | None:
         plan = self._lesson.plan
-        prompt = planned_scene_prompt(self._cfg.subject, plan.profile, scene, self._theme)
-        draft = await run_scene_build(
-            self._reasoning,
-            prompt,
-            self._cfg.scene_max_tokens,
-            self._cfg.scene_effort,
-            model=self._cfg.scene_model or None,
-        )
-        if isinstance(draft, str) or len(draft.steps) != len(scene.steps):
-            return False
+        prompt = planned_scene_prompt(self._cfg.subject, plan.profile, scene, self._theme, error)
+        try:
+            async with asyncio.timeout(self._cfg.scene_timeout_s):
+                draft = await run_scene_build(
+                    self._reasoning,
+                    prompt,
+                    self._cfg.scene_max_tokens,
+                    self._cfg.scene_effort,
+                    model=self._cfg.scene_model or None,
+                )
+        except TimeoutError:
+            return "timeout", ""
+        if isinstance(draft, str):
+            return _scene_reason(draft), draft.removeprefix("scene: error: ")
+        if len(draft.steps) != len(scene.steps):
+            return "count", (
+                f"write exactly {len(scene.steps)} say lines, one per step; "
+                f"the draft had {len(draft.steps)}"
+            )
         if await asyncio.to_thread(draft_paths, draft):
-            return False
+            return "position", DRAFT_POSITION
         await self._wait_for_the_slot(scene)
         push = ScenePush(scene_id=scene.id, title=scene.title, html=draft.html, steps=draft.steps)
         ready = await self._check(scene.id, push)
+        if ready.error == NO_REPORT:
+            return "no_report", ""
         if not ready.ok:
-            return False
+            return "check", ready.error
         self._lesson.built[scene.id] = BuiltScene(
             scene_id=scene.id, version=1, say=list(draft.steps), html=draft.html
         )
         logger.info("scene.built scene_id=%s steps=%d", scene.id, len(draft.steps))
-        return True
+        return None
 
     async def _wait_for_the_slot(self, scene: Scene) -> None:
         logged = False
