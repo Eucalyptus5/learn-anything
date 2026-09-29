@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field, ValidationError
 from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.input_path import EndOfTurn, InputPath, PartialTranscript, SpeechStarted
 from tutor.lead_in import lead_in_sentence, lead_in_stages
-from tutor.lesson import OPENING_TEXT, LessonPlan, LessonState, lesson_block
+from tutor.lesson import OPENING_TEXT, BuiltScene, LessonPlan, LessonState, Scene, lesson_block
 from tutor.planner import EMPTY_REPLY, NO_TOOL_CALL, POSITION_REFUSED, plan_prompt, run_planner
 from tutor.prompt import (
     SEARCH_CODE_TOOL,
@@ -21,6 +21,7 @@ from tutor.prompt import (
     TurnPrompt,
 )
 from tutor.reasoning import ReasoningClient, TurnChunk
+from tutor.scene import draft_paths, planned_scene_prompt, run_scene_build
 from tutor.speech import Chunk, OnPlay, Speaker
 from tutor.tags import Marker, RawTag, TagSplitter, parse_marker, tag_name
 from tutor.tools.models import SearchBudget, SearchResult
@@ -224,6 +225,8 @@ class TurnLoop:
         if not cfg.planned:
             self._plan_ready.set()
         self._planner: asyncio.Task[None] | None = None
+        self._builder: asyncio.Task[None] | None = None
+        self._lesson_changed = asyncio.Event()
         self._rerun_pending: str | None = None
         self._exposed: dict[str, int] = {}
         self._closing = False
@@ -282,6 +285,7 @@ class TurnLoop:
                 "cursor.scene scene_id=%s n=%d cue_id=%d", head.tag.scene_id, head.tag.n, ack.cue_id
             )
             self._publish()
+            self._lesson_changed.set()
             if head.tag.n >= 2:
                 self._rerun("boundary")
             return
@@ -293,6 +297,7 @@ class TurnLoop:
             return
         self._pending_barrier = None
         self._lesson.synced(message)
+        self._lesson_changed.set()
         self._settled.set()
         if self._sync_wait is not None:
             self._sync_wait.cancel()
@@ -312,6 +317,7 @@ class TurnLoop:
             logger.info("lesson.checkpoint_ignored epoch=%d", message.epoch)
             return
         self._lesson.retain(message)
+        self._lesson_changed.set()
         self._resync("restore")
 
     async def run(self) -> None:
@@ -319,6 +325,7 @@ class TurnLoop:
         if self._cfg.planned:
             self._planner = asyncio.create_task(self._plan(), name="lesson-planner")
             self._planner.add_done_callback(self._planner_done)
+            self._builder = asyncio.create_task(self._build_loop(), name="lesson-builder")
         async for event in self._source.events():
             if isinstance(event, SpeechStarted):
                 self._hearing = True
@@ -333,8 +340,7 @@ class TurnLoop:
                 self._dispatch(event.text)
         self._closing = True
         pending = [speculation.task for speculation in self._speculations.values()]
-        if self._planner is not None:
-            pending.append(self._planner)
+        pending += [task for task in (self._planner, self._builder) if task is not None]
         for task in pending:
             task.cancel()
         await asyncio.gather(*self._turns, *pending, return_exceptions=True)
@@ -410,6 +416,7 @@ class TurnLoop:
         else:
             logger.info("planner.accepted stage=%s scenes=%d", stage, len(self._lesson.plan.scenes))
         self._publish()
+        self._lesson_changed.set()
 
     def _rerun(self, stage: str) -> None:
         if not self._cfg.planned or self._closing:
@@ -435,6 +442,7 @@ class TurnLoop:
         self._lesson.adopt(plan)
         logger.info("lesson.planned scenes=%d", len(plan.scenes))
         self._publish()
+        self._lesson_changed.set()
 
     def _publish(self) -> None:
         scenes, current = self._lesson.statuses()
@@ -551,9 +559,10 @@ class TurnLoop:
 
     async def aclose(self) -> None:
         self._closing = True
-        if self._planner is not None:
-            self._planner.cancel()
-            await asyncio.gather(self._planner, return_exceptions=True)
+        lesson = [task for task in (self._planner, self._builder) if task is not None]
+        for task in lesson:
+            task.cancel()
+        await asyncio.gather(*lesson, return_exceptions=True)
         tasks = [*self._turns, *(speculation.task for speculation in self._speculations.values())]
         for task in tasks:
             if not task.cancelling():
@@ -961,17 +970,76 @@ class TurnLoop:
                 await _put_all(queue, tags.feed(chunk.text))
         await _put_all(queue, tags.finish())
 
-    async def _check(self, turn_id: str, push: ScenePush) -> SceneReady:
+    async def _build_loop(self) -> None:
+        while True:
+            while self._planner is not None and not self._planner.done():
+                await asyncio.wait({self._planner})
+            scene = self._lesson.next_to_build()
+            if scene is None:
+                self._lesson_changed.clear()
+                await self._lesson_changed.wait()
+                continue
+            await self._build(scene)
+
+    async def _build(self, scene: Scene) -> None:
+        self._lesson.committed.add(scene.id)
+        self._publish()
+        logger.info("scene.build scene_id=%s attempt=1", scene.id)
+        if not await self._attempt(scene):
+            self._lesson.failed.add(scene.id)
+            logger.info("scene.failed scene_id=%s attempt=1", scene.id)
+        self._publish()
+
+    async def _attempt(self, scene: Scene) -> bool:
+        plan = self._lesson.plan
+        prompt = planned_scene_prompt(self._cfg.subject, plan.profile, scene, self._theme)
+        draft = await run_scene_build(
+            self._reasoning,
+            prompt,
+            self._cfg.scene_max_tokens,
+            self._cfg.scene_effort,
+            model=self._cfg.scene_model or None,
+        )
+        if isinstance(draft, str) or len(draft.steps) != len(scene.steps):
+            return False
+        if await asyncio.to_thread(draft_paths, draft):
+            return False
+        await self._wait_for_the_slot(scene)
+        push = ScenePush(scene_id=scene.id, title=scene.title, html=draft.html, steps=draft.steps)
+        ready = await self._check(scene.id, push)
+        if not ready.ok:
+            return False
+        self._lesson.built[scene.id] = BuiltScene(
+            scene_id=scene.id, version=1, say=list(draft.steps), html=draft.html
+        )
+        logger.info("scene.built scene_id=%s steps=%d", scene.id, len(draft.steps))
+        return True
+
+    async def _wait_for_the_slot(self, scene: Scene) -> None:
+        logged = False
+        while True:
+            ids = [each.id for each in self._lesson.plan.scenes]
+            position = ids.index(scene.id) + 1
+            before = ids[position - 2] if position > 1 else None
+            if before not in self._lesson.built or self._lesson.acked.scene >= position - 1:
+                return
+            if not logged:
+                logger.info("scene.held scene_id=%s behind=%s", scene.id, before)
+                logged = True
+            self._lesson_changed.clear()
+            await self._lesson_changed.wait()
+
+    async def _check(self, scene_id: str, push: ScenePush) -> SceneReady:
         waiting: asyncio.Future[SceneReady] = asyncio.get_running_loop().create_future()
-        self._ready[turn_id] = waiting
+        self._ready[scene_id] = waiting
         try:
             await self._visuals.push(push)
             async with asyncio.timeout(self._cfg.scene_ready_timeout_s):
                 return await waiting
         except TimeoutError:
-            return SceneReady(scene_id=turn_id, ok=False, steps=0, error=NO_REPORT)
+            return SceneReady(scene_id=scene_id, ok=False, steps=0, error=NO_REPORT)
         finally:
-            self._ready.pop(turn_id, None)
+            self._ready.pop(scene_id, None)
 
     async def _answer(self, turn_id: str, call: TurnChunk) -> str:
         if call.tool_name in VISUAL_TOOL_NAMES:

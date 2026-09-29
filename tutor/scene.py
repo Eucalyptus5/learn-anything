@@ -1,10 +1,13 @@
 import json
 import logging
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from tutor.lesson import Scene
+from tutor.planner import named_paths
 from tutor.prompt import TurnPrompt
 from tutor.reasoning import ReasoningClient
 from tutor.visuals import StepLine
@@ -85,6 +88,49 @@ def scene_prompt(subject: str, title: str, show: str, theme: str, error: str = "
     if error:
         user_text += RETRY.format(error=error)
     return TurnPrompt(system=f"{CONTRACT.format(theme=theme)}\n\n{GUIDE}", user_text=user_text)
+
+
+def planned_scene_prompt(
+    subject: str, profile: str, scene: Scene, theme: str, error: str = ""
+) -> TurnPrompt:
+    lines = [
+        f"Subject: {subject}",
+        f"Learner: {profile}",
+        f"Title: {scene.title}",
+        f"Show: {scene.show}",
+        f"Steps, in this order, exactly {len(scene.steps)}, one say line each:",
+        *(f"{n}. {step.show}" for n, step in enumerate(scene.steps, start=1)),
+    ]
+    user_text = "\n".join(lines)
+    if error:
+        user_text += RETRY.format(error=error)
+    return TurnPrompt(system=f"{CONTRACT.format(theme=theme)}\n\n{GUIDE}", user_text=user_text)
+
+
+class _Visible(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.texts: list[str] = []
+        self._hidden = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in ("script", "style"):
+            self._hidden += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("script", "style") and self._hidden:
+            self._hidden -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._hidden:
+            self.texts.append(data)
+
+
+def draft_paths(draft: SceneDraft) -> int:
+    visible = _Visible()
+    visible.feed(draft.html)
+    visible.close()
+    return named_paths([*draft.steps, *visible.texts])
 
 
 async def run_scene_build(

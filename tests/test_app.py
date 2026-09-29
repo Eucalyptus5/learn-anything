@@ -13,9 +13,13 @@ import pytest
 from tests.fakes import FakeSynthesizer, FakeTransport
 from tests.test_input_path import CANONICAL, FakeVad, scripted_frames
 from tests.test_session import (
+    LESSON,
     SPOKEN_DELTAS,
     STARTING_FROM,
     FakeReasoning,
+    ScriptedSource,
+    draft_call,
+    planned_call,
     spoken_chunks,
 )
 from tutor import app
@@ -350,3 +354,31 @@ async def test_build_loop_plans_by_default_with_the_planner_settings(tmp_path: P
         loop._cfg.planner_max_tokens,
         loop._cfg.planner_timeout_s,
     ) == ("plan-1", "medium", 9000, 90.0)
+
+
+async def test_build_loop_hands_the_scene_model_to_the_builder_only(tmp_path: Path) -> None:
+    cfg = settings_for(tmp_path, SCENE_MODEL="draw-1")
+    log: list[tuple[str, object]] = []
+    reasoning = FakeReasoning(
+        log,
+        spoken_chunks(SPOKEN_DELTAS),
+        asyncio.Event(),
+        plans=[planned_call(LESSON)],
+        visual=[draft_call(3)],
+        visual_finish="tool_calls",
+    )
+    request = SessionRequest(subject="PPO", starting_from=STARTING_FROM)
+    stop = asyncio.Event()
+    loop = build_loop(
+        cfg, fake_models(), reasoning, ScriptedSource([stop]), FakeTransport(), request
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(reasoning.visual_started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    stop.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert set(reasoning.build_models) == {"draw-1"}
+    assert reasoning.models == [None]

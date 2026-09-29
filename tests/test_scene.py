@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 from tests.test_session import FakeReasoning, visual_call
+from tutor.lesson import Scene, Step
 from tutor.reasoning import TurnChunk
 from tutor.scene import (
     CONTRACT,
@@ -14,6 +15,8 @@ from tutor.scene import (
     SCENE_TOOL,
     SCENE_TOOLS,
     SceneDraft,
+    draft_paths,
+    planned_scene_prompt,
     run_scene_build,
     scene_prompt,
 )
@@ -138,11 +141,11 @@ async def test_a_tool_call_becomes_a_draft_and_is_logged_without_its_text(caplog
         )
 
     assert result == SceneDraft.model_validate(DRAFT)
-    assert reasoning.tools == [SCENE_TOOLS]
-    assert reasoning.tool_choices == ["required"]
-    assert reasoning.max_tokens == [32000]
-    assert reasoning.efforts == ["high"]
-    assert reasoning.models == ["draw-1"]
+    assert reasoning.build_tools == [SCENE_TOOLS]
+    assert reasoning.build_tool_choices == ["required"]
+    assert reasoning.build_max_tokens == [32000]
+    assert reasoning.build_efforts == ["high"]
+    assert reasoning.build_models == ["draw-1"]
     (line,) = [m for m in caplog.messages if m.startswith("scene.call")]
     assert re.fullmatch(r"scene\.call ms=\d+ finish=\S+ chars=23 steps=3", line)
     assert "<p>" not in " ".join(caplog.messages)
@@ -260,3 +263,54 @@ async def test_bad_arguments_are_error_strings_that_carry_no_text(caplog) -> Non
         )
     assert result == "scene: error: arguments are not valid JSON"
     assert "scene.tool_arguments chars=20000" in caplog.messages
+
+
+PLANNED = Scene(
+    id="clip",
+    title="The clip",
+    show="The clipped surrogate against the ratio, epsilon 0.2",
+    steps=[
+        Step(show="The ratio axis from 0.5 to 2.0"),
+        Step(show="The clip band at 0.8 and 1.2", ask="Where does the band sit?"),
+        Step(show="The flat regions outside the band"),
+    ],
+)
+
+
+def test_the_planned_prompt_carries_the_profile_and_the_numbered_step_lines() -> None:
+    prompt = planned_scene_prompt("PPO", "Knows policy gradients.", PLANNED, "dark")
+    assert prompt.system == f"{CONTRACT.format(theme='dark')}\n\n{GUIDE}"
+    assert prompt.history == [] and prompt.tool_context == [] and prompt.tool_exchange == []
+    assert prompt.user_text == (
+        "Subject: PPO\nLearner: Knows policy gradients.\nTitle: The clip\n"
+        "Show: The clipped surrogate against the ratio, epsilon 0.2\n"
+        "Steps, in this order, exactly 3, one say line each:\n"
+        "1. The ratio axis from 0.5 to 2.0\n2. The clip band at 0.8 and 1.2\n"
+        "3. The flat regions outside the band"
+    )
+    assert "Where does the band sit?" not in prompt.user_text
+    retry = planned_scene_prompt("PPO", "p", PLANNED, "light", "timeline lacks labels step-3")
+    assert retry.user_text.endswith(
+        "\n\nThe previous attempt failed its check: timeline lacks labels step-3\n"
+        "Write the whole scene again."
+    )
+
+
+def test_a_draft_names_a_path_only_in_its_say_lines_or_its_visible_text() -> None:
+    clean = SceneDraft(
+        html=(
+            '<!doctype html><script src="/vendor/gsap.min.js"></script>'
+            '<script>const note = "src/pool.py";</script><style>.band { fill: red; }</style>'
+            "<p>the clip band at 0.8 and 1.2</p>"
+        ),
+        steps=["say 1", "say 2", "say 3"],
+    )
+    assert draft_paths(clean) == 0
+    assert (
+        draft_paths(clean.model_copy(update={"steps": ["say 1", "see src/pool.py:12", "say 3"]}))
+        == 1
+    )
+    assert (
+        draft_paths(clean.model_copy(update={"html": clean.html + "<p>tutor/transport.py</p>"}))
+        == 1
+    )

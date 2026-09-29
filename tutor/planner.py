@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 from pydantic import ValidationError
 
@@ -82,12 +82,16 @@ def _parameters() -> dict[str, object]:
     return schema
 
 
+def named_paths(texts: Iterable[str]) -> int:
+    return sum(1 for text in texts for position in extract_positions(text) if position.path)
+
+
 def _named_paths(plan: LessonPlan) -> int:
     texts = [plan.profile]
     for scene in plan.scenes:
         texts += [scene.title, scene.show]
         texts += [text for step in scene.steps for text in (step.show, step.ask)]
-    return sum(1 for text in texts for position in extract_positions(text) if position.path)
+    return named_paths(texts)
 
 
 PLAN_TOOLS: list[dict[str, object]] = [

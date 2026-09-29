@@ -1,10 +1,11 @@
 import asyncio
+import contextlib
 import json
 import logging
 import re
 import typing
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from pathlib import Path
 
 import av
@@ -39,6 +40,7 @@ from tutor.lesson import (
 from tutor.planner import PLAN_TOOL
 from tutor.prompt import SEARCH_CODE_TOOL, Message, TurnPrompt
 from tutor.reasoning import TurnChunk
+from tutor.scene import SCENE_TOOL, planned_scene_prompt
 from tutor.session import (
     BAD_ARGUMENTS,
     LESSON_SYNC_TIMEOUT_S,
@@ -589,7 +591,7 @@ class FakeReasoning:
         self._close_gate = close_gate
         self._turns = deque(turns) if turns is not None else deque()
         self._follow_up_gate = follow_up_gate
-        self._visual = visual if visual is not None else []
+        self._visual = visual
         self._visual_finish = visual_finish
         self._visual_gates = deque(visual_gates) if visual_gates is not None else deque()
         self._plans = deque(plans) if plans is not None else deque()
@@ -605,7 +607,13 @@ class FakeReasoning:
         self.streams: list[FakeStream] = []
         self.started = asyncio.Event()
         self.visual_started = asyncio.Event()
-        self.visual_callers: list[asyncio.Task[object] | None] = []
+        self.build_prompts: list[TurnPrompt] = []
+        self.build_tools: list[list[dict]] = []
+        self.build_tool_choices: list[str | None] = []
+        self.build_max_tokens: list[int | None] = []
+        self.build_models: list[str | None] = []
+        self.build_efforts: list[str | None] = []
+        self.build_streams: list[FakeStream] = []
         self.plan_prompts: list[TurnPrompt] = []
         self.plan_tools: list[list[dict]] = []
         self.plan_tool_choices: list[str | None] = []
@@ -641,6 +649,25 @@ class FakeReasoning:
             stream.finish_reason = self._plan_finish or ("tool_calls" if chunks else "stop")
             self.plan_streams.append(stream)
             return stream
+        if tools and tools[0]["function"]["name"] == SCENE_TOOL:
+            self.build_prompts.append(prompt)
+            self.build_tools.append(list(tools))
+            self.build_tool_choices.append(tool_choice)
+            self.build_max_tokens.append(max_tokens)
+            self.build_models.append(model)
+            self.build_efforts.append(effort)
+            self._log.append(("build", prompt.user_text))
+            if self._visual is None:
+                stream = FakeStream(
+                    [TurnChunk(kind="spoken", text="")], self._log, self._received, asyncio.Event()
+                )
+            else:
+                gate = self._visual_gates.popleft() if self._visual_gates else None
+                stream = FakeStream(self._visual, self._log, self._received, gate)
+                stream.finish_reason = self._visual_finish
+            self.build_streams.append(stream)
+            self.visual_started.set()
+            return stream
         self.prompts.append(prompt)
         self.tools.append(list(tools) if tools is not None else None)
         self.max_tokens.append(max_tokens)
@@ -650,15 +677,6 @@ class FakeReasoning:
         self._log.append(("start_turn", prompt.user_text))
         if prompt.user_text == self._fails:
             raise RateLimited(RATE_LIMIT_DETAIL)
-        if tool_choice is not None:
-            gate = self._visual_gates.popleft() if self._visual_gates else None
-            stream = FakeStream(self._visual, self._log, self._received, gate)
-            stream.finish_reason = self._visual_finish
-            self.streams.append(stream)
-            self.visual_callers.append(asyncio.current_task())
-            self.started.set()
-            self.visual_started.set()
-            return stream
         answering = bool(prompt.tool_exchange)
         if answering:
             chunks = self._follow_up
@@ -4022,11 +4040,16 @@ RESTORE = {
 
 class FakePage(LoggingTransport):
     def __init__(
-        self, log: list[tuple[str, object]], fires: bool = False, syncs: bool = True
+        self,
+        log: list[tuple[str, object]],
+        fires: bool = False,
+        syncs: bool = True,
+        ready: dict[str, str] | None = None,
     ) -> None:
         super().__init__(log)
         self.fires = fires
         self.syncs = syncs
+        self.ready = ready
         self.held: dict[int, dict[str, object]] = {}
         self.scene_id: str | None = None
         self.step = 0
@@ -4055,6 +4078,11 @@ class FakePage(LoggingTransport):
             self.arrival("lesson.state").clear()
             await self.arrival("lesson.state").wait()
 
+    async def seen(self, kind: str, count: int) -> None:
+        while len(sent(self._log, kind)) < count:
+            self.arrival(kind).clear()
+            await self.arrival(kind).wait()
+
     def _receive(self, payload: dict[str, object]) -> None:
         kind = str(payload["type"])
         if kind == "lesson.cue":
@@ -4065,6 +4093,19 @@ class FakePage(LoggingTransport):
             self.syncs_seen.append(payload)
             if self.syncs:
                 asyncio.get_running_loop().call_soon(self.answer_sync)
+        elif kind == "scene.push" and self.ready is not None:
+            scene_id = str(payload["scene_id"])
+            if scene_id in self.ready:
+                error = self.ready[scene_id]
+                steps = len(typing.cast(list[str], payload["steps"]))
+                report = {
+                    "type": "scene.ready",
+                    "scene_id": scene_id,
+                    "ok": error == "",
+                    "steps": steps if error == "" else 0,
+                    "error": error,
+                }
+                asyncio.get_running_loop().call_soon(self.reply, report)
         self.arrival(kind).set()
 
     def fire(self, cue_id: int) -> None:
@@ -5736,3 +5777,440 @@ async def test_after_two_failed_connect_calls_the_first_answer_recovers(
     assert loop._lesson.plan == LESSON
     assert len(reasoning.plan_prompts) == 3
     assert "Protected:" not in reasoning.plan_prompts[2].user_text
+
+
+class LineSeen(logging.Handler):
+    def __init__(self, line: str) -> None:
+        super().__init__()
+        self._line = line
+        self.seen = asyncio.Event()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.getMessage().startswith(self._line):
+            self.seen.set()
+
+
+@contextlib.contextmanager
+def line_seen(line: str) -> Iterator[asyncio.Event]:
+    handler = LineSeen(line)
+    session = logging.getLogger("tutor.session")
+    level = session.level
+    session.setLevel(logging.INFO)
+    session.addHandler(handler)
+    try:
+        yield handler.seen
+    finally:
+        session.removeHandler(handler)
+        session.setLevel(level)
+
+
+def said_call(lines: list[str]) -> TurnChunk:
+    body = {"html": "<!doctype html><p>scene</p>", "steps": lines}
+    return TurnChunk(
+        kind="tool_call", text=json.dumps(body), tool_call_id="call-scene", tool_name=SCENE_TOOL
+    )
+
+
+def draft_call(steps: int) -> TurnChunk:
+    return said_call([f"say {n}" for n in range(1, steps + 1)])
+
+
+def pushed(log: list[tuple[str, object]]) -> list[str]:
+    return [str(payload["scene_id"]) for payload in sent(log, "scene.push")]
+
+
+def builds(reasoning: FakeReasoning, title: str) -> list[TurnPrompt]:
+    return [
+        prompt for prompt in reasoning.build_prompts if f"\nTitle: {title}\n" in prompt.user_text
+    ]
+
+
+def builder_task() -> asyncio.Task[None]:
+    (task,) = [task for task in asyncio.all_tasks() if task.get_name() == "lesson-builder"]
+    return task
+
+
+def status_is(scene_id: str, status: str) -> Callable[[dict[str, object]], bool]:
+    def match(payload: dict[str, object]) -> bool:
+        rows = typing.cast(list[dict[str, str]], payload["scenes"])
+        return any(row["id"] == scene_id and row["status"] == status for row in rows)
+
+    return match
+
+
+READY = {"ratio": "", "clip": "", "epochs": ""}
+
+
+def queue_reasoning(
+    log: list[tuple[str, object]],
+    speaker: FakeSpeaker,
+    opening: list[str],
+    plans: list[LessonPlan] | None = None,
+    visual: list[TurnChunk] | None = None,
+    plan_gates: list[asyncio.Event] | None = None,
+    visual_gates: list[asyncio.Event] | None = None,
+) -> FakeReasoning:
+    return FakeReasoning(
+        log,
+        spoken_chunks(SPOKEN_DELTAS),
+        speaker.received,
+        turns=[spoken_chunks(opening)],
+        plans=[planned_call(plan) for plan in (plans or [LESSON])],
+        plan_gates=plan_gates,
+        visual=visual if visual is not None else [draft_call(3)],
+        visual_finish="tool_calls",
+        visual_gates=visual_gates,
+    )
+
+
+async def test_one_scene_builds_ahead_of_the_page() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log, ready=READY)
+    reasoning = queue_reasoning(log, speaker, OPENING_SCENES)
+    stop = asyncio.Event()
+    loop = concept_loop(
+        log, ScriptedSource([stop]), speaker, reasoning, cfg=lesson_cfg(), transport=page
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(page.seen("lesson.cue", 2), HANG_GUARD_S)
+    await asyncio.wait_for(page.seen("scene.push", 1), HANG_GUARD_S)
+    assert pushed(log) == ["ratio"]
+    log.append(("fired", "ratio"))
+    page.fire(1)
+    await asyncio.wait_for(page.seen("scene.push", 2), HANG_GUARD_S)
+    log.append(("fired", "clip"))
+    page.fire(2)
+    await asyncio.wait_for(page.seen("scene.push", 3), HANG_GUARD_S)
+
+    second, third = sent(log, "scene.push")[1:]
+    assert pushed(log) == ["ratio", "clip", "epochs"]
+    assert log.index(("fired", "ratio")) < log.index(("send_json", second))
+    assert log.index(("fired", "clip")) < log.index(("send_json", third))
+    assert sent(log, "scene.show") == []
+    assert loop._lesson.committed == {"ratio", "clip", "epochs"}
+    stop.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+
+async def test_scene_two_is_checked_only_after_scene_one_opens() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log, ready=READY)
+    reasoning = queue_reasoning(
+        log, speaker, ["<scene 1>Start with the ratio. ", "It compares two policies."]
+    )
+    stop = asyncio.Event()
+    loop = concept_loop(
+        log, ScriptedSource([stop]), speaker, reasoning, cfg=lesson_cfg(), transport=page
+    )
+
+    with line_seen("scene.held scene_id=clip") as held:
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(held.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(page.seen("lesson.cue", 1), HANG_GUARD_S)
+    assert pushed(log) == ["ratio"] and "ratio" in loop._lesson.built
+    log.append(("fired", "ratio"))
+    page.fire(1)
+    await asyncio.wait_for(page.seen("scene.push", 2), HANG_GUARD_S)
+
+    assert log.index(("fired", "ratio")) < log.index(("send_json", sent(log, "scene.push")[1]))
+    stop.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+
+async def test_no_build_starts_while_a_planner_call_is_in_flight() -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold, hold_at=2)
+    page = FakePage(log, fires=True, ready=READY)
+    rerun = asyncio.Event()
+    reasoning = queue_reasoning(
+        log,
+        speaker,
+        OPENING_SCENES,
+        plans=[LESSON, LESSON],
+        plan_gates=[opened(), rerun],
+    )
+    stop = asyncio.Event()
+    loop = concept_loop(
+        log, ScriptedSource([stop]), speaker, reasoning, cfg=lesson_cfg(), transport=page
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(page.state_where(status_is("clip", "built")), HANG_GUARD_S)
+    reasoning.planning.clear()
+    hold.set()
+    await asyncio.wait_for(page.state_where(lambda p: p["current"] == "clip"), HANG_GUARD_S)
+    boundary = planner_task()
+    await asyncio.wait_for(reasoning.planning.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.plan_streams[1].held.wait(), HANG_GUARD_S)
+    assert builds(reasoning, "Several epochs") == []
+    log.append(("released", None))
+    rerun.set()
+    await asyncio.wait_for(asyncio.wait([boundary]), HANG_GUARD_S)
+    await asyncio.wait_for(page.seen("scene.push", 3), HANG_GUARD_S)
+
+    epochs = next(
+        n
+        for n, (name, text) in enumerate(log)
+        if name == "build" and "\nTitle: Several epochs\n" in str(text)
+    )
+    assert log.index(("released", None)) < epochs
+    assert pushed(log) == ["ratio", "clip", "epochs"]
+    stop.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+
+async def test_the_queue_follows_an_accepted_rerun() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log, fires=True, ready={**READY, "trust": ""})
+    trusted = with_fourth_scene(LESSON).model_dump()
+    del trusted["scenes"][2]
+    reasoning = queue_reasoning(
+        log,
+        speaker,
+        OPENING_SCENES,
+        plans=[LESSON, LessonPlan.model_validate(trusted)],
+    )
+    stop = asyncio.Event()
+    loop = concept_loop(
+        log, ScriptedSource([stop]), speaker, reasoning, cfg=lesson_cfg(), transport=page
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(page.seen("scene.push", 3), HANG_GUARD_S)
+    stop.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert pushed(log) == ["ratio", "clip", "trust"]
+    assert builds(reasoning, "Several epochs") == []
+
+
+async def test_a_barge_in_cancels_neither_the_build_nor_the_planner(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold, hold_at=1)
+    page = FakePage(log, fires=True, ready=READY)
+    clip_gate = asyncio.Event()
+    rerun = asyncio.Event()
+    reasoning = queue_reasoning(
+        log,
+        speaker,
+        ["<scene 1>Start with the ratio. ", "<scene 2>Now the clip. ", "It bounds the ratio."],
+        plans=[LESSON, LESSON],
+        plan_gates=[opened(), rerun],
+        visual_gates=[opened(), clip_gate],
+    )
+    barge = asyncio.Event()
+    stop = asyncio.Event()
+    source = ScriptedSource([barge, SpeechStarted(), stop])
+    loop = concept_loop(log, source, speaker, reasoning, cfg=lesson_cfg(), transport=page)
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(page.state_where(status_is("clip", "building")), HANG_GUARD_S)
+        builder = builder_task()
+        reasoning.planning.clear()
+        hold.set()
+        await asyncio.wait_for(page.state_where(lambda p: p["current"] == "clip"), HANG_GUARD_S)
+        planner = planner_task()
+        await asyncio.wait_for(reasoning.planning.wait(), HANG_GUARD_S)
+        await asyncio.wait_for(reasoning.plan_streams[1].held.wait(), HANG_GUARD_S)
+        await pull_past(source, barge)
+        assert not builder.cancelling() and not planner.cancelling()
+        clip_gate.set()
+        rerun.set()
+        await asyncio.wait_for(page.state_where(status_is("clip", "built")), HANG_GUARD_S)
+        await asyncio.wait_for(asyncio.wait([planner]), HANG_GUARD_S)
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert not planner.cancelled()
+    messages = session_messages(caplog)
+    assert "scene.built scene_id=clip steps=3" in messages
+    assert "planner.accepted stage=boundary scenes=3" in messages
+
+
+async def test_eof_and_aclose_end_the_builder_and_the_planner() -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold, hold_at=1)
+    page = FakePage(log, fires=True, ready=READY)
+    clip_gate = asyncio.Event()
+    rerun = asyncio.Event()
+    reasoning = queue_reasoning(
+        log,
+        speaker,
+        ["<scene 1>Start with the ratio. ", "<scene 2>Now the clip. ", "It bounds the ratio."],
+        plans=[LESSON, LESSON],
+        plan_gates=[opened(), rerun],
+        visual_gates=[opened(), clip_gate],
+    )
+    stop = asyncio.Event()
+    loop = concept_loop(
+        log, ScriptedSource([stop]), speaker, reasoning, cfg=lesson_cfg(), transport=page
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(page.state_where(status_is("clip", "building")), HANG_GUARD_S)
+    builder = builder_task()
+    hold.set()
+    await asyncio.wait_for(page.state_where(lambda p: p["current"] == "clip"), HANG_GUARD_S)
+    planner = planner_task()
+    stop.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert builder.cancelled() and planner.cancelled()
+    assert not [
+        task for task in asyncio.all_tasks() if task.get_name().startswith(("lesson-", "turn-"))
+    ]
+
+
+async def test_a_ready_report_never_interrupts_the_turn() -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold, hold_at=1)
+    page = FakePage(log, ready=READY)
+    reasoning = queue_reasoning(log, speaker, SPOKEN_DELTAS)
+    stop = asyncio.Event()
+    loop = concept_loop(
+        log, ScriptedSource([stop]), speaker, reasoning, cfg=lesson_cfg(), transport=page
+    )
+
+    with line_seen("scene.built scene_id=ratio") as built:
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(speaker.held.wait(), HANG_GUARD_S)
+        await asyncio.wait_for(built.wait(), HANG_GUARD_S)
+    hold.set()
+    await asyncio.wait_for(speaker.finished.wait(), HANG_GUARD_S)
+    stop.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert ("flush_playout", None) not in log
+    assert [prompt.user_text for prompt in reasoning.prompts] == [OPENING_TEXT]
+    assert speaker.utterances == [SPOKEN_CLAUSES]
+
+
+async def test_a_theme_message_reaches_the_planned_scene_prompt() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log)
+    reasoning = FakeReasoning(
+        log, spoken_chunks(SPOKEN_DELTAS), speaker.received, plans=[planned_call(LESSON)]
+    )
+    stop = asyncio.Event()
+    loop = concept_loop(
+        log, ScriptedSource([stop]), speaker, reasoning, cfg=lesson_cfg(), transport=page
+    )
+    page.reply({"type": "theme", "theme": "dark"})
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(reasoning.visual_started.wait(), HANG_GUARD_S)
+    stop.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert "The page is dark." in reasoning.build_prompts[0].system
+
+
+async def test_the_builder_uses_the_scene_model_and_the_voice_does_not() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log, ready=READY)
+    reasoning = queue_reasoning(log, speaker, SPOKEN_DELTAS)
+    cfg = lesson_cfg().model_copy(update={"scene_model": "draw-1", "scene_effort": "medium"})
+    stop = asyncio.Event()
+    loop = concept_loop(log, ScriptedSource([stop]), speaker, reasoning, cfg=cfg, transport=page)
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(page.state_where(status_is("ratio", "built")), HANG_GUARD_S)
+    await asyncio.wait_for(speaker.finished.wait(), HANG_GUARD_S)
+    stop.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert reasoning.build_models and set(reasoning.build_models) == {"draw-1"}
+    assert set(reasoning.build_efforts) == {"medium"}
+    assert reasoning.models == [None] and reasoning.efforts == [None]
+
+
+async def test_a_planned_scene_is_built_from_the_plan_alone(tmp_path: Path) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log, ready=READY)
+    reasoning = FakeReasoning(
+        log,
+        [SEARCH_CALL],
+        speaker.received,
+        follow_up=spoken_chunks(["<scene 1>Both call sites ", "drain it."]),
+        plans=[planned_call(LESSON)],
+        visual=[draft_call(3)],
+        visual_finish="tool_calls",
+    )
+    stop = asyncio.Event()
+    loop = TurnLoop(
+        config(tmp_path).model_copy(update={"planned": True}),
+        ScriptedSource([stop]),
+        FakeSearch(log, found()),
+        speaker,
+        page,
+        reasoning,
+        FakeRegistry(log),
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(speaker.finished.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(page.state_where(status_is("ratio", "built")), HANG_GUARD_S)
+    stop.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert ("search_done", MODEL_QUERY) in log
+    assert reasoning.build_prompts
+    scenes = {scene.title: scene for scene in LESSON.scenes}
+    for prompt in reasoning.build_prompts:
+        assert prompt.tool_context == [] and prompt.tool_exchange == []
+        title = prompt.user_text.splitlines()[2].removeprefix("Title: ")
+        expected = planned_scene_prompt(SUBJECT, LESSON.profile, scenes[title], "light")
+        assert prompt.user_text == expected.user_text
+
+
+async def test_statuses_follow_the_queue() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log, fires=True, ready=READY)
+    reasoning = queue_reasoning(
+        log, speaker, ["<scene 1>Start with the ratio. ", "It compares two policies."]
+    )
+    stop = asyncio.Event()
+    loop = concept_loop(
+        log, ScriptedSource([stop]), speaker, reasoning, cfg=lesson_cfg(), transport=page
+    )
+    running = asyncio.create_task(loop.run())
+
+    await asyncio.wait_for(page.state_where(status_is("clip", "built")), HANG_GUARD_S)
+    stop.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    def history(scene_id: str) -> list[str]:
+        statuses = [
+            next(row["status"] for row in payload["scenes"] if row["id"] == scene_id)
+            for payload in sent(log, "lesson.state")
+        ]
+        return [s for n, s in enumerate(statuses) if n == 0 or s != statuses[n - 1]]
+
+    assert history("ratio") == ["planned", "building", "built"]
+    assert history("clip") == ["planned", "building", "built"]
