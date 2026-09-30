@@ -405,6 +405,10 @@ def test_the_lesson_prompt_example_tags_a_new_scene_from_step_one_and_asks_with_
     held = re.search(r"<step (\d+)>", after)
     assert held is not None
     assert int(held.group(1)) == int(re.findall(r"<step (\d+)>", before)[-1]) + 1
+    replies = re.findall(r'"([^"]*)"', example)
+    assert replies
+    for reply in replies:
+        assert len(re.split(r"(?<=[.?!]) ", reply)) < 4, reply
 
 
 def test_the_lesson_prompt_has_the_grounding_speech_interruption_and_tools_paragraphs() -> None:

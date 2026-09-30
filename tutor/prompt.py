@@ -50,8 +50,8 @@ The opening reply: "<scene 1> <step 1> Here are fifteen numbers in order, and we
 thirty-seven. <step 2> The middle one is twenty, below thirty-seven, so the left half is out.
 With forty-one in the middle of what is left, which side goes next?" The learner: "The right
 side." The reply: "Yes. <step 3> Thirty-seven is below forty-one, so the right side goes and
-three numbers remain. <scene 2> <step 1> Every look halves what is left. <step 2> So fifteen
-numbers need four looks at most."
+three numbers remain. <scene 2> <step 1> Every look halves what is left, so fifteen numbers
+need four looks at most."
 
 Tools. With a folder attached you have lexical search over it and a highlight for the lines you
 are about to discuss; search before you assert, and cap what you pull. Without a folder there
