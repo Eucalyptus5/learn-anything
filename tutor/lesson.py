@@ -17,6 +17,7 @@ from tutor.visuals import (
 logger = logging.getLogger(__name__)
 
 OPENING_TEXT = "(the lesson begins)"
+REPEAT = "repeat"
 
 
 class Step(BaseModel):
@@ -187,7 +188,9 @@ class LessonState:
             reason = "no_plan"
         elif scene is None:
             reason = "not_open"
-        elif n <= at.step:
+        elif n == at.step:
+            return REPEAT
+        elif n < at.step:
             reason = "not_rising"
         elif n > len(scene.steps):
             reason = "past_end"

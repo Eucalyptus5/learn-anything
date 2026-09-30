@@ -5069,6 +5069,29 @@ async def test_the_next_prompt_names_the_tags_the_last_reply_dropped() -> None:
     assert [named in prompt.system for prompt in reasoning.prompts] == [False, True, False]
 
 
+async def test_a_step_tag_naming_the_step_a_scene_opens_on_sends_no_cue_and_drops_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    first = spoken_chunks(["<scene 1>The ratio compares two policies. ", "<step 1>Three actions."])
+    turns = [first, spoken_chunks(SPOKEN_DELTAS)]
+    reasoning = FakeReasoning(log, [], speaker.received, turns=turns)
+    loop = concept_loop(log, SerialSource([CONCEPT_TEXT, "go on"]), speaker, reasoning)
+    loop._lesson.adopt(LESSON)
+
+    with caplog.at_level(logging.INFO, logger="tutor.lesson"):
+        await asyncio.wait_for(loop.run(), HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    (cue,) = sent(log, "lesson.cue")
+    assert cue["tag"] == {"kind": "scene", "n": 1, "scene_id": "ratio"}
+    assert [entry.cue_id for entry in loop._lesson.sent] == [cue["cue_id"]]
+    assert not [message for message in caplog.messages if message.startswith("step.dropped ")]
+    assert len(reasoning.prompts) == 2
+    assert not any("Tags dropped from your last reply" in p.system for p in reasoning.prompts)
+
+
 def planned_call(plan: LessonPlan) -> list[TurnChunk]:
     return [
         TurnChunk(

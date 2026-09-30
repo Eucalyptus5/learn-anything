@@ -41,7 +41,7 @@ from tutor.config import Settings, settings
 from tutor.constants import TTS_SAMPLE_RATE, WEBRTC_FRAME_SAMPLES, WEBRTC_SAMPLE_RATE
 from tutor.cost import TurnUsage, UsageLedger, turn_cost_usd
 from tutor.input_path import EndOfTurn, InputEvent
-from tutor.lesson import OPENING_TEXT, Cursor, LessonPlan, LessonState
+from tutor.lesson import OPENING_TEXT, REPEAT, Cursor, LessonPlan, LessonState
 from tutor.planner import PLAN_TOOL
 from tutor.prompt import Message, TurnPrompt
 from tutor.reasoning import ReasoningClient, TurnChunk, TurnStream
@@ -915,10 +915,11 @@ def classify_tags(
             tags.append(kind)
             dropped[f"{kind}:{marker}"] += 1
         else:
-            tags.append(f"{marker.kind} {marker.n}")
             check = probe.step_tag if marker.kind == "step" else probe.scene_tag
             reason = check(marker.n)
-            if reason is not None:
+            if reason != REPEAT:
+                tags.append(f"{marker.kind} {marker.n}")
+            if reason not in (None, REPEAT):
                 valid = False
                 dropped[f"{marker.kind}:{reason}"] += 1
         start = reply.index(f"<{item.text}>", at)

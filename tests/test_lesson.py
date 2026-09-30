@@ -5,6 +5,7 @@ import pytest
 from tutor.lesson import (
     NO_PLAN,
     OPENING_TEXT,
+    REPEAT,
     BuiltScene,
     Cursor,
     LessonPlan,
@@ -264,19 +265,42 @@ def test_scene_one_opens_by_its_tag_and_the_cursor_moves_only_on_the_ack() -> No
 def test_a_step_tag_must_rise_past_what_was_acked_or_sent_and_stay_in_range(caplog) -> None:
     state = opened()
     with caplog.at_level(logging.INFO, logger="tutor.lesson"):
-        assert state.step_tag(1) == "not_rising"
+        assert state.step_tag(1) == REPEAT
         assert state.step_tag(4) == "past_end"
         assert state.step_tag(3) is None
         assert state.step_tag(2) == "not_rising"
-        assert state.step_tag(3) == "not_rising"
+        assert state.step_tag(3) == REPEAT
     assert state.acked == Cursor(scene=1, step=1)
-    assert state.dropped == [
-        "<step 1>: not_rising",
-        "<step 4>: past_end",
-        "<step 2>: not_rising",
-        "<step 3>: not_rising",
-    ]
+    assert state.dropped == ["<step 4>: past_end", "<step 2>: not_rising"]
     assert "step.dropped scene_id=scene-1 n=4 reason=past_end" in caplog.messages
+
+
+def test_a_step_tag_naming_the_current_step_sends_and_drops_nothing(caplog) -> None:
+    state = opened()
+    with caplog.at_level(logging.INFO, logger="tutor.lesson"):
+        assert state.step_tag(1) == REPEAT
+        assert state.sent == [] and state.dropped == []
+        assert state.scene_tag(2) is None
+        assert state.step_tag(1) == REPEAT
+        assert state.step_tag(3) is None
+        assert state.step_tag(3) == REPEAT
+        assert [cue.tag for cue in state.sent] == [SceneCue(n=2, scene_id="scene-2"), StepCue(n=3)]
+        assert state.step_tag(2) == "not_rising"
+    assert state.position() == Cursor(scene=2, step=3)
+    assert state.dropped == ["<step 2>: not_rising"]
+    assert [message for message in caplog.messages if message.startswith("step.")] == [
+        "step.dropped scene_id=scene-2 n=2 reason=not_rising"
+    ]
+
+
+def test_a_step_tag_at_the_cursor_step_with_no_plan_or_no_open_scene_is_still_dropped() -> None:
+    empty = LessonState()
+    empty.acked = Cursor(scene=1, step=1)
+    assert empty.step_tag(1) == "no_plan"
+    beyond = three_scenes()
+    beyond.acked = Cursor(scene=4, step=1)
+    assert beyond.step_tag(1) == "not_open"
+    assert empty.dropped == ["<step 1>: no_plan"] and beyond.dropped == ["<step 1>: not_open"]
 
 
 def test_a_scene_tag_names_the_next_scene_only(caplog) -> None:
@@ -287,7 +311,7 @@ def test_a_scene_tag_names_the_next_scene_only(caplog) -> None:
         assert state.scene_tag(2) is None
         assert state.sent[-1].tag == SceneCue(n=2, scene_id="scene-2")
         assert state.sent[-1].scene_id == "scene-1"
-        assert state.step_tag(1) == "not_rising"
+        assert state.step_tag(1) == REPEAT
         assert state.scene_tag(3) is None
         assert state.scene_tag(4) == "past_end"
     assert "scene.dropped n=4 reason=past_end" in caplog.messages

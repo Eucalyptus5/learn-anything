@@ -681,6 +681,26 @@ def test_classify_tags_reads_validity_drops_placement_and_leaks() -> None:
     assert STATE.sent == []
 
 
+def test_a_step_tag_naming_the_current_step_is_neither_listed_nor_dropped() -> None:
+    reply = "<scene 1> <step 1>Three bars. <step 2>Then one moves."
+    read = bench_turn.classify_tags(reply, [], STATE, sentence_rule=True)
+    assert (read.tags, read.valid, read.dropped) == (["scene 1", "step 2"], True, {})
+    assert read.placement_errors == 0
+    held = bench_turn.classify_tags(
+        "<step 2>Then one moves <step 2>and settles.", [], state_at(1, 1), sentence_rule=True
+    )
+    assert (held.tags, held.valid, held.dropped) == (["step 2"], True, {})
+    assert held.placement_errors == 1
+    below = bench_turn.classify_tags(
+        "<step 3>It settles. <step 2>Again.", [], state_at(1, 1), sentence_rule=True
+    )
+    assert (below.tags, below.valid, below.dropped) == (
+        ["step 3", "step 2"],
+        False,
+        {"step:not_rising": 1},
+    )
+
+
 def test_a_tag_after_a_comma_is_misplaced_only_under_the_sentence_rule() -> None:
     reply = "<scene 1>The ratio, <step 2>compared at one action."
     spoken = ["The ratio,", "compared at one action."]
