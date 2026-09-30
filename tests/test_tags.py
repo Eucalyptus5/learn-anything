@@ -1,5 +1,7 @@
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
+
+import pytest
 
 from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.tags import (
@@ -283,3 +285,46 @@ def test_a_sentence_may_end_inside_a_closing_quote_or_bracket() -> None:
         RawTag("step 2"),
         " Next.",
     ]
+
+
+LEAKING_TAIL = (
+    "<step 3>An arrow carries those rollouts into the trainable pi theta box, stamped K equals 4 "
+    "passes, meaning we plan to squeeze four gradient updates from this one batch. After pass 1, "
+    "why is pass 2 already slightly dishonest?</step 3></scene 3>"
+)
+
+
+async def through_the_live_path(deltas: Sequence[str]) -> list[str | RawTag]:
+    splitter = TagSplitter()
+
+    async def items() -> AsyncIterator[str | RawTag]:
+        for delta in deltas:
+            for item in splitter.feed(delta):
+                yield item
+        for item in splitter.finish():
+            yield item
+
+    return [item async for item in clause_chunks(spoken_text(items(), Scrubber()))]
+
+
+@pytest.mark.parametrize("deltas", [[LEAKING_TAIL], list(LEAKING_TAIL)], ids=["whole", "by-char"])
+async def test_closing_tags_after_the_last_question_are_never_spoken(
+    deltas: list[str], caplog
+) -> None:
+    with caplog.at_level(logging.INFO, logger="tutor.tags"):
+        out = await through_the_live_path(deltas)
+    said = " ".join(item for item in out if isinstance(item, str))
+    assert out[-1] == "After pass 1, why is pass 2 already slightly dishonest?"
+    assert said.endswith("dishonest?")
+    assert "<" not in said and ">" not in said
+    assert "step 3" not in said and "scene 3" not in said
+    assert [item for item in out if isinstance(item, RawTag)] == [RawTag("step 3")]
+    assert caplog.messages == ["tag.closing name=step", "tag.closing name=scene"]
+
+
+@pytest.mark.parametrize("args", ["", " 3"])
+@pytest.mark.parametrize("name", TAG_NAMES)
+def test_a_closing_tag_of_every_kind_is_dropped_whole_or_split(name: str, args: str) -> None:
+    for spelled in (name, name.upper(), name.capitalize()):
+        reply = f"Is it so?</{spelled}{args}> It holds</{spelled}{args}>then falls."
+        assert fed(reply) == fed(*reply) == ["Is it so? It holds then falls."], reply

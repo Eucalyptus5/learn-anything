@@ -6,7 +6,7 @@ logger = logging.getLogger(__name__)
 
 TAG_NAMES = ("step", "scene", "set", "point", "look", "orbit", "hand", "take", "draw", "clear")
 TAG_MAX_CHARS = 240
-_OPENS = re.compile(r"<(?:" + "|".join(TAG_NAMES) + r")(?![a-z])", re.IGNORECASE)
+_STARTS = re.compile(r"</?(?:" + "|".join(TAG_NAMES) + r")(?![a-z])", re.IGNORECASE)
 _MARKER = re.compile(r"(step|scene) ([1-9][0-9]?)")
 _CLOSERS = "\"')]"
 _SENTENCE_END = re.compile(r"[.?!][\"')\]]*(?=\s)")
@@ -21,8 +21,8 @@ class Marker(NamedTuple):
     n: int
 
 
-def _could_open(text: str) -> bool:
-    return any(name.startswith(text[1:].lower()) for name in TAG_NAMES)
+def _could_start(text: str) -> bool:
+    return any(name.startswith(text[1:].lower().removeprefix("/")) for name in TAG_NAMES)
 
 
 def _close(text: str, quoted: bool, escaped: bool) -> tuple[int | None, bool, bool]:
@@ -71,7 +71,7 @@ class TagSplitter:
             if at:
                 self._text(out, text[:at])
                 text = text[at:]
-            if _OPENS.match(text):
+            if _STARTS.match(text):
                 end, quoted, escaped = _close(text, False, False)
                 if end is None and len(text) <= TAG_MAX_CHARS:
                     self._held = text
@@ -81,10 +81,13 @@ class TagSplitter:
                     break
                 if end > TAG_MAX_CHARS:
                     logger.info("tag.unterminated chars=%d", end)
+                elif text[1] == "/":
+                    logger.info("tag.closing name=%s", tag_name(RawTag(text[2 : end - 1])))
+                    self._gap = True
                 else:
                     self._tag(out, RawTag(text[1 : end - 1]))
                 text = text[end:]
-            elif _could_open(text):
+            elif _could_start(text):
                 self._held = text
                 break
             else:

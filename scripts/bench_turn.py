@@ -926,7 +926,10 @@ def classify_tags(
         if text and text[-1] not in ends:
             misplaced += 1
         at = start + len(item.text) + 2
-    leaked = sum(1 for text in spoken for name in TAG_NAMES if f"<{name}" in text.lower())
+    said = [text.lower() for text in spoken]
+    leaked = sum(
+        1 for text in said for name in TAG_NAMES if f"<{name}" in text or f"</{name}" in text
+    )
     return TagRead(tags, valid, dict(dropped), misplaced, leaked)
 
 

@@ -701,6 +701,16 @@ def test_any_tag_text_in_the_spoken_stream_is_a_leak() -> None:
     assert read.leaked == 3
 
 
+def test_closing_tag_text_in_the_spoken_stream_is_a_leak() -> None:
+    read = bench_turn.classify_tags(
+        "<step 3>Why is it dishonest?</step 3></scene 3>",
+        ["Why is it dishonest?</step 3></scene 3>", "</Draw>"],
+        STATE,
+        sentence_rule=False,
+    )
+    assert (read.tags, read.leaked) == (["step 3"], 3)
+
+
 def test_a_malformed_tag_is_counted_under_its_name_alone() -> None:
     read = bench_turn.classify_tags(
         "<Step 2>Hi. <step2>There.", ["Hi.", "There."], STATE, sentence_rule=False
