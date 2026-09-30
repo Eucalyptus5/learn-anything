@@ -147,6 +147,8 @@ class LessonState:
         self.planned_through: str | None = None
         self._cue_id = 0
         self._stale: set[int] = set()
+        self._turn_start = Cursor()
+        self._learner_spoke = False
 
     def adopt(self, plan: LessonPlan) -> None:
         self.plan = plan
@@ -181,9 +183,16 @@ class LessonState:
     def next_scene(self) -> Scene | None:
         return self.scene_at(max(self.position().scene, 1) + 1)
 
+    def begin_turn(self, learner_spoke: bool) -> None:
+        self._turn_start = self.position()
+        self._learner_spoke = learner_spoke
+
     def step_tag(self, n: int) -> str | None:
         at = self.position()
         scene = self.scene_at(at.scene)
+        # Learner text can answer only the step right after where its turn began; any later
+        # ask in the same reply was put after the learner last spoke.
+        answered = at.step + 1 if self._learner_spoke and at == self._turn_start else at.step
         if self.plan is None:
             reason = "no_plan"
         elif scene is None:
@@ -194,6 +203,8 @@ class LessonState:
             reason = "not_rising"
         elif n > len(scene.steps):
             reason = "past_end"
+        elif any(step.ask for step in scene.steps[answered:n]):
+            reason = "not_answered"
         else:
             self._accept(StepCue(n=n), scene.id, Cursor(scene=at.scene, step=n))
             return None

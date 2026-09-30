@@ -894,10 +894,11 @@ class TagRead(NamedTuple):
 
 
 def classify_tags(
-    reply: str, spoken: list[str], state: LessonState, sentence_rule: bool
+    reply: str, spoken: list[str], state: LessonState, learner_spoke: bool, sentence_rule: bool
 ) -> TagRead:
     ends = ".?!" if sentence_rule else ".?!;:,"
     probe = copy.deepcopy(state)
+    probe.begin_turn(learner_spoke)
     splitter = TagSplitter()
     items = [*splitter.feed(reply), *splitter.finish()]
     tags: list[str] = []
@@ -987,7 +988,7 @@ class ScenarioResult(BaseModel):
 def evaluate_scenario(
     reply: str, spoken: list[str], state: LessonState, scenario: Scenario, sentence_rule: bool
 ) -> ScenarioResult:
-    read = classify_tags(reply, spoken, state, sentence_rule)
+    read = classify_tags(reply, spoken, state, scenario.learner is not None, sentence_rule)
     scenes = [tag for tag in read.tags if tag.startswith("scene ")]
     if scenario.requires_scene is not None:
         scene_ok = f"scene {scenario.requires_scene}" in scenes

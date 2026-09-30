@@ -741,6 +741,7 @@ class TurnLoop:
                 # resolve, or set_result() raises inside the speculation.
                 prompt, queue = await asyncio.shield(grounded)
             self._lesson.dropped.clear()
+            self._lesson.begin_turn(user_text != OPENING_TEXT)
             await self._speaker.speak(
                 self._utterance(turn_id, prompt, queue, barrier), self._caption(turn_id, barrier)
             )
