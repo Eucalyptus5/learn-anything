@@ -185,6 +185,7 @@ class Sample(BaseModel):
     leaked: int | None = None
     opening: bool | None = None
     scenario_pass: bool | None = None
+    seen_pass: bool | None = None
 
 
 class Enqueued(NamedTuple):
@@ -891,6 +892,8 @@ class TagRead(NamedTuple):
     dropped: dict[str, int]
     placement_errors: int
     leaked: int
+    cues: list[str]
+    cue_placement_errors: int
 
 
 def classify_tags(
@@ -902,15 +905,19 @@ def classify_tags(
     splitter = TagSplitter()
     items = [*splitter.feed(reply), *splitter.finish()]
     tags: list[str] = []
+    cues: list[str] = []
     dropped: Counter[str] = Counter()
     valid = True
     misplaced = 0
+    cue_misplaced = 0
     at = 0
+    since_cue = ""
     for item in items:
         if isinstance(item, str):
             continue
         marker = parse_marker(item)
         kind = tag_name(item)
+        cue = None
         if isinstance(marker, str):
             valid = False
             tags.append(kind)
@@ -918,6 +925,8 @@ def classify_tags(
         else:
             check = probe.step_tag if marker.kind == "step" else probe.scene_tag
             reason = check(marker.n)
+            if reason is None:
+                cue = f"{marker.kind} {marker.n}"
             if reason != REPEAT:
                 tags.append(f"{marker.kind} {marker.n}")
             if reason not in (None, REPEAT):
@@ -927,12 +936,26 @@ def classify_tags(
         text = reply[at:start].rstrip()
         if text and text[-1] not in ends:
             misplaced += 1
+        # A tag that became no cue is gone from what the page receives, so a cue is placed by
+        # the speech since the previous cue, not by whatever tag was written just before it.
+        since_cue += reply[at:start]
+        if cue is not None:
+            cues.append(cue)
+            heard = since_cue.rstrip()
+            if heard and heard[-1] not in ends:
+                cue_misplaced += 1
+            since_cue = ""
         at = start + len(item.text) + 2
     said = [text.lower() for text in spoken]
     leaked = sum(
         1 for text in said for name in TAG_NAMES if f"<{name}" in text or f"</{name}" in text
     )
-    return TagRead(tags, valid, dict(dropped), misplaced, leaked)
+    return TagRead(tags, valid, dict(dropped), misplaced, leaked, cues, cue_misplaced)
+
+
+def qualified(passed: int, leaked: int, groups: dict[str, int]) -> bool:
+    covered = all(groups.get(group, 0) == SAMPLES // len(GROUPS) for group in GROUPS)
+    return passed >= FLOOR and leaked == 0 and covered
 
 
 def scenario_verdict(passed: int, leaked: int, n: int, groups: dict[str, int]) -> str:
@@ -941,8 +964,15 @@ def scenario_verdict(passed: int, leaked: int, n: int, groups: dict[str, int]) -
     line = (
         f"verdict: scenarios passed {passed}/{n} against the floor of {FLOOR}, leaked {leaked}/{n}"
     )
-    covered = all(groups.get(group, 0) == SAMPLES // len(GROUPS) for group in GROUPS)
-    return line + ("" if passed >= FLOOR and leaked == 0 and covered else ", FAIL")
+    return line + ("" if qualified(passed, leaked, groups) else ", FAIL")
+
+
+def seen_verdict(passed: int, leaked: int, n: int, groups: dict[str, int]) -> str:
+    line = f"verdict as seen: scenarios passed {passed}/{n} on the cues the page receives"
+    if n < SAMPLES:
+        return f"{line}, not a qualification run"
+    line += f", against the floor of {FLOOR}, leaked {leaked}/{n}"
+    return line + ("" if qualified(passed, leaked, groups) else ", FAIL")
 
 
 class SetupTurn(BaseModel):
@@ -983,23 +1013,28 @@ class ScenarioResult(BaseModel):
     leaked: int
     opening: bool
     passed: bool
+    seen_tags: list[str]
+    seen_passed: bool
+
+
+def tag_checks(tags: list[str], scenario: Scenario) -> tuple[bool, bool, bool]:
+    scenes = [tag for tag in tags if tag.startswith("scene ")]
+    if scenario.requires_scene is not None:
+        scene_ok = f"scene {scenario.requires_scene}" in scenes
+    else:
+        scene_ok = not (scenario.forbids_scene and scenes)
+    return tags in scenario.sequences, scene_ok, not set(tags) & set(scenario.reveal_forbidden)
 
 
 def evaluate_scenario(
     reply: str, spoken: list[str], state: LessonState, scenario: Scenario, sentence_rule: bool
 ) -> ScenarioResult:
     read = classify_tags(reply, spoken, state, scenario.learner is not None, sentence_rule)
-    scenes = [tag for tag in read.tags if tag.startswith("scene ")]
-    if scenario.requires_scene is not None:
-        scene_ok = f"scene {scenario.requires_scene}" in scenes
-    else:
-        scene_ok = not (scenario.forbids_scene and scenes)
     said = " ".join(spoken).strip()
     asked = None
     if scenario.question:
         asked = said.endswith("?") and all(term.lower() in said.lower() for term in scenario.terms)
-    progress_ok = read.tags in scenario.sequences
-    reveal_ok = not set(read.tags) & set(scenario.reveal_forbidden)
+    progress_ok, scene_ok, reveal_ok = tag_checks(read.tags, scenario)
     passed = (
         read.valid
         and progress_ok
@@ -1007,6 +1042,12 @@ def evaluate_scenario(
         and reveal_ok
         and asked is not False
         and read.placement_errors == 0
+        and read.leaked == 0
+    )
+    seen_passed = (
+        all(tag_checks(read.cues, scenario))
+        and asked is not False
+        and read.cue_placement_errors == 0
         and read.leaked == 0
     )
     return ScenarioResult(
@@ -1021,6 +1062,8 @@ def evaluate_scenario(
         leaked=read.leaked,
         opening=scenario.learner is None,
         passed=passed,
+        seen_tags=read.cues,
+        seen_passed=seen_passed,
     )
 
 
@@ -1293,6 +1336,7 @@ def report_scenarios(samples: list[Sample], sentence_rule: bool) -> None:
         print(f"{group} passed {passed}/{groups[group]}")
     leaked = sum(1 for s in samples if s.leaked)
     passed = sum(1 for s in samples if s.scenario_pass)
+    print(seen_verdict(sum(1 for s in samples if s.seen_pass), leaked, n, dict(groups)))
     print(scenario_verdict(passed, leaked, n, dict(groups)))
 
 
@@ -1537,13 +1581,14 @@ async def run_fixture(
         finally:
             await bench.aclose()
         result = evaluate_scenario(heard.reply, heard.spoken, state, case, sentence_rule)
-        fields = result.model_dump(exclude={"reveal_ok", "passed"})
+        fields = result.model_dump(exclude={"reveal_ok", "passed", "seen_tags", "seen_passed"})
         sample = heard.sample.model_copy(
             update={
                 **fields,
                 "scenario_id": case.id,
                 "group": case.group,
                 "scenario_pass": result.passed,
+                "seen_pass": result.seen_passed,
             }
         )
         runs.append((sample, bench.reasoning, bench.transport.simulated))

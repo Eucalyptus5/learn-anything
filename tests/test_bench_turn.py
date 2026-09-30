@@ -680,6 +680,8 @@ def test_classify_tags_reads_validity_drops_placement_and_leaks() -> None:
         dropped={"set:unsupported": 1},
         placement_errors=1,
         leaked=0,
+        cues=["scene 1", "step 2", "step 3"],
+        cue_placement_errors=1,
     )
     assert WATCHED_STATE.sent == []
 
@@ -694,6 +696,7 @@ def test_a_step_tag_naming_the_current_step_is_neither_listed_nor_dropped() -> N
     )
     assert (held.tags, held.valid, held.dropped) == (["step 2"], True, {})
     assert held.placement_errors == 1
+    assert (held.cues, held.cue_placement_errors) == (["step 2"], 0)
     below = bench_turn.classify_tags(
         "<step 3>It settles. <step 2>Again.", [], state_at(1, 1), True, sentence_rule=True
     )
@@ -702,6 +705,7 @@ def test_a_step_tag_naming_the_current_step_is_neither_listed_nor_dropped() -> N
         False,
         {"step:not_rising": 1},
     )
+    assert below.cues == ["step 3"]
 
 
 def test_a_tag_after_a_comma_is_misplaced_only_under_the_sentence_rule() -> None:
@@ -727,6 +731,40 @@ def test_placement_is_read_where_the_reply_wrote_each_tag() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("reply", "cues", "strict", "seen"),
+    [
+        pytest.param(
+            "<step 2>The band sits at 0.8 and 1.2. Below it<step 1> the ratio is clipped.",
+            ["step 2"],
+            1,
+            0,
+            id="refused-mid-sentence",
+        ),
+        pytest.param(
+            "<step 2>The band sits<step 3> at 0.8 and 1.2.",
+            ["step 2", "step 3"],
+            1,
+            1,
+            id="cue-mid-sentence",
+        ),
+        pytest.param(
+            "<step 2>The band sits<step 1><step 3> at 0.8 and 1.2.",
+            ["step 2", "step 3"],
+            1,
+            1,
+            id="cue-behind-a-refused-tag-mid-sentence",
+        ),
+    ],
+)
+def test_placement_as_seen_is_read_where_each_cue_lands_in_the_speech(
+    reply: str, cues: list[str], strict: int, seen: int
+) -> None:
+    read = bench_turn.classify_tags(reply, [], state_at(2, 1), True, sentence_rule=True)
+    assert read.cues == cues
+    assert (read.placement_errors, read.cue_placement_errors) == (strict, seen)
+
+
 def test_any_tag_text_in_the_spoken_stream_is_a_leak() -> None:
     read = bench_turn.classify_tags(
         "<scene 1>Hi.", ["<scene 1>Hi.", "<set lr", "<STEP 2>"], STATE, False, sentence_rule=False
@@ -750,6 +788,7 @@ def test_a_malformed_tag_is_counted_under_its_name_alone() -> None:
         "<Step 2>Hi. <step2>There.", ["Hi.", "There."], STATE, False, sentence_rule=False
     )
     assert read.tags == ["step", "step"] and read.dropped == {"step:malformed": 2}
+    assert read.cues == []
 
 
 def test_the_asking_step_is_refused_without_learner_text_and_taken_with_it() -> None:
@@ -896,6 +935,98 @@ def test_a_scenario_passes_only_when_every_applicable_check_holds(
         field, value = failing
         assert getattr(result, field) == value
     assert result.opening is (case.group == "opening")
+    assert state.sent == []
+
+
+@pytest.mark.parametrize(
+    ("case", "at", "reply", "spoken", "failing", "seen_tags", "seen_passed"),
+    [
+        pytest.param(
+            scenario("opening", Cursor(), [["scene 1"]]),
+            (0, 0),
+            "<scene 1>Start with the ratio. <step 2>They agree at one.",
+            ["Start with the ratio.", "They agree at one."],
+            ("tags", ["scene 1", "step 2"]),
+            ["scene 1"],
+            True,
+            id="asking-step-with-no-learner-text",
+        ),
+        pytest.param(
+            scenario("progress", Cursor(scene=2, step=1), [["step 2"]]),
+            (2, 1),
+            "<step 2>The band sits at 0.8 and 1.2. <step 1>Back on the axis.",
+            ["The band sits at 0.8 and 1.2.", "Back on the axis."],
+            ("dropped", {"step:not_rising": 1}),
+            ["step 2"],
+            True,
+            id="not-rising",
+        ),
+        pytest.param(
+            scenario("progress", Cursor(scene=2, step=1), [["step 2"]]),
+            (2, 1),
+            "<step 1>The axis. <Step 2>The band. <step 2>It sits at 0.8 and 1.2.",
+            ["The axis.", "The band.", "It sits at 0.8 and 1.2."],
+            ("tags", ["step", "step 2"]),
+            ["step 2"],
+            True,
+            id="malformed-and-repeat",
+        ),
+        pytest.param(
+            scenario("progress", Cursor(scene=2, step=1), [["step 2"]]),
+            (2, 1),
+            "<step 2>The band sits at 0.8 and 1.2. Below it<step 1> the ratio is clipped.",
+            ["The band sits at 0.8 and 1.2.", "Below it the ratio is clipped."],
+            ("placement_errors", 1),
+            ["step 2"],
+            True,
+            id="refused-mid-sentence",
+        ),
+        pytest.param(
+            scenario("progress", Cursor(scene=2, step=1), [["step 2", "step 3"]]),
+            (2, 1),
+            "<step 2>The band sits<step 3> at 0.8 and 1.2.",
+            ["The band sits", "at 0.8 and 1.2."],
+            ("placement_errors", 1),
+            ["step 2", "step 3"],
+            False,
+            id="cue-mid-sentence",
+        ),
+        pytest.param(
+            scenario("progress", Cursor(scene=2, step=1), [["step 2"]]),
+            (2, 1),
+            "<step 2>The band sits at 0.8 and 1.2.",
+            ["<step 2>The band sits at 0.8 and 1.2."],
+            ("leaked", 1),
+            ["step 2"],
+            False,
+            id="leak",
+        ),
+        pytest.param(
+            scenario("answer", Cursor(scene=1, step=1), [["step 2"]], learner=None),
+            (1, 1),
+            "<step 2>They agree at one.",
+            ["They agree at one."],
+            ("dropped", {"step:not_answered": 1}),
+            [],
+            False,
+            id="required-tag-refused",
+        ),
+    ],
+)
+def test_the_as_seen_pass_reads_only_the_tags_that_became_cues(
+    case: "bench_turn.Scenario",
+    at: tuple[int, int],
+    reply: str,
+    spoken: list[str],
+    failing: tuple[str, object],
+    seen_tags: list[str],
+    seen_passed: bool,
+) -> None:
+    state = state_at(*at)
+    result = bench_turn.evaluate_scenario(reply, spoken, state, case, sentence_rule=True)
+    field, value = failing
+    assert result.passed is False and getattr(result, field) == value
+    assert (result.seen_tags, result.seen_passed) == (seen_tags, seen_passed)
     assert state.sent == []
 
 
@@ -1111,29 +1242,33 @@ def test_a_stub_scene_has_the_count_the_planned_prompt_asks_for() -> None:
         assert len(body["steps"]) == count and body["html"]
 
 
+REPORTED = bench_turn.Sample(
+    first_sound_ms=900,
+    substance_ms=900,
+    first_content_delta_ms=600,
+    stages=0,
+    silent=False,
+    audio_ms=4000,
+    voice_usd=0.0001,
+    utterance=0,
+    scenario_id="question-0",
+    group="question",
+    tags=[],
+    tags_valid=True,
+    placement_errors=0,
+    dropped={},
+    progress_ok=True,
+    asked=True,
+    scene_ok=True,
+    leaked=0,
+    opening=False,
+    scenario_pass=True,
+    seen_pass=True,
+)
+
+
 def test_the_scenario_report_counts_each_check_over_its_own_cases(capsys) -> None:
-    kept = bench_turn.Sample(
-        first_sound_ms=900,
-        substance_ms=900,
-        first_content_delta_ms=600,
-        stages=0,
-        silent=False,
-        audio_ms=4000,
-        voice_usd=0.0001,
-        utterance=0,
-        scenario_id="question-0",
-        group="question",
-        tags=[],
-        tags_valid=True,
-        placement_errors=0,
-        dropped={},
-        progress_ok=True,
-        asked=True,
-        scene_ok=True,
-        leaked=0,
-        opening=False,
-        scenario_pass=True,
-    )
+    kept = REPORTED
     missed = kept.model_copy(
         update={
             "scenario_id": "boundary-0",
@@ -1145,6 +1280,7 @@ def test_the_scenario_report_counts_each_check_over_its_own_cases(capsys) -> Non
             "scene_ok": False,
             "leaked": 1,
             "scenario_pass": False,
+            "seen_pass": False,
         }
     )
 
@@ -1156,7 +1292,115 @@ def test_the_scenario_report_counts_each_check_over_its_own_cases(capsys) -> Non
     assert "scene tags as required 0/1" in lines
     assert "tags dropped: step:not_rising=1" in lines
     assert "boundary passed 0/1" in lines
-    assert lines[-1] == "verdict: scenarios passed 1/2, not a qualification run"
+    assert lines[-2:] == [
+        (
+            "verdict as seen: scenarios passed 1/2 on the cues the page receives, "
+            "not a qualification run"
+        ),
+        "verdict: scenarios passed 1/2, not a qualification run",
+    ]
+
+
+SEEN = "verdict as seen: scenarios passed {}/{} on the cues the page receives"
+
+
+@pytest.mark.parametrize(
+    ("n", "strict", "seen", "leaks", "spread", "verdicts"),
+    [
+        pytest.param(
+            30,
+            27,
+            29,
+            0,
+            6,
+            [
+                SEEN.format(29, 30) + ", against the floor of 27, leaked 0/30",
+                "verdict: scenarios passed 27/30 against the floor of 27, leaked 0/30",
+            ],
+            id="both-pass",
+        ),
+        pytest.param(
+            30,
+            24,
+            26,
+            0,
+            6,
+            [
+                SEEN.format(26, 30) + ", against the floor of 27, leaked 0/30, FAIL",
+                "verdict: scenarios passed 24/30 against the floor of 27, leaked 0/30, FAIL",
+            ],
+            id="both-under-the-floor",
+        ),
+        pytest.param(
+            30,
+            24,
+            28,
+            0,
+            6,
+            [
+                SEEN.format(28, 30) + ", against the floor of 27, leaked 0/30",
+                "verdict: scenarios passed 24/30 against the floor of 27, leaked 0/30, FAIL",
+            ],
+            id="only-strict-under-the-floor",
+        ),
+        pytest.param(
+            30,
+            28,
+            28,
+            1,
+            6,
+            [
+                SEEN.format(28, 30) + ", against the floor of 27, leaked 1/30, FAIL",
+                "verdict: scenarios passed 28/30 against the floor of 27, leaked 1/30, FAIL",
+            ],
+            id="a-leak",
+        ),
+        pytest.param(
+            30,
+            30,
+            30,
+            0,
+            5,
+            [
+                SEEN.format(30, 30) + ", against the floor of 27, leaked 0/30, FAIL",
+                "verdict: scenarios passed 30/30 against the floor of 27, leaked 0/30, FAIL",
+            ],
+            id="a-group-not-covered",
+        ),
+        pytest.param(
+            12,
+            9,
+            11,
+            0,
+            6,
+            [
+                SEEN.format(11, 12) + ", not a qualification run",
+                "verdict: scenarios passed 9/12, not a qualification run",
+            ],
+            id="short-run",
+        ),
+    ],
+)
+def test_the_as_seen_verdict_comes_just_before_the_strict_verdict(
+    capsys, n: int, strict: int, seen: int, leaks: int, spread: int, verdicts: list[str]
+) -> None:
+    samples = [
+        REPORTED.model_copy(
+            update={
+                "group": bench_turn.GROUPS[i % spread],
+                "scenario_pass": i < strict,
+                "seen_pass": i < seen,
+                "leaked": int(i >= n - leaks),
+            }
+        )
+        for i in range(n)
+    ]
+
+    bench_turn.report_scenarios(samples, sentence_rule=True)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 9 + len(bench_turn.GROUPS)
+    assert lines[-2:] == verdicts
 
 
 def test_a_stub_scene_says_the_planned_prompts_show_lines() -> None:
