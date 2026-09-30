@@ -1,5 +1,6 @@
 import inspect
 import json
+import re
 
 from tutor.prompt import (
     LESSON_PROMPT,
@@ -379,13 +380,31 @@ def test_the_lesson_prompt_names_only_the_step_and_scene_tags_and_stays_ascii() 
         "<step n> at the start of the sentence where step n of the current scene should appear"
         in flat
     )
-    assert "A new scene opens at its first step, so its step tags start at 2." in flat
+    assert (
+        "Every step you narrate gets its tag, from <step 1>, in every scene, a new one "
+        "included; a scene tag and that scene's <step 1> open the same picture."
+    ) in flat
+    assert "start at 2" not in flat and "never written" not in flat
     assert (
         "A step that asks has its tag held back: put its question with no tag, and write its "
         "<step n> only after the learner has answered, at the start of the sentence that "
         "explains what appears."
     ) in flat
     assert "Never name a phase, a mode, the plan, a scene number or a step number aloud." in flat
+
+
+def test_the_lesson_prompt_example_tags_a_new_scene_from_step_one_and_asks_with_no_tag() -> None:
+    examples = [p for p in LESSON_PROMPT.split("\n\n") if p.startswith("Example.")]
+    assert len(examples) == 1
+    example = " ".join(examples[0].split())
+    assert re.findall(r"<(step|scene) (\d+)>", example)[:2] == [("scene", "1"), ("step", "1")]
+    assert re.search(r"<scene [2-9]> <step 1> ", example)
+    questions = re.findall(r"[^.?!]*\?", example)
+    assert questions and all("<" not in question for question in questions)
+    before, after = example.split(questions[0], 1)
+    held = re.search(r"<step (\d+)>", after)
+    assert held is not None
+    assert int(held.group(1)) == int(re.findall(r"<step (\d+)>", before)[-1]) + 1
 
 
 def test_the_lesson_prompt_has_the_grounding_speech_interruption_and_tools_paragraphs() -> None:

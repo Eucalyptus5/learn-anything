@@ -6,6 +6,7 @@ from tutor.lesson import (
     NO_PLAN,
     OPENING_TEXT,
     REPEAT,
+    TAG_RULES,
     BuiltScene,
     Cursor,
     LessonPlan,
@@ -548,7 +549,7 @@ def test_the_block_directs_the_opening_and_a_learner_who_spoke_first() -> None:
     opening = lesson_block(state, learner_spoke=False, dropped=[])
     assert "There is no learner text" in opening and "Open scene one" in opening
     assert "write <scene 1> at the start of the sentence where it opens" in opening
-    assert "<scene 1> opens step 1, so <step 1> is never written" in opening
+    assert "<scene 1> and its <step 1> open the same picture" in opening
     assert "The page has not opened a scene yet." in opening
     assert "1. Scene 1 (now)" in opening
     spoke = lesson_block(state, learner_spoke=True, dropped=[])
@@ -570,12 +571,13 @@ def test_the_block_asks_before_an_asking_step_and_closes_a_scene_and_the_lesson(
     assert "Its tag is held back until the learner has answered." in text
     assert "write <step 3> at the start of the sentence that explains what appears" in text
     assert "open the next scene in the same breath: write <scene 2>" in text
-    assert "step tags in a new scene start at 2" in text
+    assert "writing the tag of every step you narrate; <scene 2> and its <step 1> open" in text
     assert "asked to be told" in text and "without questions" in text
     assert state.step_tag(3) is None
     state.acknowledge(ack(3, step=3, revision=3))
     done = lesson_block(state, learner_spoke=True, dropped=[])
-    assert "This scene is done" in done and "write <scene 2>" in done and "start at 2" in done
+    assert "This scene is done" in done and "write <scene 2>" in done
+    assert "by the same rules; <scene 2> and its <step 1> open the same picture." in done
     assert state.scene_tag(2) is None
     state.acknowledge(ack(4, scene_id="scene-2", step=1, revision=4))
     assert state.scene_tag(3) is None
@@ -585,6 +587,36 @@ def test_the_block_asks_before_an_asking_step_and_closes_a_scene_and_the_lesson(
     last = lesson_block(state, learner_spoke=True, dropped=[])
     assert "last scene" in last and "close the lesson" in last and "<scene" not in last
     assert "3. Scene 3 (now)" in last and "Next scene" not in last
+
+
+def test_the_opening_ask_boundary_and_plain_directives_carry_the_same_tag_rules() -> None:
+    assert "Tag every step you narrate, from <step 1>" in TAG_RULES
+    assert "in every scene, one just opened included" in TAG_RULES
+    assert "put its question with no tag" in TAG_RULES
+    assert "until the learner has answered" in TAG_RULES
+    fresh = three_scenes()
+    blocks = {
+        "There is no learner text": lesson_block(fresh, learner_spoke=False, dropped=[]),
+        "spoke before the lesson was ready": lesson_block(fresh, learner_spoke=True, dropped=[]),
+    }
+    fresh.opened = True
+    blocks["Scene one is not open yet"] = lesson_block(fresh, learner_spoke=True, dropped=[])
+    state = opened()
+    state.opened = True
+    blocks["The next step, 2, does not ask"] = lesson_block(state, learner_spoke=True, dropped=[])
+    assert state.step_tag(2) is None
+    blocks["If the scene ends first"] = lesson_block(state, learner_spoke=True, dropped=[])
+    assert state.step_tag(3) is None
+    blocks["This scene is done"] = lesson_block(state, learner_spoke=True, dropped=[])
+    assert state.scene_tag(2) is None and state.scene_tag(3) is None and state.step_tag(2) is None
+    blocks["or until the scene ends."] = lesson_block(state, learner_spoke=True, dropped=[])
+    for lead, text in blocks.items():
+        assert lead in text, lead
+        assert text.endswith(TAG_RULES) and text.count(TAG_RULES) == 1, lead
+        assert "start at 2" not in text and "never written" not in text, lead
+    assert state.step_tag(3) is None
+    last = lesson_block(state, learner_spoke=True, dropped=[])
+    assert "close the lesson" in last and TAG_RULES not in last and TAG_RULES not in NO_PLAN
 
 
 def test_the_ask_directive_in_the_last_scene_opens_no_scene() -> None:

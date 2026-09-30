@@ -324,13 +324,18 @@ class LessonState:
         return rows, None if shown is None else shown.id
 
 
+TAG_RULES = (
+    "Tag every step you narrate, from <step 1>: write its <step n> at the start of the sentence "
+    "where it appears, in every scene, one just opened included. For a step that asks, put its "
+    "question with no tag and hold its <step n> until the learner has answered."
+)
 NO_PLAN = (
     "There is no lesson plan yet. Teach from the subject and the starting-from line in words, "
     "one idea at a time, and write no tags."
 )
 OPEN_SCENE_ONE = (
-    "write <scene 1> at the start of the sentence where it opens; <scene 1> opens step 1, so "
-    "<step 1> is never written. Say what its first step shows, then go on through the steps "
+    "write <scene 1> at the start of the sentence where it opens; <scene 1> and its <step 1> "
+    "open the same picture. Say what its first step shows, then go on through the steps "
     "that do not ask, writing <step n> at the start of the sentence where step n should appear, "
     "until the next step that asks; put that question and stop."
 )
@@ -360,7 +365,7 @@ def _directive(state: LessonState, scene: Scene, learner_spoke: bool) -> str:
             )
         else:
             lead = "This is the opening of the lesson. There is no learner text. Open scene one: "
-        return lead + OPEN_SCENE_ONE
+        return f"{lead}{OPEN_SCENE_ONE} {TAG_RULES}"
     if at.step >= len(scene.steps):
         if state.next_scene() is None:
             return (
@@ -370,8 +375,8 @@ def _directive(state: LessonState, scene: Scene, learner_spoke: bool) -> str:
         return (
             f"This scene is done. Open the next scene in the same breath: write "
             f"<scene {at.scene + 1}> at the start of the sentence where it opens, say what its "
-            "first step shows, then go on through its steps by the same rules; step tags in a "
-            "new scene start at 2."
+            "first step shows, then go on through its steps by the same rules; "
+            f"<scene {at.scene + 1}> and its <step 1> open the same picture. {TAG_RULES}"
         )
     n = at.step + 1
     following = scene.steps[at.step]
@@ -383,7 +388,8 @@ def _directive(state: LessonState, scene: Scene, learner_spoke: bool) -> str:
                 ". If the scene ends first, open the next scene in the same breath: write "
                 f"<scene {at.scene + 1}> at the start of the sentence where it opens, say what "
                 "its first step shows, then go on through its steps by the same rules, writing "
-                "the tag of every step you narrate; step tags in a new scene start at 2."
+                f"the tag of every step you narrate; <scene {at.scene + 1}> and its <step 1> "
+                "open the same picture."
             )
         return (
             f"The next step, {n}, asks first: {following.ask} Its tag is held back until the "
@@ -394,13 +400,13 @@ def _directive(state: LessonState, scene: Scene, learner_spoke: bool) -> str:
             "next one that does, whose question you put with no tag before you stop"
             f"{onward} If the learner has asked to be told, explain the rest of the scene "
             "without questions, writing each step's tag. On the learner's own question, answer "
-            "it in words first and return to the step."
+            f"it in words first and return to the step. {TAG_RULES}"
         )
     return (
         f"The next step, {n}, does not ask: write <step {n}> at the start of the sentence where "
         "it should appear and explain it, and continue through the steps that do not ask until "
         "the next one that does; put that question and stop. On the learner's own question, "
-        "answer it in words first and return to the step."
+        f"answer it in words first and return to the step. {TAG_RULES}"
     )
 
 
