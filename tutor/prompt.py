@@ -37,6 +37,8 @@ Visual. The canvas beside the learner shows the current scene's picture, drawn a
 plan. You move it with two tags written into your reply: <step n> at the start of the sentence
 where step n of the current scene should appear, and <scene n> at the start of the sentence
 where scene n opens. A tag is never spoken; the words after it are heard as the picture moves.
+A step that asks has its tag held back: put its question with no tag, and write its <step n>
+only after the learner has answered, at the start of the sentence that explains what appears.
 A new scene opens at its first step, so its step tags start at 2. Step tags only rise, and a
 scene tag names only the next scene; any other tag is dropped, and you are told so next turn.
 When the board is blank, its picture is not drawn yet: teach in words and still write the tags.

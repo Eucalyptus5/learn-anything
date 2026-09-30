@@ -326,16 +326,18 @@ NO_PLAN = (
     "one idea at a time, and write no tags."
 )
 OPEN_SCENE_ONE = (
-    "write <scene 1> at the start of the sentence where it opens, say what its first step "
-    "shows, then go on through the steps that do not ask, writing <step n> at the start of the "
-    "sentence where step n should appear, until the next step that asks; put that question and "
-    "stop."
+    "write <scene 1> at the start of the sentence where it opens; <scene 1> opens step 1, so "
+    "<step 1> is never written. Say what its first step shows, then go on through the steps "
+    "that do not ask, writing <step n> at the start of the sentence where step n should appear, "
+    "until the next step that asks; put that question and stop."
 )
 
 
 def _steps(steps: list[Step]) -> list[str]:
     return [
-        f"{n}. {step.show}" + (f" (ask first: {step.ask})" if step.ask else "")
+        f"{n}. {step.show} (ask first, with no tag: {step.ask} Its tag waits for the answer.)"
+        if step.ask
+        else f"{n}. {step.show}"
         for n, step in enumerate(steps, start=1)
     ]
 
@@ -371,12 +373,23 @@ def _directive(state: LessonState, scene: Scene, learner_spoke: bool) -> str:
     n = at.step + 1
     following = scene.steps[at.step]
     if following.ask:
+        if state.next_scene() is None:
+            onward = ", or until the scene ends."
+        else:
+            onward = (
+                ". If the scene ends first, open the next scene in the same breath: write "
+                f"<scene {at.scene + 1}> at the start of the sentence where it opens, say what "
+                "its first step shows, then go on through its steps by the same rules, writing "
+                "the tag of every step you narrate; step tags in a new scene start at 2."
+            )
         return (
-            f"The next step, {n}, asks first: {following.ask} If that question is not yet in "
-            "the conversation above, put it and stop. If the learner has just answered it, say "
-            f"in one sentence whether they have it, write <step {n}> and explain what appears, "
-            "then continue through the steps that do not ask until the next one that does, or "
-            "the scene ends. If the learner has asked to be told, explain the rest of the scene "
+            f"The next step, {n}, asks first: {following.ask} Its tag is held back until the "
+            "learner has answered. If that question is not yet in the conversation above, put "
+            "it with no tag and stop. If the learner has just answered it, say in one sentence "
+            f"whether they have it, then write <step {n}> at the start of the sentence that "
+            "explains what appears, and continue through the steps that do not ask until the "
+            "next one that does, whose question you put with no tag before you stop"
+            f"{onward} If the learner has asked to be told, explain the rest of the scene "
             "without questions, writing each step's tag. On the learner's own question, answer "
             "it in words first and return to the step."
         )

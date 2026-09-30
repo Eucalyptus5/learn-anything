@@ -380,6 +380,11 @@ def test_the_lesson_prompt_names_only_the_step_and_scene_tags_and_stays_ascii() 
         in flat
     )
     assert "A new scene opens at its first step, so its step tags start at 2." in flat
+    assert (
+        "A step that asks has its tag held back: put its question with no tag, and write its "
+        "<step n> only after the learner has answered, at the start of the sentence that "
+        "explains what appears."
+    ) in flat
     assert "Never name a phase, a mode, the plan, a scene number or a step number aloud." in flat
 
 

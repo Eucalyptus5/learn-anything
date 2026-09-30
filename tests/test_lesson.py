@@ -508,7 +508,8 @@ def test_the_block_lists_every_title_marks_the_current_scene_and_numbers_the_ste
     assert "Current scene, 1 of 3: Scene 1." in text
     assert (
         "1. The ratio axis from 0.5 to 2.0\n2. The ratio axis from 0.5 to 2.0\n"
-        "3. The clip band at 0.8 and 1.2 (ask first: Where does the band sit?)"
+        "3. The clip band at 0.8 and 1.2 (ask first, with no tag: Where does the band sit? "
+        "Its tag waits for the answer.)"
     ) in text
     assert "Next scene, 2: Scene 2." in text
     assert "The page shows scene 1 at step 1 of 3." in text
@@ -523,6 +524,7 @@ def test_the_block_directs_the_opening_and_a_learner_who_spoke_first() -> None:
     opening = lesson_block(state, learner_spoke=False, dropped=[])
     assert "There is no learner text" in opening and "Open scene one" in opening
     assert "write <scene 1> at the start of the sentence where it opens" in opening
+    assert "<scene 1> opens step 1, so <step 1> is never written" in opening
     assert "The page has not opened a scene yet." in opening
     assert "1. Scene 1 (now)" in opening
     spoke = lesson_block(state, learner_spoke=True, dropped=[])
@@ -540,7 +542,11 @@ def test_the_block_asks_before_an_asking_step_and_closes_a_scene_and_the_lesson(
     state.acknowledge(ack(2, step=2, revision=2))
     text = lesson_block(state, learner_spoke=True, dropped=[])
     assert "The next step, 3, asks first: Where does the band sit?" in text
-    assert "put it and stop" in text and "write <step 3>" in text
+    assert "put it with no tag and stop" in text and "write <step 3>" in text
+    assert "Its tag is held back until the learner has answered." in text
+    assert "write <step 3> at the start of the sentence that explains what appears" in text
+    assert "open the next scene in the same breath: write <scene 2>" in text
+    assert "step tags in a new scene start at 2" in text
     assert "asked to be told" in text and "without questions" in text
     assert state.step_tag(3) is None
     state.acknowledge(ack(3, step=3, revision=3))
@@ -555,6 +561,19 @@ def test_the_block_asks_before_an_asking_step_and_closes_a_scene_and_the_lesson(
     last = lesson_block(state, learner_spoke=True, dropped=[])
     assert "last scene" in last and "close the lesson" in last and "<scene" not in last
     assert "3. Scene 3 (now)" in last and "Next scene" not in last
+
+
+def test_the_ask_directive_in_the_last_scene_opens_no_scene() -> None:
+    state = opened()
+    state.opened = True
+    assert state.scene_tag(2) is None and state.scene_tag(3) is None
+    assert state.step_tag(2) is None
+    text = lesson_block(state, learner_spoke=True, dropped=[])
+    assert "3. Scene 3 (now)" in text
+    assert "The next step, 3, asks first: Where does the band sit?" in text
+    assert "put it with no tag and stop" in text
+    assert "whose question you put with no tag before you stop, or until the scene ends." in text
+    assert "<scene" not in text and "If the scene ends first" not in text
 
 
 def test_the_block_reads_the_position_with_tags_already_sent() -> None:
