@@ -1,3 +1,4 @@
+import argparse
 import ast
 import asyncio
 import importlib.util
@@ -1524,7 +1525,7 @@ async def _machine_state() -> str:
     return "loadavg=0 swapusage=0 rss_mb=0"
 
 
-def _scenario_args(out: Path) -> object:
+def _scenario_args(out: Path) -> argparse.Namespace:
     flags = ["--plan", "p.json", "--stub-scenes", "--scenarios", "s.json", "--out", str(out)]
     return bench_turn.parse_args([*flags, "--silent-synth"])
 
@@ -1583,6 +1584,19 @@ async def test_a_seeded_case_skips_the_opening_and_starts_at_its_target(
     reply = bench_turn.rebuilt_reply(heard.wire)
     assert reply.startswith("<step 3> Now the ratio sits over all three actions.")
     assert re.findall(r"<[^>]+>", reply) == ["<step 3>", "<scene 2>", "<step 2>", "<step 3>"]
+
+
+async def test_a_seed_at_no_scene_seats_the_page_on_no_scene() -> None:
+    seed = bench_turn.Seed(acked=Cursor(), asked=set(), history=[], turns=1)
+    bench = bench_turn.Bench.boot(
+        CFG, _models(), ScriptedReasoning([]), REQUEST, True, LESSON, True, seed=seed, split=True
+    )
+    page = bench.transport
+    try:
+        await asyncio.wait_for(page.wait_frames(lambda: page._epoch == 1), HANG_GUARD_S)
+        assert (page._scene_id, page._step, page._revision) == (None, 0, 0)
+    finally:
+        await bench.aclose()
 
 
 def test_the_scored_reply_is_rebuilt_from_captions_and_their_cues() -> None:
@@ -1773,6 +1787,10 @@ async def test_run_fixture_scores_a_scripted_split_case(
     assert not any("Well" in text for text in went["spoken"])
     lines = capsys.readouterr().out.splitlines()
     assert "voice calls closed at the label: 1 of 1, no usage recorded" in lines
+    assert f"{'time to substance':34s} not measured on the split reply" in lines
+    assert "stage sentences before substance not measured on the split reply" in lines
+    assert "silent turns not measured on the split reply" in lines
+    assert not any(re.fullmatch(r"silent turns \d+/\d+", line) for line in lines)
     assert lines[-2:] == [
         (
             "verdict as seen: scenarios passed 2/2 on the cues the page receives, "

@@ -827,7 +827,8 @@ class Bench:
                     loop._transcript.learner(f"turn-{n}", text)
                 else:
                     loop._transcript.tutor(f"turn-{n}", text)
-            transport.seat = (plan.scenes[seed.acked.scene - 1].id, seed.acked.step)
+            if seed.acked.scene:
+                transport.seat = (plan.scenes[seed.acked.scene - 1].id, seed.acked.step)
         watch = OutcomeWatch()
         logging.getLogger("tutor.session").addFilter(watch)
         reasoning.begin()
@@ -1378,10 +1379,18 @@ def report(
         else:
             summarize(label, values)
 
+    # On the split reply the voice deltas hold only the label and the reaction, so no prepared
+    # chunk is ever read as substance.
+    split = args.scenarios is not None
     measured(
         "time to first sound", [s.first_sound_ms for s in samples if s.first_sound_ms is not None]
     )
-    measured("time to substance", [s.substance_ms for s in samples if s.substance_ms is not None])
+    if split:
+        print(f"{'time to substance':34s} not measured on the split reply")
+    else:
+        measured(
+            "time to substance", [s.substance_ms for s in samples if s.substance_ms is not None]
+        )
     summarize(
         "first content delta (model, from first request)",
         [s.first_content_delta_ms for s in samples if s.first_content_delta_ms is not None],
@@ -1390,11 +1399,15 @@ def report(
     priced = [s.voice_usd for s in samples if s.voice_usd is not None]
     summarize_usd("cost per turn (list)", priced)
     print(f"turns with unknown cost {len(samples) - len(priced)}/{len(samples)}")
-    stages = [s.stages for s in samples if not s.silent]
-    if stages:
-        print(f"stage sentences before substance median={int(statistics.median(stages))}")
-    silent = sum(1 for s in samples if s.silent)
-    print(f"silent turns {silent}/{len(samples)}")
+    if split:
+        print("stage sentences before substance not measured on the split reply")
+        print("silent turns not measured on the split reply")
+    else:
+        stages = [s.stages for s in samples if not s.silent]
+        if stages:
+            print(f"stage sentences before substance median={int(statistics.median(stages))}")
+        silent = sum(1 for s in samples if s.silent)
+        print(f"silent turns {silent}/{len(samples)}")
     print(ledger_line("", reasoning.ledger))
     print(ledger_line("voice ", reasoning.ledgers["voice"]))
     print(ledger_line("visual ", reasoning.ledgers["visual"]))
