@@ -3,6 +3,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
@@ -11,7 +12,15 @@ from pydantic import BaseModel, Field, ValidationError
 from tutor.chunker import Scrubber, clause_chunks, spoken_text
 from tutor.input_path import EndOfTurn, InputPath, PartialTranscript, SpeechStarted
 from tutor.lead_in import lead_in_sentence, lead_in_stages
-from tutor.lesson import OPENING_TEXT, BuiltScene, LessonPlan, LessonState, Scene, lesson_block
+from tutor.lesson import (
+    OPENING_TEXT,
+    BuiltScene,
+    Cursor,
+    LessonPlan,
+    LessonState,
+    Scene,
+    lesson_block,
+)
 from tutor.planner import EMPTY_REPLY, NO_TOOL_CALL, POSITION_REFUSED, plan_prompt, run_planner
 from tutor.prompt import (
     SEARCH_CODE_TOOL,
@@ -21,6 +30,17 @@ from tutor.prompt import (
     TurnPrompt,
 )
 from tutor.reasoning import ReasoningClient, TurnChunk
+from tutor.reply import (
+    BRIDGED,
+    LIVE_PROMPT,
+    RELAXED,
+    STRIP,
+    Question,
+    bridge_for,
+    direct,
+    live_text,
+    read_label,
+)
 from tutor.scene import EMPTY_REPLY as EMPTY_REPLY_SCENE
 from tutor.scene import NO_TOOL_CALL as NO_TOOL_CALL_SCENE
 from tutor.scene import draft_paths, planned_scene_prompt, run_scene_build
@@ -53,7 +73,9 @@ from tutor.visuals import (
 logger = logging.getLogger(__name__)
 
 SearchCall = Callable[[str, Sequence[str], Path, SearchBudget], Awaitable[SearchResult]]
-Grounded = tuple[TurnPrompt, asyncio.Queue[str | RawTag | None]]
+Item = str | RawTag | Marker | Question
+Fill = Callable[[asyncio.Queue[Item | None]], Coroutine[Any, Any, None]]
+Grounded = tuple[TurnPrompt, asyncio.Queue[Item | None]]
 
 SEARCH_CODE = "search_code"
 TURN_TOOLS: list[dict[str, object]] = [SEARCH_CODE_TOOL, *VOICE_VISUAL_TOOLS]
@@ -129,7 +151,7 @@ def _assistant_calls(calls: list[TurnChunk]) -> Message:
     )
 
 
-async def _queued(queue: asyncio.Queue[str | RawTag | None]) -> AsyncIterator[str | RawTag]:
+async def _queued(queue: asyncio.Queue[Item | None]) -> AsyncIterator[Item]:
     while True:
         item = await queue.get()
         if item is None:
@@ -139,7 +161,7 @@ async def _queued(queue: asyncio.Queue[str | RawTag | None]) -> AsyncIterator[st
 
 class Clause(NamedTuple):
     text: str
-    markers: list[Marker]
+    markers: list[Marker | Question]
 
 
 class Played(NamedTuple):
@@ -149,7 +171,7 @@ class Played(NamedTuple):
     at: float
 
 
-async def _put_all(queue: asyncio.Queue[str | RawTag | None], items: list[str | RawTag]) -> None:
+async def _put_all(queue: asyncio.Queue[Item | None], items: list[str | RawTag]) -> None:
     for item in items:
         if item != "":
             await queue.put(item)
@@ -175,6 +197,7 @@ class TurnLoopConfig(BaseModel):
     planner_effort: str = "high"
     planner_max_tokens: int = Field(default=22000, gt=0)
     planner_timeout_s: float = Field(default=300.0, gt=0)
+    split: bool = False
 
 
 class Speculation:
@@ -245,6 +268,8 @@ class TurnLoop:
         self._exposed: dict[str, int] = {}
         self._closing = False
         self._hearing = False
+        self._rights = 0
+        self._asking: dict[tuple[str, int], float] = {}
         transport.on_json(self._on_json)
 
     def _on_json(self, payload: dict[str, object]) -> None:
@@ -471,7 +496,12 @@ class TurnLoop:
         self._turns.add(turn)
         turn.add_done_callback(self._turn_done)
 
+    def _splitting(self) -> bool:
+        return self._cfg.split and self._lesson.plan is not None
+
     def _prime(self, text: str) -> None:
+        if self._splitting():
+            return
         turn_id = f"turn-{self._dispatched + 1}"
         previous = self._speculations.get(turn_id)
         if previous is not None and previous.text == text and previous.live():
@@ -534,6 +564,12 @@ class TurnLoop:
 
     def _interrupt(self) -> None:
         self._sync("barge_in")
+        if self._asking:
+            now = self._clock()
+            self._lesson.asked.difference_update(
+                key for key, end in self._asking.items() if end > now
+            )
+            self._asking.clear()
         for speculation in self._speculations.values():
             if not speculation.task.cancelling():
                 speculation.task.cancel()
@@ -600,7 +636,7 @@ class TurnLoop:
         self._registry.open_turn(turn_id)
         try:
             prompt = self._prompt([], speculation.text, turn_id)
-            queue: asyncio.Queue[str | RawTag | None] = asyncio.Queue(SPOKEN_DEPTH)
+            queue: asyncio.Queue[Item | None] = asyncio.Queue(SPOKEN_DEPTH)
             speculation.grounded.set_result((prompt, queue))
             logger.info(
                 "turn.speculation turn_id=%s ms=%d", turn_id, _elapsed_ms(start, self._clock())
@@ -624,6 +660,7 @@ class TurnLoop:
             speculation is not None
             and speculation.live()
             and user_text.startswith(speculation.text)
+            and not self._splitting()
         ):
             speculation.claimed = True
             self._drains[turn_id] = speculation.task
@@ -667,7 +704,7 @@ class TurnLoop:
 
         return on_play
 
-    async def _trailing(self, turn_id: str, barrier: int, markers: list[Marker]) -> None:
+    async def _trailing(self, turn_id: str, barrier: int, markers: list[Marker | Question]) -> None:
         played = self._played.get(turn_id)
         if played is None:
             logger.info("tag.discarded turn_id=%s count=%d reason=no_chunk", turn_id, len(markers))
@@ -679,7 +716,7 @@ class TurnLoop:
         self,
         turn_id: str,
         barrier: int,
-        markers: list[Marker],
+        markers: list[Marker | Question],
         chunk_id: int,
         lead_ms: int,
         audio_ms: int,
@@ -690,6 +727,11 @@ class TurnLoop:
                     "tag.discarded turn_id=%s count=%d reason=barrier", turn_id, len(markers) - at
                 )
                 return
+            if isinstance(marker, Question):
+                key = (marker.scene_id, marker.n)
+                self._lesson.asked.add(key)
+                self._asking[key] = self._clock() + lead_ms / 1000
+                continue
             if marker.kind == "step":
                 reason = self._lesson.step_tag(marker.n)
             else:
@@ -729,21 +771,26 @@ class TurnLoop:
         await self._settled.wait()
         opens = not self._lesson.opened
         barrier = self._barrier
+        split = self._splitting()
         grounded = await self._claim(turn_id, user_text)
         self._visuals.set_grounding(self._registry, turn_id)
         await self._visuals.push(self._state("thinking"))
         try:
-            queue: asyncio.Queue[str | RawTag | None] | None = None
-            if grounded is None:
+            feed: asyncio.Queue[Item | None] | Fill
+            if split:
+                feed = partial(self._split, turn_id, user_text)
+            elif grounded is None:
+                tools = TURN_TOOLS if self._cfg.root is not None else []
                 prompt = self._prompt([], user_text, turn_id)
+                feed = partial(self._drain, turn_id, prompt, tools=tools)
             else:
                 # A cancelled turn must not cancel the future the speculation is about to
                 # resolve, or set_result() raises inside the speculation.
-                prompt, queue = await asyncio.shield(grounded)
+                _, feed = await asyncio.shield(grounded)
             self._lesson.dropped.clear()
             self._lesson.begin_turn(user_text != OPENING_TEXT)
             await self._speaker.speak(
-                self._utterance(turn_id, prompt, queue, barrier), self._caption(turn_id, barrier)
+                self._utterance(turn_id, feed, barrier), self._caption(turn_id, barrier)
             )
             await self._await_drain(turn_id)
         except asyncio.CancelledError:
@@ -801,18 +848,13 @@ class TurnLoop:
         await asyncio.gather(task, return_exceptions=True)
 
     async def _utterance(
-        self,
-        turn_id: str,
-        prompt: TurnPrompt,
-        queue: asyncio.Queue[str | RawTag | None] | None,
-        barrier: int,
+        self, turn_id: str, feed: asyncio.Queue[Item | None] | Fill, barrier: int
     ) -> AsyncIterator[Chunk]:
-        if queue is None:
+        if isinstance(feed, asyncio.Queue):
+            queue = feed
+        else:
             queue = asyncio.Queue(SPOKEN_DEPTH)
-            tools = TURN_TOOLS if self._cfg.root is not None else []
-            self._drains[turn_id] = asyncio.create_task(
-                self._drain(turn_id, prompt, queue, tools), name=f"{turn_id}-drain"
-            )
+            self._drains[turn_id] = asyncio.create_task(feed(queue), name=f"{turn_id}-drain")
         spoken: asyncio.Queue[Clause | None] = asyncio.Queue(SPOKEN_DEPTH)
         demand = asyncio.Event()
         self._staging[turn_id] = (spoken, demand)
@@ -875,13 +917,14 @@ class TurnLoop:
     async def _pump(
         self,
         turn_id: str,
-        queue: asyncio.Queue[str | RawTag | None],
+        queue: asyncio.Queue[Item | None],
         spoken: asyncio.Queue[Clause | None],
         demand: asyncio.Event,
     ) -> None:
         scrubber = Scrubber()
         items = clause_chunks(spoken_text(_queued(queue), scrubber))
-        markers: list[Marker] = []
+        markers: list[Marker | Question] = []
+        withheld = False
         # A clause is pulled only once the speaker has asked for one, so a stalled speaker still
         # backs the model stream up at SPOKEN_DEPTH deltas rather than at the chunker's buffer.
         while True:
@@ -903,7 +946,19 @@ class TurnLoop:
                 else:
                     markers.append(marker)
                 continue
-            if not self._admits(turn_id, item, "model"):
+            if isinstance(item, Question) and withheld:
+                logger.info(
+                    "question.dropped turn_id=%s scene_id=%s n=%d reason=withheld",
+                    turn_id,
+                    item.scene_id,
+                    item.n,
+                )
+                continue
+            if not isinstance(item, str):
+                markers.append(item)
+                continue
+            withheld = not self._admits(turn_id, item, "model")
+            if withheld:
                 continue
             await self._stop(self._stagers, turn_id)
             demand.clear()
@@ -936,7 +991,7 @@ class TurnLoop:
         self,
         turn_id: str,
         prompt: TurnPrompt,
-        queue: asyncio.Queue[str | RawTag | None],
+        queue: asyncio.Queue[Item | None],
         tools: Sequence[dict[str, object]],
     ) -> None:
         try:
@@ -971,7 +1026,7 @@ class TurnLoop:
         turn_id: str,
         prompt: TurnPrompt,
         calls: list[TurnChunk],
-        queue: asyncio.Queue[str | RawTag | None],
+        queue: asyncio.Queue[Item | None],
     ) -> None:
         exchange = [_assistant_calls(calls)]
         for call in calls:
@@ -984,6 +1039,109 @@ class TurnLoop:
             if chunk.kind == "spoken":
                 await _put_all(queue, tags.feed(chunk.text))
         await _put_all(queue, tags.finish())
+
+    async def _split(self, turn_id: str, user_text: str, queue: asyncio.Queue[Item | None]) -> None:
+        try:
+            at, pending = self._lesson.position(), self._lesson.pending()
+            move, said = "open", False
+            if user_text != OPENING_TEXT:
+                move, said = await self._live(turn_id, user_text, at, pending, queue)
+            pieces, _ = direct(self._lesson.plan, self._lesson.scripts, move, at, pending)
+            for piece in pieces:
+                if piece.cue is not None:
+                    await queue.put(piece.cue)
+                await queue.put(" " + piece.text if said else piece.text)
+                said = True
+                if piece.question is not None:
+                    await queue.put(piece.question)
+        except BaseException:
+            if queue.full():
+                queue.get_nowait()
+            queue.put_nowait(None)
+            raise
+        await queue.put(None)
+
+    async def _live(
+        self,
+        turn_id: str,
+        user_text: str,
+        at: Cursor,
+        pending: int | None,
+        queue: asyncio.Queue[Item | None],
+    ) -> tuple[str, bool]:
+        scene = self._lesson.current()
+        if at.scene >= 1 and at.step == len(scene.steps) and pending is not None:
+            scene = self._lesson.next_scene()
+        history = self._transcript.history(before=turn_id)
+        prompt = TurnPrompt(
+            system=LIVE_PROMPT,
+            user_text=live_text(self._cfg.subject, scene, pending, history, user_text),
+        )
+        tags = TagSplitter()
+        content, heard, said = "", 0, False
+        status, label, end = "wait", None, 0
+        start = self._clock()
+
+        def decide(ended: bool) -> None:
+            nonlocal status, label, end
+            status, label, end = read_label(content, ended)
+            ms = _elapsed_ms(start, self._clock())
+            if status == "label":
+                logger.info("reply.label turn_id=%s label=%s ms=%d", turn_id, label, ms)
+            elif status == "none":
+                logger.info("reply.unlabelled turn_id=%s ms=%d", turn_id, ms)
+
+        async def speak(ended: bool) -> None:
+            nonlocal heard, said
+            if status == "label":
+                # A colon after the label can arrive in a later delta than the label itself.
+                found = RELAXED.match(content)
+                reaction = content[end if found is None else found.end() :].lstrip()
+                fresh, heard = reaction[heard:], len(reaction)
+            else:
+                cut = len(content) if ended else max(content.rfind(" "), content.rfind("\n")) + 1
+                fresh, heard = STRIP.sub("", content[heard:cut]), cut
+            for item in [*tags.feed(fresh), *(tags.finish() if ended else [])]:
+                if isinstance(item, RawTag):
+                    logger.info(
+                        "tag.dropped turn_id=%s kind=%s reason=reaction chars=%d",
+                        turn_id,
+                        tag_name(item),
+                        len(item.text),
+                    )
+                elif item:
+                    await queue.put(item)
+                    said = True
+
+        stream = self._reasoning.start_turn(prompt)
+        chunks = aiter(stream)
+        try:
+            async for chunk in chunks:
+                if chunk.kind != "spoken":
+                    continue
+                content += chunk.text
+                if status == "wait":
+                    decide(False)
+                if label in BRIDGED:
+                    break
+                if status != "wait":
+                    await speak(False)
+            if status == "wait":
+                decide(True)
+            if label in BRIDGED:
+                bridge, self._rights = bridge_for(label, pending, self._rights)
+                if bridge:
+                    await queue.put(bridge)
+                    said = True
+                await chunks.aclose()
+                await stream.cancel()
+                logger.info("reply.discarded turn_id=%s chars=%d", turn_id, len(content) - end)
+            else:
+                await speak(True)
+        except BaseException:
+            await chunks.aclose()
+            raise
+        return label or "other", said
 
     async def _build_loop(self) -> None:
         while True:

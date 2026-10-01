@@ -34,12 +34,14 @@ from tutor.lesson import (
     LessonPlan,
     LessonState,
     Scene,
+    ScriptChunk,
     Step,
     lesson_block,
 )
 from tutor.planner import PLAN_TOOL
 from tutor.prompt import SEARCH_CODE_TOOL, Message, TurnPrompt
 from tutor.reasoning import TurnChunk
+from tutor.reply import LIVE_PROMPT
 from tutor.scene import SCENE_TOOL, planned_scene_prompt
 from tutor.session import (
     BAD_ARGUMENTS,
@@ -517,6 +519,7 @@ class FakeStream:
         gate: asyncio.Event | None = None,
         holds_at: int = 0,
         close_gate: asyncio.Event | None = None,
+        raises: BaseException | None = None,
     ) -> None:
         self._chunks = chunks
         self._log = log
@@ -524,6 +527,7 @@ class FakeStream:
         self._gate = gate
         self._holds_at = holds_at
         self._close_gate = close_gate
+        self._raises = raises
         self.iterations = 0
         self.cancels = 0
         self.yielded = 0
@@ -545,6 +549,8 @@ class FakeStream:
                 if self.yielded == QUEUE_FULL_DELTAS:
                     self.filled.set()
                 yield chunk
+            if self._raises is not None:
+                raise self._raises
         finally:
             self._log.append(("stream_closed", self.yielded))
             if self._close_gate is not None:
@@ -580,9 +586,11 @@ class FakeReasoning:
         plan_gates: Sequence[asyncio.Event] | None = None,
         plan_raises: BaseException | None = None,
         plan_finish: str | None = None,
+        stream_raises: BaseException | None = None,
     ) -> None:
         self._log = log
         self._chunks = chunks
+        self._stream_raises = stream_raises
         self._follow_up = follow_up if follow_up is not None else []
         self._received = received
         self._gate = gate
@@ -691,6 +699,7 @@ class FakeReasoning:
             self._follow_up_gate if answering else self._gate,
             self._holds_at,
             None if self.streams else self._close_gate,
+            self._stream_raises,
         )
         self.streams.append(stream)
         self.started.set()
@@ -4037,6 +4046,74 @@ WATCHED = LessonPlan.model_validate(
         ],
     }
 )
+SCRIPTS = {
+    "ratio": [
+        ScriptChunk(
+            step=1,
+            question=False,
+            text="Here are the old and the new policy over three actions. Each bar is the "
+            "chance one of them gives an action.",
+        ),
+        ScriptChunk(
+            step=2,
+            question=True,
+            text="Divide the new chance by the old one at a single action. What is the ratio "
+            "where they agree?",
+        ),
+        ScriptChunk(
+            step=2,
+            question=False,
+            text="Where the two policies agree the ratio is exactly one. Above one the new "
+            "policy favours that action more.",
+        ),
+        ScriptChunk(
+            step=3,
+            question=False,
+            text="Now the ratio sits over all three actions. Two rise above one and one "
+            "falls below it.",
+        ),
+    ],
+    "clip": [
+        ScriptChunk(
+            step=1,
+            question=False,
+            text="This axis is the ratio, from one half to two. The objective is drawn against it.",
+        ),
+        ScriptChunk(
+            step=2,
+            question=False,
+            text="The band runs from 0.8 to 1.2. Inside it the objective follows the ratio.",
+        ),
+        ScriptChunk(
+            step=3,
+            question=False,
+            text="Outside the band the objective goes flat. A flat region gives no gradient "
+            "to push further.",
+        ),
+    ],
+    "epochs": [
+        ScriptChunk(
+            step=1,
+            question=False,
+            text="This is one batch of samples. Every epoch reuses the same batch.",
+        ),
+        ScriptChunk(
+            step=2,
+            question=False,
+            text="Each epoch moves the ratio a little. Left alone it would drift far from one.",
+        ),
+        ScriptChunk(
+            step=3,
+            question=False,
+            text="The clip holds the ratio inside the band. The policy cannot run away from "
+            "the batch.",
+        ),
+    ],
+}
+WATCHED_SCRIPTS = {
+    scene_id: [chunk for chunk in chunks if not chunk.question]
+    for scene_id, chunks in SCRIPTS.items()
+}
 RESTORE = {
     "type": "lesson.checkpoint",
     "epoch": 1,
@@ -6545,3 +6622,467 @@ async def test_an_unexpected_build_error_marks_the_scene_failed_and_the_queue_mo
     assert pushed(log) == ["clip"]
     assert "scene.task_failed scene_id=ratio error=ChannelClosed" in session_messages(caplog)
     assert "ratio" in loop._lesson.failed
+
+
+PREPARED_OPENING = [
+    "Here are the old and the new policy over three actions.",
+    "Each bar is the chance one of them gives an action.",
+    "Divide the new chance by the old one at a single action.",
+    "What is the ratio where they agree?",
+]
+PREPARED_QUESTION = PREPARED_OPENING[2:]
+
+
+def split_cfg() -> TurnLoopConfig:
+    return concept_cfg().model_copy(update={"planned": True, "split": True})
+
+
+def split_loop(
+    log: list[tuple[str, object]],
+    source: InputPath,
+    speaker: FakeSpeaker,
+    reasoning: FakeReasoning,
+    page: FakePage,
+    scripts: dict[str, list[ScriptChunk]] | None = None,
+    registry: FakeRegistry | TurnRegistry | None = None,
+    clock: Callable[[], float] | None = None,
+    cfg: TurnLoopConfig | None = None,
+) -> TurnLoop:
+    loop = TurnLoop(
+        cfg if cfg is not None else split_cfg(),
+        source,
+        FakeSearch(log, found()),
+        speaker,
+        page,
+        reasoning,
+        registry if registry is not None else FakeRegistry(log),
+        clock if clock is not None else FakeClock(),
+    )
+    loop._lesson.scripts = dict(SCRIPTS if scripts is None else scripts)
+    return loop
+
+
+def with_chunk(scene_id: str, step: int, question: bool, text: str) -> dict[str, list[ScriptChunk]]:
+    rewritten = [
+        ScriptChunk(step=step, question=question, text=text)
+        if (chunk.step, chunk.question) == (step, question)
+        else chunk
+        for chunk in SCRIPTS[scene_id]
+    ]
+    return {**SCRIPTS, scene_id: rewritten}
+
+
+async def opening_done(page: FakePage) -> None:
+    await asyncio.wait_for(page.seen("caption", 1), HANG_GUARD_S)
+    await asyncio.wait_for(asyncio.wait([turn_task("turn-1")]), HANG_GUARD_S)
+
+
+class SetClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class BackloggedSpeaker(FakeSpeaker):
+    async def speak(self, chunks: AsyncIterator[Chunk], on_play: OnPlay) -> None:
+        async def late(chunk: Chunk, lead_ms: int, audio_ms: int) -> None:
+            await on_play(chunk, 9000, 3000)
+
+        await super().speak(chunks, late)
+
+
+async def test_the_opening_plays_prepared_chunks_with_no_voice_call() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log)
+    reasoning = FakeReasoning(log, [], speaker.received, plans=[planned_call(LESSON)])
+    stop = asyncio.Event()
+    loop = split_loop(log, ScriptedSource([stop]), speaker, reasoning, page)
+
+    running = asyncio.create_task(loop.run())
+    await opening_done(page)
+    stop.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert speaker.utterances == [PREPARED_OPENING]
+    (cue,) = sent(log, "lesson.cue")
+    assert cue["tag"] == {"kind": "scene", "n": 1, "scene_id": "ratio"}
+    assert cue["chunk_id"] == speaker.chunks[0].id
+    (caption,) = [c for c in sent(log, "caption") if c["text"] == PREPARED_OPENING[0]]
+    assert log.index(("send_json", cue)) == log.index(("send_json", caption)) + 1
+    assert reasoning.streams == []
+    assert ("ratio", 2) in loop._lesson.asked
+
+
+async def test_go_on_ends_the_live_stream_at_its_label(caplog: pytest.LogCaptureFixture) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log)
+    reasoning = FakeReasoning(
+        log,
+        [],
+        speaker.received,
+        turns=[spoken_chunks(["go_on", "\nWell, then", " more."])],
+        plans=[planned_call(LESSON)],
+    )
+    first = asyncio.Event()
+    stop = asyncio.Event()
+    source = ScriptedSource([first, EndOfTurn(text="go on"), stop])
+    loop = split_loop(log, source, speaker, reasoning, page)
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+        await opening_done(page)
+        mark = len(log)
+        await pull_past(source, first)
+        await asyncio.wait_for(asyncio.wait([turn_task("turn-2")]), HANG_GUARD_S)
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    (stream,) = reasoning.streams
+    assert (stream.yielded, stream.cancels) == (1, 1)
+    after = log[mark:]
+    assert after.index(("stream_closed", 1)) < after.index(("speak", PREPARED_QUESTION[0]))
+    assert speaker.utterances[1] == PREPARED_QUESTION
+    assert not any("Well" in text for text in spoken_texts(speaker))
+    messages = session_messages(caplog)
+    (label,) = [m for m in messages if m.startswith("reply.label")]
+    assert re.fullmatch(r"reply\.label turn_id=turn-2 label=go_on ms=\d+", label)
+    assert "reply.discarded turn_id=turn-2 chars=0" in messages
+    (prompt,) = reasoning.prompts
+    assert prompt.system == LIVE_PROMPT
+    assert prompt.history == []
+    assert "Pending question: What is the ratio where they agree?" in prompt.user_text
+    assert prompt.user_text.endswith("The learner now says: go on")
+    assert (reasoning.tools, reasoning.max_tokens, reasoning.efforts, reasoning.models) == (
+        [None],
+        [None],
+        [None],
+        [None],
+    )
+
+
+async def test_a_side_question_reaction_is_spoken_as_it_streams() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log)
+    gate = asyncio.Event()
+    reaction = spoken_chunks(
+        ["side_question\nIt is one number ", "per action. What is the ratio where they agree?"]
+    )
+    reasoning = FakeReasoning(
+        log,
+        [],
+        speaker.received,
+        gate=gate,
+        holds_at=1,
+        turns=[reaction],
+        plans=[planned_call(LESSON)],
+    )
+    first = asyncio.Event()
+    stop = asyncio.Event()
+    source = ScriptedSource([first, EndOfTurn(text="is it one number per action?"), stop])
+    loop = split_loop(log, source, speaker, reasoning, page)
+
+    running = asyncio.create_task(loop.run())
+    await opening_done(page)
+    asked = set(loop._lesson.asked)
+    await pull_past(source, first)
+    turn = turn_task("turn-2")
+    await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.streams[0].held.wait(), HANG_GUARD_S)
+    assert spoken_texts(speaker) == PREPARED_OPENING
+    gate.set()
+    await asyncio.wait_for(asyncio.wait([turn]), HANG_GUARD_S)
+    stop.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert speaker.utterances[1] == [
+        "It is one number per action.",
+        "What is the ratio where they agree?",
+    ]
+    assert len(sent(log, "lesson.cue")) == 1
+    assert loop._lesson.asked == asked == {("ratio", 2)}
+
+
+async def test_tags_in_a_reaction_are_neither_spoken_nor_cued(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log)
+    reasoning = FakeReasoning(
+        log,
+        [],
+        speaker.received,
+        turns=[spoken_chunks(["side_question\n<step 2>It is one. <scene 2>Fine."])],
+        plans=[planned_call(LESSON)],
+    )
+    first = asyncio.Event()
+    stop = asyncio.Event()
+    source = ScriptedSource([first, EndOfTurn(text="is it one?"), stop])
+    loop = split_loop(log, source, speaker, reasoning, page)
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+        await opening_done(page)
+        await pull_past(source, first)
+        await asyncio.wait_for(asyncio.wait([turn_task("turn-2")]), HANG_GUARD_S)
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert speaker.utterances[1] == ["It is one.", "Fine."]
+    assert len(sent(log, "lesson.cue")) == 1
+    dropped = [m for m in session_messages(caplog) if m.startswith("tag.dropped")]
+    assert dropped == [
+        "tag.dropped turn_id=turn-2 kind=step reason=reaction chars=6",
+        "tag.dropped turn_id=turn-2 kind=scene reason=reaction chars=7",
+    ]
+
+
+async def test_a_barge_in_mid_chunk_drops_the_unheard_cue_and_go_on_resumes_from_the_page(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold, hold_at=3)
+    page = FakePage(log)
+    reasoning = FakeReasoning(
+        log,
+        [],
+        speaker.received,
+        turns=[spoken_chunks(["go_on"])],
+        plans=[planned_call(WATCHED)],
+    )
+    stop = asyncio.Event()
+    loop = split_loop(
+        log, ScriptedSource([stop]), speaker, reasoning, page, scripts=WATCHED_SCRIPTS
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(speaker.held.wait(), HANG_GUARD_S)
+        scene, step = sent(log, "lesson.cue")
+        page.fire(int(typing.cast(int, scene["cue_id"])))
+        page.handlers[0]({"type": "say", "text": "go on"})
+        turn = turn_task("turn-2")
+        hold.set()
+        await asyncio.wait_for(asyncio.wait([turn]), HANG_GUARD_S)
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert speaker.utterances[0] == [
+        "Here are the old and the new policy over three actions.",
+        "Each bar is the chance one of them gives an action.",
+        "Where the two policies agree the ratio is exactly one.",
+    ]
+    assert scene["tag"] == {"kind": "scene", "n": 1, "scene_id": "ratio"}
+    assert step["tag"] == {"kind": "step", "n": 2}
+    assert step["chunk_id"] == speaker.chunks[2].id
+    messages = session_messages(caplog)
+    assert f"lesson.ack cue_id={step['cue_id']} outcome=dropped reason=barrier" in messages
+    assert any(
+        m.startswith("lesson.synced epoch=1 barrier=1 scene_id=ratio step=1 ") for m in messages
+    )
+    (sync,) = sent(log, "lesson.sync")
+    later = [
+        cue
+        for cue in sent(log, "lesson.cue")
+        if log.index(("send_json", cue)) > log.index(("send_json", sync))
+    ]
+    assert later[0]["tag"] == {"kind": "step", "n": 2}
+    assert later[0]["barrier"] == 1
+    assert speaker.utterances[1][0] == "Where the two policies agree the ratio is exactly one."
+    assert later[0]["chunk_id"] == speaker.chunks[3].id
+    assert all(cue["barrier"] == 1 for cue in later)
+
+
+async def test_a_question_cut_before_its_end_is_not_pending() -> None:
+    log: list[tuple[str, object]] = []
+    hold = asyncio.Event()
+    speaker = FakeSpeaker(log, gate=hold, hold_at=1)
+    page = FakePage(log, fires=True)
+    reasoning = FakeReasoning(
+        log,
+        [],
+        speaker.received,
+        turns=[spoken_chunks(["answered_right"])],
+        plans=[planned_call(LESSON)],
+    )
+    stop = asyncio.Event()
+    loop = split_loop(log, ScriptedSource([stop]), speaker, reasoning, page)
+
+    with line_seen("cursor.scene scene_id=ratio") as fired:
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(fired.wait(), HANG_GUARD_S)
+        await asyncio.wait_for(speaker.held.wait(), HANG_GUARD_S)
+    page.handlers[0]({"type": "say", "text": "one"})
+    assert loop._lesson.asked == set()
+    turn = turn_task("turn-2")
+    hold.set()
+    await asyncio.wait_for(asyncio.wait([turn]), HANG_GUARD_S)
+    stop.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert speaker.utterances[0] == PREPARED_OPENING[:1]
+    assert speaker.utterances[1] == PREPARED_QUESTION
+    assert loop._lesson.asked == {("ratio", 2)}
+
+
+async def asked_after_a_cut(cut_at: float) -> set[tuple[str, int]]:
+    log: list[tuple[str, object]] = []
+    clock = SetClock()
+    speaker = BackloggedSpeaker(log)
+    page = FakePage(log, fires=True)
+    reasoning = FakeReasoning(log, [], speaker.received, plans=[planned_call(LESSON)])
+    stop = asyncio.Event()
+    loop = split_loop(log, ScriptedSource([stop]), speaker, reasoning, page, clock=clock)
+
+    running = asyncio.create_task(loop.run())
+    await opening_done(page)
+    assert loop._lesson.asked == {("ratio", 2)}
+    clock.now = cut_at
+    page.handlers[0]({"type": "say", "text": "one"})
+    asked = set(loop._lesson.asked)
+    stop.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+    return asked
+
+
+async def test_a_question_cut_while_its_audio_waits_to_play_is_not_pending() -> None:
+    assert await asked_after_a_cut(1.0) == set()
+    assert await asked_after_a_cut(13.0) == {("ratio", 2)}
+
+
+async def test_a_withheld_question_is_never_pending(caplog: pytest.LogCaptureFixture) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log)
+    reasoning = FakeReasoning(log, [], speaker.received, plans=[planned_call(LESSON)])
+    stop = asyncio.Event()
+    scripts = with_chunk("ratio", 2, True, "Which flag in setup.py sets it?")
+    loop = split_loop(
+        log,
+        ScriptedSource([stop]),
+        speaker,
+        reasoning,
+        page,
+        scripts=scripts,
+        registry=TurnRegistry(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+        await opening_done(page)
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert speaker.utterances == [PREPARED_OPENING[:2]]
+    messages = session_messages(caplog)
+    assert "turn.chunk_withheld turn_id=turn-1 source=model ungrounded=1" in messages
+    assert "question.dropped turn_id=turn-1 scene_id=ratio n=2 reason=withheld" in messages
+    assert loop._lesson.asked == set()
+
+
+async def test_a_prepared_chunk_naming_a_path_is_withheld(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log)
+    reasoning = FakeReasoning(log, [], speaker.received, plans=[planned_call(LESSON)])
+    stop = asyncio.Event()
+    scripts = with_chunk("ratio", 1, False, "Look in setup.py for the flags.")
+    loop = split_loop(
+        log,
+        ScriptedSource([stop]),
+        speaker,
+        reasoning,
+        page,
+        scripts=scripts,
+        registry=TurnRegistry(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+        await opening_done(page)
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert speaker.utterances == [PREPARED_QUESTION]
+    messages = session_messages(caplog)
+    assert "turn.chunk_withheld turn_id=turn-1 source=model ungrounded=1" in messages
+    (cue,) = sent(log, "lesson.cue")
+    assert cue["tag"] == {"kind": "scene", "n": 1, "scene_id": "ratio"}
+    assert cue["chunk_id"] == speaker.chunks[0].id
+    (caption,) = [c for c in sent(log, "caption") if c["text"] == PREPARED_QUESTION[0]]
+    assert log.index(("send_json", cue)) == log.index(("send_json", caption)) + 1
+
+
+async def test_no_speculation_starts_on_the_split_path() -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log)
+    reasoning = FakeReasoning(log, [], speaker.received, plans=[planned_call(LESSON)])
+    first = asyncio.Event()
+    stop = asyncio.Event()
+    source = ScriptedSource([first, PartialTranscript(text="go"), stop])
+    cfg = split_cfg().model_copy(update={"speculative_reasoning": True})
+    loop = split_loop(log, source, speaker, reasoning, page, cfg=cfg)
+
+    running = asyncio.create_task(loop.run())
+    await opening_done(page)
+    await pull_past(source, first)
+    speculating = [
+        task.get_name() for task in asyncio.all_tasks() if task.get_name().endswith("-speculation")
+    ]
+    stop.set()
+    await asyncio.wait_for(running, HANG_GUARD_S)
+    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert speculating == []
+    assert loop._speculations == {}
+
+
+async def test_a_failed_live_call_ends_the_turn(caplog: pytest.LogCaptureFixture) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log)
+    reasoning = FakeReasoning(
+        log,
+        [],
+        speaker.received,
+        turns=[spoken_chunks(["side_question\nIt is one number. "])],
+        plans=[planned_call(LESSON)],
+        stream_raises=RateLimited(RATE_LIMIT_DETAIL),
+    )
+    first = asyncio.Event()
+    stop = asyncio.Event()
+    source = ScriptedSource([first, EndOfTurn(text="is it one number?"), stop])
+    loop = split_loop(log, source, speaker, reasoning, page)
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        running = asyncio.create_task(loop.run())
+        await opening_done(page)
+        await pull_past(source, first)
+        await asyncio.wait_for(asyncio.wait([turn_task("turn-2")]), HANG_GUARD_S)
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert speaker.utterances[1] == ["It is one number."]
+    messages = session_messages(caplog)
+    assert "turn.reasoning_failed turn_id=turn-2 error=RateLimited" in messages
+    assert any(m.startswith("turn.spoken turn_id=turn-2 ") for m in messages)
+    assert states(log)[-1] == "listening"

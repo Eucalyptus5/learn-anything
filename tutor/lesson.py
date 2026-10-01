@@ -88,6 +88,14 @@ class Cursor(BaseModel):
     step: int = Field(default=0, ge=0)
 
 
+class ScriptChunk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    step: int = Field(ge=1, le=5)
+    question: bool
+    text: str = Field(min_length=1)
+
+
 class BuiltScene(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -145,6 +153,8 @@ class LessonState:
         self.opened = False
         self.first_answer_done = False
         self.planned_through: str | None = None
+        self.scripts: dict[str, list[ScriptChunk]] = {}
+        self.asked: set[tuple[str, int]] = set()
         self._cue_id = 0
         self._stale: set[int] = set()
         self._turn_start = Cursor()
@@ -182,6 +192,15 @@ class LessonState:
 
     def next_scene(self) -> Scene | None:
         return self.scene_at(max(self.position().scene, 1) + 1)
+
+    def pending(self) -> int | None:
+        at = self.position()
+        scene = self.scene_at(at.scene)
+        if scene is None or at.step >= len(scene.steps):
+            scene, at = self.scene_at(at.scene + 1), Cursor(scene=at.scene + 1)
+        if scene is None or not scene.steps[at.step].ask:
+            return None
+        return at.step + 1 if (scene.id, at.step + 1) in self.asked else None
 
     def begin_turn(self, learner_spoke: bool) -> None:
         self._turn_start = self.position()
