@@ -222,6 +222,18 @@ async def test_the_retry_carries_the_rejection_line(caplog: pytest.LogCaptureFix
     assert not any(row["text"] in logged for row in GOOD)
     assert "Subject" not in logged and SCRIPT_TOOL not in logged
 
+    caplog.clear()
+    unended = [dict(row) for row in GOOD]
+    unended[0]["text"] = "Here are the old and the new policy"
+    writer = FakeWriter([FakeStream([call(unended)]), FakeStream([call(GOOD)])])
+    with caplog.at_level(logging.INFO, logger="tutor.script"):
+        assert await write(writer) == chunks(GOOD)
+    assert rejections(caplog) == ["script.rejected scene_id=ratio attempt=1 reason=text"]
+    assert writer.prompts[1].user_text.endswith(
+        "Your previous call was rejected: the chunk for step 1 does not end with a full stop, "
+        "a question mark or an exclamation mark. Call write_script again with the whole scene."
+    )
+
 
 async def test_a_script_naming_a_path_is_refused(
     caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
@@ -233,7 +245,7 @@ async def test_a_script_naming_a_path_is_refused(
         threaded.append((func, args))
         return await real(func, *args, **kwargs)
 
-    monkeypatch.setattr("tutor.script.asyncio.to_thread", recording)
+    monkeypatch.setattr(asyncio, "to_thread", recording)
     rows = [dict(row) for row in GOOD]
     rows[3]["text"] = "The ratio is computed in tutor/session.py across all three actions."
     writer = FakeWriter([FakeStream([call(rows)]), FakeStream([call(rows)])])

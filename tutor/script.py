@@ -202,8 +202,8 @@ async def _attempt(
         chunks = _Script.model_validate_json(call.text).chunks
     except ValidationError as exc:
         fit = "; ".join(
-            f"{'.'.join(str(part) for part in error['loc']) or 'body'}: {error['msg']}"
-            for error in exc.errors()
+            f"{'.'.join(str(part) for part in item['loc']) or 'body'}: {item['msg']}"
+            for item in exc.errors()
         )
         return "arguments", f"the arguments do not fit write_script: {fit}"
     fault = script_fault(scene, chunks)
