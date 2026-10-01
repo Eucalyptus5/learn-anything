@@ -202,6 +202,12 @@ class LessonState:
             return None
         return at.step + 1 if (scene.id, at.step + 1) in self.asked else None
 
+    def done(self) -> bool:
+        if self.plan is None:
+            return False
+        scenes = self.plan.scenes
+        return self.position() == Cursor(scene=len(scenes), step=len(scenes[-1].steps))
+
     def begin_turn(self, learner_spoke: bool) -> None:
         self._turn_start = self.position()
         self._learner_spoke = learner_spoke

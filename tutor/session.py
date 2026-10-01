@@ -497,7 +497,7 @@ class TurnLoop:
         turn.add_done_callback(self._turn_done)
 
     def _splitting(self) -> bool:
-        return self._cfg.split and self._lesson.plan is not None
+        return self._cfg.split and self._lesson.plan is not None and not self._lesson.done()
 
     def _prime(self, text: str) -> None:
         if self._splitting():

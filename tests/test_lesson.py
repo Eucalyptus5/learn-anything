@@ -40,6 +40,22 @@ def plan(scenes: int = 2) -> dict[str, object]:
     }
 
 
+def shaped(*scenes: tuple[int, ...]) -> LessonPlan:
+    return LessonPlan.model_validate(
+        {
+            **plan(len(scenes)),
+            "scenes": [
+                {**scene(n), "steps": [ASKING if k in asks else STEP for k in range(1, steps + 1)]}
+                for n, (steps, *asks) in enumerate(scenes, start=1)
+            ],
+        }
+    )
+
+
+DIRECTED = shaped((4, 3), (3, 2, 3), (3,))
+ASKS_FIRST = shaped((3, 1), (3, 1, 3))
+
+
 def test_a_plan_validates_with_the_bounds() -> None:
     parsed = LessonPlan.model_validate(plan())
     assert [s.id for s in parsed.scenes] == ["scene-1", "scene-2"]
@@ -761,3 +777,29 @@ def test_the_block_names_the_tags_dropped_from_the_last_reply() -> None:
     )
     assert "Tags dropped from your last reply: <step 4>: past_end; <set>: unsupported." in text
     assert "Tags dropped" not in lesson_block(state, learner_spoke=True, dropped=[])
+
+
+def test_done_is_the_last_scenes_last_step() -> None:
+    assert not LessonState().done()
+    state = LessonState()
+    state.adopt(DIRECTED)
+    ends = []
+    for at in (Cursor(), Cursor(scene=1, step=4), Cursor(scene=3, step=2)):
+        state.acked = at
+        ends.append(state.done())
+    assert ends == [False, False, False]
+    assert state.step_tag(3) is None
+    assert state.done()
+
+
+def test_a_question_on_the_next_scenes_first_step_is_pending() -> None:
+    state = LessonState()
+    state.adopt(ASKS_FIRST)
+    first, second = (each.id for each in ASKS_FIRST.scenes)
+    assert state.pending() is None
+    state.asked.add((first, 1))
+    assert state.pending() == 1
+    state.acked = Cursor(scene=1, step=3)
+    assert state.pending() is None
+    state.asked.add((second, 1))
+    assert state.pending() == 1

@@ -2,15 +2,18 @@ import hashlib
 
 import pytest
 
+from tests.test_lesson import ASKS_FIRST, DIRECTED
 from tests.test_session import LESSON, SCRIPTS
-from tutor.lesson import OPENING_TEXT, Cursor
+from tutor.lesson import OPENING_TEXT, Cursor, LessonPlan, ScriptChunk
 from tutor.prompt import Message
 from tutor.reply import (
+    ANSWERS,
     LIVE_PROMPT,
     STRIP,
     Missing,
     Piece,
     Question,
+    bridge_for,
     direct,
     live_text,
     read_label,
@@ -41,9 +44,11 @@ RECENT_LINES = [
 ]
 
 
-def chunk(scene_id: str, step: int, question: bool) -> str:
+def chunk(
+    scene_id: str, step: int, question: bool, scripts: dict[str, list[ScriptChunk]] = SCRIPTS
+) -> str:
     return next(
-        each.text for each in SCRIPTS[scene_id] if each.step == step and each.question == question
+        each.text for each in scripts[scene_id] if each.step == step and each.question == question
     )
 
 
@@ -141,3 +146,115 @@ def test_a_reaction_label_plays_no_piece(move: str) -> None:
 
 def test_a_missing_script_is_named() -> None:
     assert direct(LESSON, {}, "open", Cursor(), None) == ([], Missing(1))
+
+
+def scripted(plan: LessonPlan) -> dict[str, list[ScriptChunk]]:
+    return {
+        each.id: [
+            ScriptChunk(
+                step=n, question=question, text=f"{each.id} {'asks' if question else 'shows'} {n}."
+            )
+            for n, step in enumerate(each.steps, start=1)
+            for question in ((True, False) if step.ask else (False,))
+        ]
+        for each in plan.scenes
+    }
+
+
+DIRECTED_SCRIPTS = scripted(DIRECTED)
+ASKS_FIRST_SCRIPTS = scripted(ASKS_FIRST)
+
+
+def spelled(
+    plan: LessonPlan, scripts: dict[str, list[ScriptChunk]], scene: int, pieces: str
+) -> list[Piece]:
+    played: list[Piece] = []
+    for word in [] if pieces == "none" else pieces.split(", "):
+        if word.startswith("q("):
+            n, step = (int(part) for part in word[2:-1].split("."))
+            scene_id = plan.scenes[n - 1].id
+            text = chunk(scene_id, step, True, scripts)
+            played.append(Piece(None, text, Question(scene_id, step)))
+            continue
+        kind, n = word.split()
+        scene = int(n) if kind == "scene" else scene
+        step = 1 if kind == "scene" else int(n)
+        text = chunk(plan.scenes[scene - 1].id, step, False, scripts)
+        played.append(Piece(Marker(kind, int(n)), text, None))
+    return played
+
+
+@pytest.mark.parametrize(
+    ("move", "at", "pending", "pieces"),
+    [
+        *[(move, (1, 2), 3, "step 3, step 4, scene 2, q(2.2)") for move in ANSWERS],
+        ("answered_right", (1, 1), None, "step 2, q(1.3)"),
+        ("go_on", (1, 2), 3, "q(1.3)"),
+        ("answered_right", (2, 1), 2, "step 2, q(2.3)"),
+        ("tell_me", (2, 1), 2, "step 2, step 3"),
+        *[(move, (1, 4), None, "scene 2, q(2.2)") for move in ("tell_me", "go_on")],
+        ("go_on", (2, 3), None, "scene 3, step 2, step 3"),
+        *[(move, (1, 2), 3, "none") for move in ("side_question", "other")],
+        *[
+            (move, (0, 0), None, "scene 1, step 2, q(1.3)")
+            for move in ("go_on", "side_question", "tell_me")
+        ],
+    ],
+)
+def test_the_director_follows_the_prototype(
+    move: str, at: tuple[int, int], pending: int | None, pieces: str
+) -> None:
+    played = direct(DIRECTED, DIRECTED_SCRIPTS, move, Cursor(scene=at[0], step=at[1]), pending)
+
+    assert played == (spelled(DIRECTED, DIRECTED_SCRIPTS, at[0], pieces), None)
+
+
+@pytest.mark.parametrize(
+    ("move", "at", "pending", "pieces"),
+    [
+        ("open", (0, 0), None, "q(1.1)"),
+        ("go_on", (0, 0), 1, "q(1.1)"),
+        *[(move, (0, 0), 1, "scene 1, step 2, step 3, q(2.1)") for move in ANSWERS],
+        ("tell_me", (0, 0), 1, "scene 1, step 2, step 3"),
+        *[(move, (0, 0), 1, "none") for move in ("side_question", "other")],
+        *[(move, (1, 3), None, "q(2.1)") for move in ("go_on", "tell_me", "answered_right")],
+        ("go_on", (1, 3), 1, "q(2.1)"),
+        ("answered_right", (1, 3), 1, "scene 2, step 2, q(2.3)"),
+        ("tell_me", (1, 3), 1, "scene 2, step 2, step 3"),
+        *[(move, (1, 3), 1, "none") for move in ("side_question", "other")],
+    ],
+)
+def test_a_scene_that_asks_at_its_first_step_opens_on_the_answer(
+    move: str, at: tuple[int, int], pending: int | None, pieces: str
+) -> None:
+    played = direct(ASKS_FIRST, ASKS_FIRST_SCRIPTS, move, Cursor(scene=at[0], step=at[1]), pending)
+
+    assert played == (spelled(ASKS_FIRST, ASKS_FIRST_SCRIPTS, at[0], pieces), None)
+
+
+def test_bridges_rotate_on_right_answers_only() -> None:
+    walked = [bridge_for("answered_right", 3, rights) for rights in range(4)]
+
+    assert walked == [
+        ("Yes, that's right.", 1),
+        ("Exactly right.", 2),
+        ("Right, well done.", 3),
+        ("Yes, that's right.", 4),
+    ]
+    assert bridge_for("answered_right", None, 5) == ("", 5)
+    assert bridge_for("tell_me", 3, 2) == ("Sure, here it is.", 2)
+    for label in ("go_on", "answered_wrong", "answered_partly", "side_question", "other"):
+        assert bridge_for(label, 3, 0) == ("", 0)
+
+
+def test_a_script_needed_only_for_the_next_scene_is_named() -> None:
+    second = DIRECTED.scenes[1].id
+    scripts = {
+        scene_id: chunks for scene_id, chunks in DIRECTED_SCRIPTS.items() if scene_id != second
+    }
+
+    assert direct(DIRECTED, scripts, "go_on", Cursor(scene=1, step=4), None) == ([], Missing(2))
+    assert direct(DIRECTED, scripts, "answered_right", Cursor(scene=1, step=2), 3) == (
+        spelled(DIRECTED, DIRECTED_SCRIPTS, 1, "step 3, step 4"),
+        Missing(2),
+    )
