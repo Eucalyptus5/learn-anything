@@ -514,9 +514,8 @@ class TurnLoop:
         self._scripts_changed.set()
 
     def _release_script_waits(self) -> None:
-        # Replaced, never cleared, so every turn waiting at this moment wakes.
         self._script_waits.set()
-        self._script_waits = asyncio.Event()
+        self._script_waits.clear()
 
     def _publish(self) -> None:
         scenes, current = self._lesson.statuses()
