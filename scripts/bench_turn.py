@@ -5,9 +5,11 @@ only tree searched. Text only on the wire. Each turn's reply length is appended 
 file (``--capture``, default ``scratch/bench/replies.jsonl``). ``--soak MINUTES`` runs the same
 turns for a stated number of minutes while sampling power, thermal pressure, cluster frequency,
 process RSS and swap. ``--plan`` answers the planner from a fixed lesson and ``--stub-scenes``
-answers every scene build with a stub; ``--scenarios`` replays each case's setup and reads the
-tags of the one measured reply, writing it to ``--out``; ``--connect`` times connect to the first
-audio frame and to scene one checked on the real planner, builder and voice. The page is simulated.
+answers every scene build with a stub; ``--scenarios`` writes every scene's script once, seeds
+each case at its target, runs it through the split reply and reads the tags of the reply rebuilt
+from the captions and cues on the wire, writing it and the scripts to ``--out``; ``--connect``
+times connect to the first audio frame and to scene one checked on the real planner, builder and
+voice. The page is simulated.
 """
 
 import argparse
@@ -41,11 +43,12 @@ from tutor.config import Settings, settings
 from tutor.constants import TTS_SAMPLE_RATE, WEBRTC_FRAME_SAMPLES, WEBRTC_SAMPLE_RATE
 from tutor.cost import TurnUsage, UsageLedger, turn_cost_usd
 from tutor.input_path import EndOfTurn, InputEvent
-from tutor.lesson import OPENING_TEXT, REPEAT, Cursor, LessonPlan, LessonState
+from tutor.lesson import OPENING_TEXT, REPEAT, Cursor, LessonPlan, LessonState, ScriptChunk
 from tutor.planner import PLAN_TOOL
-from tutor.prompt import Message, TurnPrompt
+from tutor.prompt import TurnPrompt
 from tutor.reasoning import ReasoningClient, TurnChunk, TurnStream
 from tutor.scene import SCENE_TOOL
+from tutor.script import SCRIPT_TOOL, write_script
 from tutor.session import TurnLoop, TurnLoopConfig
 from tutor.signaling import SessionRequest
 from tutor.tags import TAG_NAMES, TagSplitter, parse_marker, tag_name
@@ -89,6 +92,7 @@ PPO_UTTERANCES = (
 CAPTURE_DIR = REPO / "scratch" / "bench"
 LISTENING_OUTCOME = REPO / "scratch" / "experiments" / "12" / "listening" / "outcome.json"
 SCENE_READY_TIMEOUT_S = TurnLoopConfig.model_fields["scene_ready_timeout_s"].default
+SCRIPT_TIMEOUT_S = TurnLoopConfig.model_fields["script_timeout_s"].default
 STUB_COUNT = re.compile(r"exactly (\d+), one say line each")
 STUB_HTML = '<!doctype html><div id="stub"></div>'
 SAY_LINE_CHARS = 120  # write_scene's StepLine limit; a plan's show line may run to 300
@@ -416,11 +420,13 @@ class MeteredStream:
         record: TurnRecord,
         ledgers: Sequence[UsageLedger],
         kind: str,
+        cancelled: Counter[str],
     ) -> None:
         self._inner = inner
         self._record = record
         self._ledgers = ledgers
         self._kind = kind
+        self._cancelled = cancelled
 
     @property
     def finish_reason(self) -> str | None:
@@ -455,8 +461,12 @@ class MeteredStream:
             record.voice_usage = add_usage(record.voice_usage, usage)
         elif self._kind == "planner":
             record.planner_usage = add_usage(record.planner_usage, usage)
-        else:
+        elif self._kind == "visual":
             record.visual_usage = add_usage(record.visual_usage, usage)
+
+    async def cancel(self) -> None:
+        self._cancelled[self._kind] += 1
+        await self._inner.cancel()
 
 
 class CannedStream:
@@ -492,17 +502,15 @@ class MeteredReasoning:
         self._inner = inner
         self._plan = plan
         self._stub_scenes = stub_scenes
-        self._scripted: list[str] = []
         self.ledger = UsageLedger()
-        self.ledgers = {"voice": UsageLedger(), "visual": UsageLedger(), "planner": UsageLedger()}
+        self.ledgers = {kind: UsageLedger() for kind in ("voice", "visual", "planner", "script")}
+        self.calls: Counter[str] = Counter()
+        self.cancelled: Counter[str] = Counter()
         self.record = TurnRecord()
 
     def begin(self) -> TurnRecord:
         self.record = TurnRecord()
         return self.record
-
-    def script(self, replies: Iterable[str]) -> None:
-        self._scripted.extend(replies)
 
     def start_turn(
         self,
@@ -514,7 +522,9 @@ class MeteredReasoning:
         model: str | None = None,
     ) -> MeteredStream | CannedStream:
         name = tools[0]["function"]["name"] if tools else None
-        kind = {PLAN_TOOL: "planner", SCENE_TOOL: "visual"}.get(name, "voice")
+        kind = {PLAN_TOOL: "planner", SCENE_TOOL: "visual", SCRIPT_TOOL: "script"}.get(
+            name, "voice"
+        )
         if kind == "planner" and self._plan is not None:
             call = TurnChunk(
                 kind="tool_call",
@@ -525,10 +535,7 @@ class MeteredReasoning:
             return CannedStream([call], "tool_calls")
         if kind == "visual" and self._stub_scenes:
             return CannedStream([stub_scene(prompt)], "tool_calls")
-        if kind == "voice" and self._scripted:
-            reply = self._scripted.pop(0)
-            pieces = [piece for piece in re.split(r"(?<= )", reply) if piece]
-            return CannedStream([TurnChunk(kind="spoken", text=piece) for piece in pieces], "stop")
+        self.calls[kind] += 1
         record = self.record
         # A build or a planner call runs beside the turn; only a voice call starts its clock.
         if kind == "voice" and record.requested is None:
@@ -541,7 +548,8 @@ class MeteredReasoning:
             tool_choice=tool_choice,
             model=model,
         )
-        return MeteredStream(inner, record, (self.ledger, self.ledgers[kind]), kind)
+        ledgers = (self.ledger, self.ledgers[kind])
+        return MeteredStream(inner, record, ledgers, kind, self.cancelled)
 
     async def aclose(self) -> None:
         await self._inner.aclose()
@@ -574,6 +582,8 @@ class BenchTransport(Connection):
         self.emitted = asyncio.Event()
         self.checks: list[tuple[float, str, bool]] = []
         self.simulated: Counter[str] = Counter()
+        self.wire: list[dict[str, object]] = []
+        self.seat: tuple[str, int] | None = None
         self._held: dict[int, tuple[dict[str, object], asyncio.TimerHandle]] = {}
         self._epoch = 0
         self._barrier = 0
@@ -589,6 +599,8 @@ class BenchTransport(Connection):
 
     async def send_json(self, payload: dict[str, object]) -> None:
         kind = payload["type"]
+        if kind in ("caption", "lesson.cue"):
+            self.wire.append(payload)
         if kind == "scene.push":
             report = {
                 "type": "scene.ready",
@@ -604,6 +616,8 @@ class BenchTransport(Connection):
             self._epoch = payload["epoch"]
             self._barrier = self._revision = self._step = self._last_cue = 0
             self._scene_id = None
+            if self.seat is not None:
+                self._scene_id, self._step = self.seat
         elif kind == "lesson.cue":
             cue_id = int(payload["cue_id"])
             lead_s = int(payload["lead_ms"]) / 1000
@@ -715,6 +729,7 @@ class OutcomeWatch(logging.Filter):
         self.seen: set[str] = set()
         self.planned_at: float | None = None
         self.unplanned = False
+        self.labels: dict[str, str] = {}
         self.event = asyncio.Event()
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -725,6 +740,8 @@ class OutcomeWatch(logging.Filter):
             self.planned_at = time.perf_counter()
         elif record.msg.startswith("planner.failed stage=connect "):
             self.unplanned = True
+        elif record.msg.startswith("reply.label "):
+            self.labels[str(record.args[0])] = str(record.args[1])
         return True
 
     async def wait(self, turn_id: str) -> None:
@@ -733,21 +750,19 @@ class OutcomeWatch(logging.Filter):
             await self.event.wait()
 
 
-def setup_settled(lesson: LessonState) -> bool:
-    # Only the shown scene's build reaches the prompt; one further ahead may wait for a scene
-    # that a setup short of its target never shows.
-    scene = lesson.current()
-    return (
-        not lesson.sent
-        and scene is not None
-        and (scene.id in lesson.built or scene.id in lesson.failed)
-    )
+class Seed(NamedTuple):
+    acked: Cursor
+    asked: set[tuple[str, int]]
+    history: list[tuple[str, str]]
+    turns: int
 
 
 class Measured(NamedTuple):
     sample: Sample
     reply: str
     spoken: list[str]
+    label: str | None
+    wire: list[dict[str, object]]
 
 
 class Bench:
@@ -774,7 +789,7 @@ class Bench:
         self._loop = loop
         self.started = started
         self._capture = capture
-        self._dispatched = 0
+        self._dispatched = loop._dispatched
 
     @classmethod
     def boot(
@@ -786,14 +801,33 @@ class Bench:
         planned: bool,
         plan: LessonPlan | None = None,
         stub_scenes: bool = False,
-        replies: Sequence[str] = (),
         capture: Capture | None = None,
+        scripts: dict[str, list[ScriptChunk]] | None = None,
+        seed: Seed | None = None,
+        split: bool = False,
     ) -> "Bench":
         reasoning = MeteredReasoning(inner, plan, stub_scenes)
-        reasoning.script(replies)
         transport = BenchTransport(models.synth)
         source = ScriptedSource()
         loop = build_loop(cfg, models, reasoning, source, transport, request, planned=planned)
+        loop._cfg = loop._cfg.model_copy(update={"split": split})
+        lesson = loop._lesson
+        if scripts is not None:
+            lesson.scripts = dict(scripts)
+        if seed is not None:
+            lesson.acked, lesson.asked = seed.acked, set(seed.asked)
+            lesson.opened = lesson.first_answer_done = True
+            # The planner dispatches the opening only while no turn has been dispatched.
+            loop._dispatched = seed.turns
+            n = 1
+            loop._transcript.learner("turn-1", OPENING_TEXT)
+            for role, text in seed.history:
+                if role == "user":
+                    n += 1
+                    loop._transcript.learner(f"turn-{n}", text)
+                else:
+                    loop._transcript.tutor(f"turn-{n}", text)
+            transport.seat = (plan.scenes[seed.acked.scene - 1].id, seed.acked.step)
         watch = OutcomeWatch()
         logging.getLogger("tutor.session").addFilter(watch)
         reasoning.begin()
@@ -817,25 +851,23 @@ class Bench:
     def lesson(self) -> LessonState:
         return self._loop._lesson
 
-    def history(self) -> list[Message]:
-        return self._loop._transcript.history(before=f"turn-{self._dispatched + 1}")
-
     async def turn(self, learner: str | None, utterance: int = 0, sample: bool = True) -> Measured:
         transport = self.transport
         if learner is None:
-            since = ledger_since = 0
+            since = ledger_since = wire_since = 0
             record, t0 = self.reasoning.record, self.started
         else:
             transport.flush_playout()
             since = len(transport.frames)
             await transport.wait_frames(lambda: transport.idle_since(since))
-            ledger_since = len(transport.ledger)
+            ledger_since, wire_since = len(transport.ledger), len(transport.wire)
             record = self.reasoning.begin()
             self._synth.last = None
             t0 = time.perf_counter()
             self._source.inject(EndOfTurn(text=learner))
         self._dispatched += 1
-        await self.watch.wait(f"turn-{self._dispatched}")
+        turn_id = f"turn-{self._dispatched}"
+        await self.watch.wait(turn_id)
         spoken_at = len(transport.frames)
 
         played = transport.ledger[ledger_since:]
@@ -868,10 +900,9 @@ class Bench:
             voice_usd=None if voice is None else turn_cost_usd(voice, list_price=True),
             utterance=utterance,
         )
-        return Measured(measured, reply, [entry.text for entry in played if entry.text is not None])
-
-    async def settle(self) -> None:
-        await self.transport.wait_frames(lambda: setup_settled(self.lesson))
+        spoken = [entry.text for entry in played if entry.text is not None]
+        label = self.watch.labels.get(turn_id)
+        return Measured(measured, reply, spoken, label, transport.wire[wire_since:])
 
     async def aclose(self) -> None:
         await self._loop.aclose()
@@ -1093,24 +1124,79 @@ class HarnessError(Exception):
     pass
 
 
-def check_setup(acked: Cursor, history: list[Message], case: Scenario) -> None:
-    if acked != case.target:
-        raise HarnessError(
-            f"{case.id}: the setup reached scene {acked.scene} step {acked.step}, "
-            f"not scene {case.target.scene} step {case.target.step}"
-        )
-    expected: list[tuple[str, str]] = []
+def replay(plan: LessonPlan, case: Scenario) -> Seed:
+    state = LessonState()
+    state.adopt(plan)
+    history: list[tuple[str, str]] = []
     for turn in case.setup:
-        learner = OPENING_TEXT if turn.learner is None else turn.learner
-        expected.append(("user", " ".join(learner.split())))
+        state.begin_turn(turn.learner is not None)
         splitter = TagSplitter()
         items = [*splitter.feed(turn.reply), *splitter.finish()]
+        for item in items:
+            if isinstance(item, str):
+                continue
+            marker = parse_marker(item)
+            if isinstance(marker, str):
+                raise HarnessError(f"{case.id}: setup tag <{item.text}> is {marker}")
+            check = state.step_tag if marker.kind == "step" else state.scene_tag
+            reason = check(marker.n)
+            if reason not in (None, REPEAT):
+                raise HarnessError(f"{case.id}: setup tag <{item.text}> refused: {reason}")
+        state.acked, state.sent = state.position(), []
+        if turn.learner is not None:
+            history.append(("user", " ".join(turn.learner.split())))
         said = " ".join("".join(item for item in items if isinstance(item, str)).split())
         if said:
-            expected.append(("assistant", said))
-    found = [(message.role, " ".join(message.content.split())) for message in history]
-    if found != expected:
-        raise HarnessError(f"{case.id}: the transcript does not hold the setup's turns")
+            history.append(("assistant", said))
+    if state.acked != case.target:
+        raise HarnessError(
+            f"{case.id}: the setup reached scene {state.acked.scene} step {state.acked.step}, "
+            f"not scene {case.target.scene} step {case.target.step}"
+        )
+    asked = {(plan.scenes[case.target.scene - 1].id, n) for n in case.asked}
+    return Seed(state.acked, asked, history, len(case.setup))
+
+
+def rebuilt_reply(wire: list[dict[str, object]]) -> str:
+    # The session sends a chunk's cues right after its caption; each fires as that chunk starts.
+    said: list[tuple[list[str], str]] = []
+    for payload in wire:
+        if payload["type"] == "caption":
+            said.append(([], str(payload["text"])))
+        else:
+            tag = payload["tag"]
+            said[-1][0].append(f"<{tag['kind']} {tag['n']}>")
+    return " ".join(part for tags, text in said for part in (*tags, text))
+
+
+async def write_scripts(
+    reasoning: MeteredReasoning, plan: LessonPlan, subject: str, starting_from: str
+) -> dict[str, list[ScriptChunk]]:
+    fields = TurnLoopConfig.model_fields
+    scripts: dict[str, list[ScriptChunk]] = {}
+    for n, scene in enumerate(plan.scenes, start=1):
+        calls = reasoning.calls["script"]
+        start = time.perf_counter()
+        script = await write_script(
+            reasoning,
+            subject,
+            starting_from,
+            plan,
+            n,
+            model=fields["script_model"].default,
+            effort=fields["script_effort"].default,
+            max_tokens=fields["script_max_tokens"].default,
+            timeout_s=SCRIPT_TIMEOUT_S,
+        )
+        ms = int((time.perf_counter() - start) * 1000)
+        attempts = reasoning.calls["script"] - calls
+        if isinstance(script, str):
+            raise HarnessError(
+                f"the script for scene {n} ({scene.id}) failed after {attempts} attempts: {script}"
+            )
+        print(f"script scene={n} ms={ms} attempts={attempts}", file=sys.stderr)
+        scripts[scene.id] = script
+    return scripts
 
 
 def run_order(cases: list[Scenario]) -> tuple[list[Scenario], list[Scenario]]:
@@ -1125,26 +1211,36 @@ def prepare_out(path: Path) -> None:
         raise FileExistsError(f"{path} already holds a run")
 
 
-def write_case(
-    out: Path, case_id: str, reply: str, spoken: list[str], result: ScenarioResult
-) -> None:
-    body = {"reply": reply, "spoken": spoken, "result": result.model_dump(mode="json")}
+class Scored(NamedTuple):
+    reply: str
+    spoken: list[str]
+    label: str | None
+    first_sound_ms: int | None
+    result: ScenarioResult
+
+
+def write_case(out: Path, case_id: str, scored: Scored) -> None:
+    body = {
+        "reply": scored.reply,
+        "spoken": scored.spoken,
+        "label": scored.label,
+        "first_sound_ms": scored.first_sound_ms,
+        "result": scored.result.model_dump(mode="json"),
+    }
     (out / f"{case_id}.json").write_text(json.dumps(body, indent=2, ensure_ascii=True) + "\n")
 
 
 async def run_scenarios(
-    cases: list[Scenario],
-    out: Path,
-    run_case: Callable[[Scenario], Awaitable[tuple[str, list[str], ScenarioResult]]],
+    cases: list[Scenario], out: Path, run_case: Callable[[Scenario], Awaitable[Scored]]
 ) -> list[ScenarioResult]:
     warmups, measured = run_order(cases)
     for case in warmups:
         await run_case(case)
     results: list[ScenarioResult] = []
     for case in measured:
-        reply, spoken, result = await run_case(case)
-        write_case(out, case.id, reply, spoken, result)
-        results.append(result)
+        scored = await run_case(case)
+        write_case(out, case.id, scored)
+        results.append(scored.result)
     return results
 
 
@@ -1248,11 +1344,12 @@ def report(
     )
     print("first content delta: the model's first spoken delta after the turn's first voice call.")
     print(
-        "planner calls and scene builds run beside the turns, not inside them: a turn's cost is "
-        "its voice calls, and the planner and visual ledger lines carry the rest. With --plan the "
-        "planner is answered from the file and with --stub-scenes every build is a stub; neither "
-        "reaches the model. The page is simulated: it answers each scene.push with a passing "
-        "scene.ready, fires each lesson.cue after its lead and answers each lesson.sync."
+        "planner calls, scene builds and script writes run beside the turns, not inside them: a "
+        "turn's cost is its voice calls, and the planner, visual and script ledger lines carry the "
+        "rest. With --plan the planner is answered from the file and with --stub-scenes every "
+        "build is a stub; neither reaches the model. The page is simulated: it answers each "
+        "scene.push with a passing scene.ready, fires each lesson.cue after its lead and answers "
+        "each lesson.sync."
     )
     print(
         "a one-LSB floor is applied to every buffer before playout so an all-zero frame is exactly "
@@ -1302,6 +1399,11 @@ def report(
     print(ledger_line("voice ", reasoning.ledgers["voice"]))
     print(ledger_line("visual ", reasoning.ledgers["visual"]))
     print(ledger_line("planner ", reasoning.ledgers["planner"]))
+    print(ledger_line("script ", reasoning.ledgers["script"]))
+    print(
+        f"voice calls closed at the label: {reasoning.cancelled['voice']} of "
+        f"{reasoning.calls['voice']}, no usage recorded"
+    )
 
 
 def report_page(simulated: Counter[str]) -> None:
@@ -1315,8 +1417,9 @@ def report_scenarios(samples: list[Sample], sentence_rule: bool) -> None:
         "scenario checks read each tag where the reply wrote it: a tag is placed at the reply's "
         f"start, after another tag, or after one of {'.?!' if sentence_rule else '.?!;:,'}. "
         "Asked is a proxy, a final question mark and every required term, case-insensitive, "
-        "not a semantic judge. The setup replies, the plan and the builds are scripted; only the "
-        "measured reply reaches the model."
+        "not a semantic judge. Each case is seeded at its target, not replayed through the voice; "
+        "the plan and the builds are scripted and each scene's script is written once per run. "
+        "The reply scored is rebuilt from the captions and cues sent to the page."
     )
     placed = sum(1 for s in samples if s.tags_valid and s.placement_errors == 0)
     print(f"tags valid and placed {placed}/{n}")
@@ -1559,28 +1662,41 @@ async def run_fixture(
     fixture: Fixture,
     sentence_rule: bool,
 ) -> int:
+    seeds = {case.id: replay(plan, case) for case in fixture.cases if case.learner is not None}
     runs: list[tuple[Sample, MeteredReasoning, Counter[str]]] = []
+    print(f"start {await machine_state()}", flush=True)
+    scripter = MeteredReasoning(inner)
+    scripts = await write_scripts(scripter, plan, request.subject, request.starting_from)
+    written = {
+        scene_id: [chunk.model_dump(mode="json") for chunk in chunks]
+        for scene_id, chunks in scripts.items()
+    }
+    (args.out / "scripts.json").write_text(json.dumps(written, indent=2, ensure_ascii=True) + "\n")
 
-    async def run_case(case: Scenario) -> tuple[str, list[str], ScenarioResult]:
-        replies = [turn.reply for turn in case.setup]
+    async def run_case(case: Scenario) -> Scored:
+        seed = seeds.get(case.id)
         bench = Bench.boot(
-            cfg, models, inner, request, planned(args), plan, args.stub_scenes, replies
+            cfg,
+            models,
+            inner,
+            request,
+            planned(args),
+            plan,
+            args.stub_scenes,
+            scripts=scripts,
+            seed=seed,
+            split=True,
         )
+        state = LessonState()
+        state.adopt(plan)
+        if seed is not None:
+            state.acked, state.asked = seed.acked, set(seed.asked)
         try:
-            for turn in case.setup:
-                await bench.turn(turn.learner)
-                await bench.settle()
-            check_setup(bench.lesson.acked, bench.history(), case)
-            # The opening starts on its own, so its state is taken as the plan adopted afresh.
-            if case.learner is None:
-                state = LessonState()
-                state.adopt(plan)
-            else:
-                state = copy.deepcopy(bench.lesson)
             heard = await bench.turn(case.learner)
         finally:
             await bench.aclose()
-        result = evaluate_scenario(heard.reply, heard.spoken, state, case, sentence_rule)
+        reply = rebuilt_reply(heard.wire)
+        result = evaluate_scenario(reply, heard.spoken, state, case, sentence_rule)
         fields = result.model_dump(exclude={"reveal_ok", "passed", "seen_tags", "seen_passed"})
         sample = heard.sample.model_copy(
             update={
@@ -1593,19 +1709,21 @@ async def run_fixture(
         )
         runs.append((sample, bench.reasoning, bench.transport.simulated))
         print(
-            f"case={case.id} {turn_line(sample)} tags={result.tags} passed={result.passed}",
+            f"case={case.id} {turn_line(sample)} label={heard.label} tags={result.tags} "
+            f"passed={result.passed}",
             file=sys.stderr,
         )
-        return heard.reply, heard.spoken, result
+        return Scored(reply, heard.spoken, heard.label, sample.first_sound_ms, result)
 
-    print(f"start {await machine_state()}", flush=True)
     results = await run_scenarios(fixture.cases, args.out, run_case)
     measured = runs[len(runs) - len(results) :]
     totals = MeteredReasoning(inner)
-    for _, reasoning, _ in measured:
+    for reasoning in (scripter, *(reasoning for _, reasoning, _ in measured)):
         pool(totals.ledger, reasoning.ledger)
         for kind, ledger in reasoning.ledgers.items():
             pool(totals.ledgers[kind], ledger)
+        totals.calls += reasoning.calls
+        totals.cancelled += reasoning.cancelled
     samples = [sample for sample, _, _ in measured]
     report(cfg, args, samples, totals)
     report_page(sum((simulated for _, _, simulated in measured), Counter()))
@@ -1659,7 +1777,13 @@ async def run_connect(
     inner: ReasoningClient,
     request: SessionRequest,
 ) -> int:
-    bound_s = 2 * cfg.planner_timeout_s + cfg.scene_timeout_s + SCENE_READY_TIMEOUT_S + 60
+    bound_s = (
+        2 * cfg.planner_timeout_s
+        + cfg.scene_timeout_s
+        + SCENE_READY_TIMEOUT_S
+        + 2 * SCRIPT_TIMEOUT_S
+        + 60
+    )
     total = WARMUP + args.samples
     samples: list[ConnectSample] = []
     simulated: Counter[str] = Counter()
