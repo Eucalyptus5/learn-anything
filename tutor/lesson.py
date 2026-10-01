@@ -154,6 +154,8 @@ class LessonState:
         self.first_answer_done = False
         self.planned_through: str | None = None
         self.scripts: dict[str, list[ScriptChunk]] = {}
+        self.unscripted: set[str] = set()
+        self.scripting: set[str] = set()
         self.asked: set[tuple[str, int]] = set()
         self._cue_id = 0
         self._stale: set[int] = set()
@@ -321,18 +323,22 @@ class LessonState:
     def protected_count(self) -> int:
         if self.plan is None:
             return 0
-        committed = [n for n, s in enumerate(self.plan.scenes, start=1) if s.id in self.committed]
-        return max([self.position().scene, *committed])
+        held = self.committed | self.scripting
+        drawn = [n for n, s in enumerate(self.plan.scenes, start=1) if s.id in held]
+        return max([self.position().scene, *drawn])
+
+    def _window(self) -> list[Scene]:
+        if self.plan is None:
+            return []
+        first = max(self.acked.scene, 1)
+        return self.plan.scenes[first - 1 : first + 1]
 
     def next_to_build(self) -> Scene | None:
-        if self.plan is None:
-            return None
-        first = max(self.acked.scene, 1)
-        for position in range(first, min(first + 1, len(self.plan.scenes)) + 1):
-            scene = self.plan.scenes[position - 1]
-            if scene.id not in self.committed:
-                return scene
-        return None
+        return next((s for s in self._window() if s.id not in self.committed), None)
+
+    def next_to_script(self) -> Scene | None:
+        done = self.scripts.keys() | self.unscripted
+        return next((s for s in self._window() if s.id not in done), None)
 
     def being_taught(self, scene_id: str) -> bool:
         if self.plan is None:

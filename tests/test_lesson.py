@@ -12,6 +12,7 @@ from tutor.lesson import (
     LessonPlan,
     LessonState,
     Scene,
+    ScriptChunk,
     SentCue,
     Step,
     lesson_block,
@@ -548,6 +549,40 @@ def test_the_queue_builds_one_scene_ahead_of_the_acked_scene() -> None:
     state.acknowledge(ack(2, scene_id="scene-2", step=1, revision=2))
     assert state.next_to_build().id == "scene-3"
     assert LessonState().next_to_build() is None
+
+
+def test_next_to_script_follows_the_builders_window() -> None:
+    script = [ScriptChunk(step=1, question=False, text="One step.")]
+    state = three_scenes()
+    state.scripting.add("scene-1")
+    state.committed.add("scene-1")
+    assert state.next_to_script().id == "scene-1"
+    state.scripts["scene-1"] = script
+    assert state.next_to_script().id == "scene-2"
+    state.unscripted.add("scene-2")
+    assert state.next_to_script() is None
+    assert state.scene_tag(1) is None and state.scene_tag(2) is None
+    assert state.next_to_script() is None
+    state.acknowledge(ack(1))
+    assert state.next_to_script() is None
+    state.acknowledge(ack(2, scene_id="scene-2", step=1, revision=2))
+    assert state.next_to_script().id == "scene-3"
+    state.scripts["scene-3"] = script
+    assert state.next_to_script() is None
+    state.unscripted.discard("scene-2")
+    assert state.next_to_script().id == "scene-2"
+    assert LessonState().next_to_script() is None
+
+
+def test_a_scene_whose_script_call_started_is_protected_but_still_built() -> None:
+    state = three_scenes()
+    state.committed.add("scene-1")
+    state.scripting.update({"scene-1", "scene-2"})
+    assert state.protected_count() == 2
+    assert state.next_to_build().id == "scene-2"
+    state.scripting.add("scene-3")
+    assert state.protected_count() == 3
+    assert LessonState().protected_count() == 0
 
 
 def test_a_scene_opened_in_speech_is_being_taught_before_its_ack() -> None:

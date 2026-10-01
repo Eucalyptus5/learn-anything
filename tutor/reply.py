@@ -27,6 +27,7 @@ STRIP = re.compile(
 )
 RIGHT_BRIDGES = ("Yes, that's right.", "Exactly right.", "Right, well done.")
 TELL_ME_BRIDGE = "Sure, here it is."
+NOT_READY = "The next part is not ready yet. Say go on in a moment and we will carry on."
 RECENT = 6
 
 LIVE_PROMPT = """

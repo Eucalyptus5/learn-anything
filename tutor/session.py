@@ -19,6 +19,7 @@ from tutor.lesson import (
     LessonPlan,
     LessonState,
     Scene,
+    ScriptChunk,
     lesson_block,
 )
 from tutor.planner import EMPTY_REPLY, NO_TOOL_CALL, POSITION_REFUSED, plan_prompt, run_planner
@@ -33,6 +34,7 @@ from tutor.reasoning import ReasoningClient, TurnChunk
 from tutor.reply import (
     BRIDGED,
     LIVE_PROMPT,
+    NOT_READY,
     RELAXED,
     STRIP,
     Question,
@@ -44,6 +46,7 @@ from tutor.reply import (
 from tutor.scene import EMPTY_REPLY as EMPTY_REPLY_SCENE
 from tutor.scene import NO_TOOL_CALL as NO_TOOL_CALL_SCENE
 from tutor.scene import draft_paths, planned_scene_prompt, run_scene_build
+from tutor.script import write_script
 from tutor.speech import Chunk, OnPlay, Speaker
 from tutor.tags import Marker, RawTag, TagSplitter, parse_marker, tag_name
 from tutor.tools.models import SearchBudget, SearchResult
@@ -73,7 +76,13 @@ from tutor.visuals import (
 logger = logging.getLogger(__name__)
 
 SearchCall = Callable[[str, Sequence[str], Path, SearchBudget], Awaitable[SearchResult]]
-Item = str | RawTag | Marker | Question
+
+
+class Flush(NamedTuple):
+    pass
+
+
+Item = str | RawTag | Marker | Question | Flush
 Fill = Callable[[asyncio.Queue[Item | None]], Coroutine[Any, Any, None]]
 Grounded = tuple[TurnPrompt, asyncio.Queue[Item | None]]
 
@@ -197,6 +206,10 @@ class TurnLoopConfig(BaseModel):
     planner_effort: str = "high"
     planner_max_tokens: int = Field(default=22000, gt=0)
     planner_timeout_s: float = Field(default=300.0, gt=0)
+    script_model: str = "glm-5.3-flash"
+    script_effort: str = "high"
+    script_max_tokens: int = Field(default=22000, gt=0)
+    script_timeout_s: float = Field(default=300.0, gt=0)
     split: bool = False
 
 
@@ -263,7 +276,10 @@ class TurnLoop:
             self._plan_ready.set()
         self._planner: asyncio.Task[None] | None = None
         self._builder: asyncio.Task[None] | None = None
+        self._scripter: asyncio.Task[None] | None = None
         self._lesson_changed = asyncio.Event()
+        self._scripts_changed = asyncio.Event()
+        self._script_waits = asyncio.Event()
         self._rerun_pending: str | None = None
         self._exposed: dict[str, int] = {}
         self._closing = False
@@ -324,7 +340,7 @@ class TurnLoop:
                 "cursor.scene scene_id=%s n=%d cue_id=%d", head.tag.scene_id, head.tag.n, ack.cue_id
             )
             self._publish()
-            self._lesson_changed.set()
+            self._wake()
             if head.tag.n >= 2:
                 self._rerun("boundary")
             return
@@ -336,7 +352,7 @@ class TurnLoop:
             return
         self._pending_barrier = None
         self._lesson.synced(message)
-        self._lesson_changed.set()
+        self._wake()
         self._settled.set()
         if self._sync_wait is not None:
             self._sync_wait.cancel()
@@ -356,7 +372,7 @@ class TurnLoop:
             logger.info("lesson.checkpoint_ignored epoch=%d", message.epoch)
             return
         self._lesson.retain(message)
-        self._lesson_changed.set()
+        self._wake()
         self._resync("restore")
 
     async def run(self) -> None:
@@ -365,6 +381,9 @@ class TurnLoop:
             self._planner = asyncio.create_task(self._plan(), name="lesson-planner")
             self._planner.add_done_callback(self._planner_done)
             self._builder = asyncio.create_task(self._build_loop(), name="lesson-builder")
+            if self._cfg.split:
+                self._scripter = asyncio.create_task(self._script_loop(), name="lesson-scripter")
+                self._scripter.add_done_callback(self._scripter_done)
         async for event in self._source.events():
             if isinstance(event, SpeechStarted):
                 self._hearing = True
@@ -379,7 +398,9 @@ class TurnLoop:
                 self._dispatch(event.text)
         self._closing = True
         pending = [speculation.task for speculation in self._speculations.values()]
-        pending += [task for task in (self._planner, self._builder) if task is not None]
+        pending += [
+            task for task in (self._planner, self._builder, self._scripter) if task is not None
+        ]
         for task in pending:
             task.cancel()
         await asyncio.gather(*self._turns, *pending, return_exceptions=True)
@@ -455,7 +476,7 @@ class TurnLoop:
         else:
             logger.info("planner.accepted stage=%s scenes=%d", stage, len(self._lesson.plan.scenes))
         self._publish()
-        self._lesson_changed.set()
+        self._wake()
 
     def _rerun(self, stage: str) -> None:
         if not self._cfg.planned or self._closing:
@@ -474,6 +495,11 @@ class TurnLoop:
         if stage is not None:
             self._rerun(stage)
 
+    def _scripter_done(self, task: asyncio.Task[None]) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("script.task_failed error=%s", type(task.exception()).__name__)
+        self._release_script_waits()
+
     def _protected(self) -> int:
         return max(self._lesson.protected_count(), *self._exposed.values(), 0)
 
@@ -481,7 +507,16 @@ class TurnLoop:
         self._lesson.adopt(plan)
         logger.info("lesson.planned scenes=%d", len(plan.scenes))
         self._publish()
+        self._wake()
+
+    def _wake(self) -> None:
         self._lesson_changed.set()
+        self._scripts_changed.set()
+
+    def _release_script_waits(self) -> None:
+        # Replaced, never cleared, so every turn waiting at this moment wakes.
+        self._script_waits.set()
+        self._script_waits = asyncio.Event()
 
     def _publish(self) -> None:
         scenes, current = self._lesson.statuses()
@@ -609,7 +644,9 @@ class TurnLoop:
 
     async def aclose(self) -> None:
         self._closing = True
-        lesson = [task for task in (self._planner, self._builder) if task is not None]
+        lesson = [
+            task for task in (self._planner, self._builder, self._scripter) if task is not None
+        ]
         for task in lesson:
             task.cancel()
         await asyncio.gather(*lesson, return_exceptions=True)
@@ -932,6 +969,8 @@ class TurnLoop:
             item = await anext(items, None)
             if item is None:
                 break
+            if isinstance(item, Flush):
+                continue
             if isinstance(item, RawTag):
                 marker = parse_marker(item)
                 if isinstance(marker, str):
@@ -1046,14 +1085,30 @@ class TurnLoop:
             move, said = "open", False
             if user_text != OPENING_TEXT:
                 move, said = await self._live(turn_id, user_text, at, pending, queue)
-            pieces, _ = direct(self._lesson.plan, self._lesson.scripts, move, at, pending)
-            for piece in pieces:
-                if piece.cue is not None:
-                    await queue.put(piece.cue)
-                await queue.put(" " + piece.text if said else piece.text)
-                said = True
-                if piece.question is not None:
-                    await queue.put(piece.question)
+            queued = 0
+            while True:
+                plan = self._lesson.plan
+                pieces, missing = direct(plan, self._lesson.scripts, move, at, pending)
+                for piece in pieces[queued:]:
+                    if piece.cue is not None:
+                        await queue.put(piece.cue)
+                    await queue.put(" " + piece.text if said else piece.text)
+                    said = True
+                    if piece.question is not None:
+                        await queue.put(piece.question)
+                queued = len(pieces)
+                if missing is None:
+                    break
+                scene_id = plan.scenes[missing.n - 1].id
+                await queue.put(Flush())
+                if scene_id not in self._lesson.unscripted:
+                    logger.info("script.waiting turn_id=%s scene_id=%s", turn_id, scene_id)
+                if await self._script_for(missing.n) is None:
+                    await queue.put(" " + NOT_READY if said else NOT_READY)
+                    logger.info("reply.not_ready turn_id=%s scene_id=%s", turn_id, scene_id)
+                    self._lesson.unscripted.discard(scene_id)
+                    self._scripts_changed.set()
+                    break
         except BaseException:
             if queue.full():
                 queue.get_nowait()
@@ -1142,6 +1197,47 @@ class TurnLoop:
             await chunks.aclose()
             raise
         return label or "other", said
+
+    async def _script_for(self, n: int) -> list[ScriptChunk] | None:
+        while True:
+            scene = self._lesson.scene_at(n)
+            if scene is None or scene.id in self._lesson.unscripted:
+                return None
+            script = self._lesson.scripts.get(scene.id)
+            if script is not None:
+                return script
+            if self._scripter is None or self._scripter.done():
+                return None
+            await self._script_waits.wait()
+
+    async def _script_loop(self) -> None:
+        await self._plan_ready.wait()
+        while True:
+            scene = self._lesson.next_to_script()
+            if scene is None:
+                self._scripts_changed.clear()
+                await self._scripts_changed.wait()
+                continue
+            plan = self._lesson.plan
+            n = [each.id for each in plan.scenes].index(scene.id) + 1
+            self._lesson.scripting.add(scene.id)
+            script = await write_script(
+                self._reasoning,
+                self._cfg.subject,
+                self._cfg.starting_from,
+                plan,
+                n,
+                model=self._cfg.script_model,
+                effort=self._cfg.script_effort,
+                max_tokens=self._cfg.script_max_tokens,
+                timeout_s=self._cfg.script_timeout_s,
+            )
+            if isinstance(script, str):
+                self._lesson.unscripted.add(scene.id)
+                logger.info("script.failed scene_id=%s", scene.id)
+            else:
+                self._lesson.scripts[scene.id] = script
+            self._release_script_waits()
 
     async def _build_loop(self) -> None:
         while True:
