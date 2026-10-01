@@ -242,7 +242,7 @@ class TurnLoop:
         self._pumps: dict[str, asyncio.Task[None]] = {}
         self._stagers: dict[str, asyncio.Task[None]] = {}
         self._staging: dict[str, tuple[asyncio.Queue[Clause | None], asyncio.Event]] = {}
-        self._due: dict[str, dict[int, list[Marker]]] = {}
+        self._due: dict[str, dict[int, list[Marker | Question]]] = {}
         self._played: dict[str, Played] = {}
         self._speculations: dict[str, Speculation] = {}
         self._results: dict[str, list[SearchResult]] = {}
