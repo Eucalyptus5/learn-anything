@@ -5,7 +5,7 @@ const words = [];
 let next = 0;
 for (const word of SENTENCE.split(" ")) {
   words.push([word, Math.round(next * 100) / 100]);
-  next += word.endsWith(",") ? 0.65 : 0.4;
+  next += word.endsWith(",") ? 0.46 : 0.28;
 }
 
 function when(word) {
