@@ -9,6 +9,7 @@ import light, {
   cartHeading,
   refract,
 } from "../../site/lessons/light.js";
+import { GRAPH, arrivals, shortestPath } from "../../site/lessons/route.js";
 import sine, { X0, dot, waveAt } from "../../site/lessons/sine.js";
 
 const ROWS = [
@@ -22,7 +23,31 @@ const ROWS = [
     name: "Light at water",
     sentence: "Light bends at water because it slows there, like a cart with one wheel in sand.",
   },
+  {
+    path: "../../site/lessons/route.js",
+    name: "Maps route",
+    sentence:
+      "A maps app finds the quickest route by exploring outward from you, closest streets first.",
+  },
 ];
+
+const SQUARE = {
+  nodes: [
+    [0, 0],
+    [3, 0],
+    [3, 4],
+    [0, 4],
+  ],
+  edges: [
+    [0, 1],
+    [1, 2],
+    [2, 3],
+    [3, 0],
+    [0, 2],
+  ],
+  start: 0,
+  goal: 2,
+};
 
 const lessons = await Promise.all(
   ROWS.map(async (row) => ({ ...row, lesson: (await import(row.path)).default })),
@@ -38,6 +63,10 @@ function steps(from, to, step) {
   const times = [];
   for (let i = 0; from + i * step < to; i++) times.push(from + i * step);
   return times;
+}
+
+function span(nodes, a, b) {
+  return Math.hypot(nodes[a][0] - nodes[b][0], nodes[a][1] - nodes[b][1]);
 }
 
 test("every lesson says its sentence", () => {
@@ -133,4 +162,67 @@ test("the cart turns only while it straddles", () => {
   }
   const middle = cartHeading((one + done) / 2);
   assert.ok(middle < INCIDENCE && middle > out, `middle of the turn at ${middle}`);
+});
+
+test("arrivals on a square with a diagonal", () => {
+  assert.deepEqual(arrivals(SQUARE), [0, 3, 5, 4]);
+});
+
+test("the diagonal is the shortest path", () => {
+  assert.deepEqual(shortestPath(SQUARE), [0, 2]);
+});
+
+test("an island is unreachable", () => {
+  const island = { ...SQUARE, nodes: [...SQUARE.nodes, [9, 9]] };
+  assert.equal(arrivals(island)[4], Infinity);
+});
+
+test("the lesson graph meets the shortest-path conditions", () => {
+  const { nodes, edges, start } = GRAPH;
+  const arrival = arrivals(GRAPH);
+  assert.equal(arrival[start], 0);
+  arrival.forEach((at, node) => assert.ok(Number.isFinite(at), `node ${node} unreachable`));
+  for (const [a, b] of edges) {
+    const gap = Math.abs(arrival[a] - arrival[b]);
+    assert.ok(gap <= span(nodes, a, b) + 1e-9, `street ${a}-${b}: arrivals ${gap} apart`);
+  }
+  arrival.forEach((at, node) => {
+    if (node === start) return;
+    const reached = edges.some(([a, b]) => {
+      if (a !== node && b !== node) return false;
+      const from = a === node ? b : a;
+      return Math.abs(arrival[from] + span(nodes, a, b) - at) <= 1e-9;
+    });
+    assert.ok(reached, `node ${node} at ${at} has no neighbour it is reached from`);
+  });
+});
+
+test("the lesson path is real and turns", () => {
+  const { nodes, edges, start, goal } = GRAPH;
+  const path = shortestPath(GRAPH);
+  assert.equal(path[0], start);
+  assert.equal(path.at(-1), goal);
+  let total = 0;
+  for (let i = 1; i < path.length; i++) {
+    const [a, b] = [path[i - 1], path[i]];
+    const street = edges.some(([u, v]) => (u === a && v === b) || (u === b && v === a));
+    assert.ok(street, `no street ${a}-${b}`);
+    total += span(nodes, a, b);
+  }
+  const arrival = arrivals(GRAPH)[goal];
+  assert.ok(Math.abs(total - arrival) <= 1e-9, `path ${total}, goal reached at ${arrival}`);
+  const [[x0, y0], [x1, y1]] = [nodes[path[0]], nodes[path[1]]];
+  const off = path.some((node) => {
+    const [x, y] = nodes[node];
+    return Math.abs((x1 - x0) * (y - y0) - (y1 - y0) * (x - x0)) > 1e-9;
+  });
+  assert.ok(off, `path ${path} is one straight line`);
+});
+
+test("the graph is the size the drawing needs", () => {
+  const { nodes } = GRAPH;
+  assert.ok(nodes.length >= 30 && nodes.length <= 45, `${nodes.length} nodes`);
+  for (const [x, y] of nodes) {
+    assert.ok(x >= 12 && x <= 640 - 12 && y >= 12 && y <= 300 - 12, `node at ${x},${y}`);
+  }
 });

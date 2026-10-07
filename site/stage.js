@@ -1,7 +1,8 @@
 import sine from "./lessons/sine.js";
 import light from "./lessons/light.js";
+import route from "./lessons/route.js";
 
-const LESSONS = [sine, light];
+const LESSONS = [sine, light, route];
 const WAIT = 0.6;
 const FADE = 0.8;
 
