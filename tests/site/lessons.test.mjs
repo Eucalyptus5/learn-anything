@@ -73,7 +73,7 @@ test("the dot appears on its word", () => {
   for (const t of [...steps(0, round, 0.1), round - 0.01]) {
     assert.deepEqual(dot(t), rest, `t=${t}`);
   }
-  for (const t of steps(round, when(sine, "watched"), 0.01)) {
+  for (const t of steps(round, sine.length, 0.01)) {
     assert.ok(dot(t).x <= rest.x + 1e-9, `t=${t}: ${dot(t).x} right of ${rest.x}`);
   }
 });
