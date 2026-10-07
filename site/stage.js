@@ -89,8 +89,6 @@ function play(index, at) {
   });
   for (const mark of marks) mark.style.setProperty("--p", "0");
   spans = fill(sentence, scenes[index].answer);
-  // A span inserted and marked said in the same frame skips its fade; settle it unsaid first.
-  void sentence.offsetWidth;
   show();
 }
 
