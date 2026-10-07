@@ -1526,7 +1526,7 @@ async def test_a_seeded_case_skips_the_opening_and_starts_at_its_target(
             assert loop._transcript.latest() == "turn-2"
             assert (lesson.acked, lesson.asked) == (Cursor(scene=1, step=2), {("ratio", 2)})
             assert lesson.opened and lesson.first_answer_done
-            assert lesson.scripts == SCRIPTS and loop._cfg.planned
+            assert lesson.scripts == SCRIPTS
             await asyncio.wait_for(page.wait_frames(lambda: page._epoch == 1), HANG_GUARD_S)
             assert (page._scene_id, page._step, page._revision) == ("ratio", 2, 0)
             heard = await asyncio.wait_for(bench.turn("go on"), HANG_GUARD_S)
@@ -1759,3 +1759,28 @@ async def test_run_fixture_scores_a_scripted_split_case(
         ),
         "verdict: scenarios passed 2/2, not a qualification run",
     ]
+
+
+def test_a_planned_run_without_scenarios_reports_the_split_reply(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sample = bench_turn.Sample(
+        first_sound_ms=900,
+        substance_ms=900,
+        first_content_delta_ms=600,
+        stages=0,
+        silent=True,
+        audio_ms=4000,
+        voice_usd=0.0001,
+        utterance=0,
+    )
+    args = bench_turn.parse_args(["--plan", "p.json"])
+
+    bench_turn.report(CFG, args, [sample], bench_turn.MeteredReasoning(ScriptedReasoning([])))
+
+    lines = capsys.readouterr().out.splitlines()
+    (substance,) = [line for line in lines if line.startswith(f"{'time to substance':34s}")]
+    assert substance == f"{'time to substance':34s} not measured on the split reply"
+    assert "stage sentences before substance not measured on the split reply" in lines
+    assert "silent turns not measured on the split reply" in lines
+    assert not any(re.fullmatch(r"silent turns \d+/\d+", line) for line in lines)

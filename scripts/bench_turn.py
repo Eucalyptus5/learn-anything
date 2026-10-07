@@ -1375,9 +1375,9 @@ def report(
         else:
             summarize(label, values)
 
-    # On the split reply the voice deltas hold only the label and the reaction, so no prepared
-    # chunk is ever read as substance.
-    split = args.scenarios is not None
+    # Every planned run takes the split reply, whose voice deltas hold only the label and the
+    # reaction, so no prepared chunk is ever read as substance.
+    split = planned(args)
     measured(
         "time to first sound", [s.first_sound_ms for s in samples if s.first_sound_ms is not None]
     )
