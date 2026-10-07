@@ -6212,18 +6212,23 @@ async def test_a_planned_scene_is_built_from_the_plan_alone(tmp_path: Path) -> N
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
     page = FakePage(log, ready=READY)
+    held = asyncio.Event()
     reasoning = FakeReasoning(
         log,
-        [],
+        [SEARCH_CALL],
         speaker.received,
+        follow_up=spoken_chunks(FOLLOW_DELTAS),
         plans=[planned_call(LESSON)],
         visual=[draft_call(3)],
         visual_finish="tool_calls",
+        visual_gates=[held],
     )
+    restored = asyncio.Event()
     stop = asyncio.Event()
+    source = ScriptedSource([restored, EndOfTurn(text=USER_TEXT), stop])
     loop = TurnLoop(
         config(tmp_path).model_copy(update={"planned": True}),
-        ScriptedSource([stop]),
+        source,
         FakeSearch(log, found()),
         speaker,
         page,
@@ -6233,12 +6238,20 @@ async def test_a_planned_scene_is_built_from_the_plan_alone(tmp_path: Path) -> N
     loop._lesson.scripts = dict(SCRIPTS)
     running = asyncio.create_task(loop.run())
 
-    await asyncio.wait_for(speaker.finished.wait(), HANG_GUARD_S)
-    await asyncio.wait_for(page.state_where(status_is("ratio", "built")), HANG_GUARD_S)
+    await asyncio.wait_for(reasoning.visual_started.wait(), HANG_GUARD_S)
+    await opening_done(page)
+    page.scene_id, page.step, page.revision = "epochs", 3, 3
+    page.reply({**RESTORE, "scene_id": "epochs", "step": 3})
+    await turn_after(source, restored, "turn-2")
+    held.set()
+    await asyncio.wait_for(page.state_where(status_is("epochs", "built")), HANG_GUARD_S)
     stop.set()
     await asyncio.wait_for(running, HANG_GUARD_S)
     await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
 
+    assert ("search_done", MODEL_QUERY) in log
+    searched = log.index(("search_done", MODEL_QUERY))
+    assert any(kind == "build" for kind, _ in log[searched:])
     assert reasoning.build_prompts
     scenes = {scene.title: scene for scene in LESSON.scenes}
     for prompt in reasoning.build_prompts:
