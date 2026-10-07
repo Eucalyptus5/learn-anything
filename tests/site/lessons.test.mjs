@@ -9,6 +9,7 @@ import light, {
   cartHeading,
   refract,
 } from "../../site/lessons/light.js";
+import { phase } from "../../site/lessons/moon.js";
 import { GRAPH, arrivals, shortestPath } from "../../site/lessons/route.js";
 import sine, { X0, dot, waveAt } from "../../site/lessons/sine.js";
 
@@ -28,6 +29,11 @@ const ROWS = [
     name: "Maps route",
     sentence:
       "A maps app finds the quickest route by exploring outward from you, closest streets first.",
+  },
+  {
+    path: "../../site/lessons/moon.js",
+    name: "Phases of the Moon",
+    sentence: "The Moon's phases are just how much of its sunlit half we can see as it circles us.",
   },
 ];
 
@@ -224,5 +230,41 @@ test("the graph is the size the drawing needs", () => {
   assert.ok(nodes.length >= 30 && nodes.length <= 45, `${nodes.length} nodes`);
   for (const [x, y] of nodes) {
     assert.ok(x >= 12 && x <= 640 - 12 && y >= 12 && y <= 300 - 12, `node at ${x},${y}`);
+  }
+});
+
+test("phase at the quarters", () => {
+  const quarters = [
+    [0, 0],
+    [Math.PI / 2, 0.5],
+    [Math.PI, 1],
+    [(3 * Math.PI) / 2, 0.5],
+  ];
+  for (const [angle, lit] of quarters) {
+    const got = phase(angle).lit;
+    assert.ok(Math.abs(got - lit) <= 1e-12, `angle ${angle}: lit ${got}`);
+  }
+  assert.equal(phase(Math.PI / 2).waxing, true);
+  assert.equal(phase((3 * Math.PI) / 2).waxing, false);
+});
+
+test("lit grows while waxing and shrinks while waning", () => {
+  const waxing = steps(0.01, Math.PI, 0.01);
+  for (let i = 1; i < waxing.length; i++) {
+    const [before, after] = [phase(waxing[i - 1]), phase(waxing[i])];
+    assert.ok(after.lit > before.lit, `angle ${waxing[i]}: ${after.lit} after ${before.lit}`);
+    assert.equal(after.waxing, true, `angle ${waxing[i]}`);
+  }
+  const waning = steps(Math.PI + 0.01, 2 * Math.PI, 0.01);
+  for (let i = 1; i < waning.length; i++) {
+    const [before, after] = [phase(waning[i - 1]), phase(waning[i])];
+    assert.ok(after.lit < before.lit, `angle ${waning[i]}: ${after.lit} after ${before.lit}`);
+    assert.equal(after.waxing, false, `angle ${waning[i]}`);
+  }
+});
+
+test("phase wraps", () => {
+  for (const angle of [0.3, 2, 4.5]) {
+    assert.deepEqual(phase(angle + 2 * Math.PI), phase(angle), `angle ${angle}`);
   }
 });

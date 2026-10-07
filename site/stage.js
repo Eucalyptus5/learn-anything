@@ -1,8 +1,9 @@
 import sine from "./lessons/sine.js";
 import light from "./lessons/light.js";
 import route from "./lessons/route.js";
+import moon from "./lessons/moon.js";
 
-const LESSONS = [sine, light, route];
+const LESSONS = [sine, light, route, moon];
 const WAIT = 0.6;
 const FADE = 0.8;
 
