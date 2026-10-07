@@ -55,16 +55,18 @@ body {
 }
 
 main {
+  --say: clamp(1.75rem, 3.2vw, 3.25rem);
   box-sizing: border-box;
   display: grid;
-  grid-template-columns: 26% 1fr;
+  grid-template-columns: calc(10.6 * var(--say)) 1fr;
   grid-template-rows: auto auto auto 1fr auto;
   grid-template-areas:
-    "brand brand"
-    "voice voice"
-    "say say"
+    "brand draw"
+    "voice draw"
+    "say draw"
     "about draw"
     "about marks";
+  column-gap: 4vw;
   min-height: 100svh;
   max-width: calc(1600px + 10vw);
   margin: 0 auto;
@@ -157,10 +159,8 @@ main {
 
 .sentence {
   grid-area: say;
-  max-width: max(58%, 15em);
-  min-height: 3.75em;
-  margin: 1.1em 0 24px;
-  font: 400 clamp(1.75rem, 3.2vw, 3.25rem) / 1.25 var(--serif);
+  margin: 16px 0 24px;
+  font: 400 var(--say) / 1.25 var(--serif);
   letter-spacing: -0.003em;
   text-wrap: balance;
 }
@@ -211,7 +211,6 @@ main {
   align-self: end;
   max-width: 18em;
   margin: 0;
-  padding-right: 24px;
   color: var(--ink-2);
   font: 15px / 1.5 var(--sans);
 }
@@ -314,7 +313,6 @@ main {
   }
 
   .sentence {
-    max-width: none;
     min-height: 5em;
     margin-bottom: 20px;
     font-size: 1.625rem;
@@ -323,7 +321,6 @@ main {
   .about {
     max-width: none;
     margin-top: 20px;
-    padding-right: 0;
   }
 
   .marks {
