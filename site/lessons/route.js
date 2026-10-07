@@ -130,6 +130,9 @@ export default {
   name: "Maps route",
   words,
   length: 11,
+  asked: "How does my maps app find the fastest way home?",
+  askBack: "So which streets would it check last?",
+  askAt: 6.15,
   build(svg) {
     const doc = svg.ownerDocument;
     const group = doc.createElementNS(NS, "g");

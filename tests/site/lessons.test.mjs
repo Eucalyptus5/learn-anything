@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { FADE, exchange } from "../../site/exchange.js";
 import light, {
   INCIDENCE,
   N,
@@ -18,22 +19,30 @@ const ROWS = [
     path: "../../site/lessons/sine.js",
     name: "Sine wave",
     sentence: "A sine wave is a point going round a circle, watched from the side.",
+    asked: "What actually is a sine wave?",
+    askBack: "So what if the point went round faster?",
   },
   {
     path: "../../site/lessons/light.js",
     name: "Light at water",
     sentence: "Light bends at water because it slows there, like a cart with one wheel in sand.",
+    asked: "Why does a straw look bent in a glass of water?",
+    askBack: "So which way does it bend on the way out?",
   },
   {
     path: "../../site/lessons/route.js",
     name: "Maps route",
     sentence:
       "A maps app finds the quickest route by exploring outward from you, closest streets first.",
+    asked: "How does my maps app find the fastest way home?",
+    askBack: "So which streets would it check last?",
   },
   {
     path: "../../site/lessons/moon.js",
     name: "Phases of the Moon",
     sentence: "The Moon's phases are just how much of its sunlit half we can see as it circles us.",
+    asked: "Why does the Moon change shape?",
+    askBack: "So when it's between us and the Sun, what do we see?",
   },
 ];
 
@@ -55,6 +64,14 @@ const SQUARE = {
   goal: 2,
 };
 
+const FIXTURE = {
+  words: [["A", 0]],
+  length: 11,
+  asked: "Why is the sky blue?",
+  askBack: "So, why?",
+  askAt: 6,
+};
+
 const lessons = await Promise.all(
   ROWS.map(async (row) => ({ ...row, lesson: (await import(row.path)).default })),
 );
@@ -63,6 +80,15 @@ function when(lesson, word) {
   const found = lesson.words.find(([text]) => text === word);
   assert.ok(found, `no word ${word}`);
   return found[1];
+}
+
+function near(got, want, label) {
+  assert.ok(Math.abs(got - want) <= 1e-9, `${label}: ${got}, not ${want}`);
+}
+
+function timed(got, want, label) {
+  assert.deepEqual(got.map(([word]) => word), want.map(([word]) => word), label);
+  got.forEach(([word, at], i) => near(at, want[i][1], `${label} ${word}`));
 }
 
 function steps(from, to, step) {
@@ -90,6 +116,47 @@ test("every lesson's timing is sound", () => {
     }
     assert.ok(lesson.length >= 11 && lesson.length <= 13, `${path}: length ${lesson.length}`);
     assert.ok(lesson.length >= times.at(-1) + 3.4, `${path}: length ${lesson.length}`);
+  }
+});
+
+test("exchange times a fixture lesson", () => {
+  const x = exchange(FIXTURE);
+  near(x.pre, 1.1, "pre");
+  const asked = [
+    ["Why", 0],
+    ["is", 0.12],
+    ["the", 0.24],
+    ["sky", 0.36],
+    ["blue?", 0.48],
+  ];
+  const askBack = [
+    ["So,", 7.5],
+    ["why?", 7.82],
+  ];
+  timed(x.asked, asked, "asked");
+  timed(x.askBack, askBack, "askBack");
+  near(x.listenAt, 8.27, "listenAt");
+  near(x.total, 12.1, "total");
+});
+
+test("every lesson asks and is asked back", () => {
+  for (const { path, asked, askBack, lesson } of lessons) {
+    assert.equal(lesson.asked, asked, path);
+    assert.equal(lesson.askBack, askBack, path);
+  }
+});
+
+test("the question back waits for the answer", () => {
+  for (const { path, lesson } of lessons) {
+    const last = lesson.words.at(-1)[1];
+    assert.ok(lesson.askAt >= last + 2, `${path}: asks back at ${lesson.askAt}`);
+  }
+});
+
+test("the question back leaves time to listen", () => {
+  for (const { path, lesson } of lessons) {
+    const x = exchange(lesson);
+    assert.ok(x.listenAt + 1 <= x.total - FADE, `${path}: listens at ${x.listenAt} of ${x.total}`);
   }
 });
 

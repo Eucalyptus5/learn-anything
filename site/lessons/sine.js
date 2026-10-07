@@ -52,6 +52,9 @@ export default {
   name: "Sine wave",
   words,
   length: 11,
+  asked: "What actually is a sine wave?",
+  askBack: "So what if the point went round faster?",
+  askAt: 6.65,
   build(svg) {
     const doc = svg.ownerDocument;
     const group = doc.createElementNS(NS, "g");

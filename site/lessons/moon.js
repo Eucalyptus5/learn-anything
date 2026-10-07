@@ -85,7 +85,10 @@ function seen(x, y, r, angle) {
 export default {
   name: "Phases of the Moon",
   words,
-  length: 11,
+  length: 12.85,
+  asked: "Why does the Moon change shape?",
+  askBack: "So when it's between us and the Sun, what do we see?",
+  askAt: 7.85,
   build(svg) {
     const doc = svg.ownerDocument;
     const group = doc.createElementNS(NS, "g");
