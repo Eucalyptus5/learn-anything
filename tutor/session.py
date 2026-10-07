@@ -1103,6 +1103,8 @@ class TurnLoop:
                 if scene_id not in self._lesson.unscripted:
                     logger.info("script.waiting turn_id=%s scene_id=%s", turn_id, scene_id)
                 if await self._script_for(missing.n) is None:
+                    if self._closing:
+                        break
                     await queue.put(" " + NOT_READY if said else NOT_READY)
                     logger.info("reply.not_ready turn_id=%s scene_id=%s", turn_id, scene_id)
                     self._lesson.unscripted.discard(scene_id)
@@ -1220,23 +1222,31 @@ class TurnLoop:
             plan = self._lesson.plan
             n = [each.id for each in plan.scenes].index(scene.id) + 1
             self._lesson.scripting.add(scene.id)
-            script = await write_script(
-                self._reasoning,
-                self._cfg.subject,
-                self._cfg.starting_from,
-                plan,
-                n,
-                model=self._cfg.script_model,
-                effort=self._cfg.script_effort,
-                max_tokens=self._cfg.script_max_tokens,
-                timeout_s=self._cfg.script_timeout_s,
-            )
-            if isinstance(script, str):
+            # The error returns as a value, so only its type is logged; a cancel still propagates.
+            (error,) = await asyncio.gather(self._script(plan, n), return_exceptions=True)
+            if isinstance(error, BaseException):
                 self._lesson.unscripted.add(scene.id)
-                logger.info("script.failed scene_id=%s", scene.id)
-            else:
-                self._lesson.scripts[scene.id] = script
+                logger.error("script.failed scene_id=%s error=%s", scene.id, type(error).__name__)
             self._release_script_waits()
+
+    async def _script(self, plan: LessonPlan, n: int) -> None:
+        scene_id = plan.scenes[n - 1].id
+        script = await write_script(
+            self._reasoning,
+            self._cfg.subject,
+            self._cfg.starting_from,
+            plan,
+            n,
+            model=self._cfg.script_model,
+            effort=self._cfg.script_effort,
+            max_tokens=self._cfg.script_max_tokens,
+            timeout_s=self._cfg.script_timeout_s,
+        )
+        if isinstance(script, str):
+            self._lesson.unscripted.add(scene_id)
+            logger.info("script.failed scene_id=%s", scene_id)
+        else:
+            self._lesson.scripts[scene_id] = script
 
     async def _build_loop(self) -> None:
         while True:

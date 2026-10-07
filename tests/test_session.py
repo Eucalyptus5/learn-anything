@@ -686,7 +686,8 @@ class FakeReasoning:
                 gate = self._script_gates.popleft() if self._script_gates else None
             else:
                 chunks, gate = [TurnChunk(kind="spoken", text="")], asyncio.Event()
-            stream = FakeStream(chunks, self._log, self._received, gate, raises=self._script_raises)
+            raises, self._script_raises = self._script_raises, None
+            stream = FakeStream(chunks, self._log, self._received, gate, raises=raises)
             stream.finish_reason = "tool_calls" if chunks else "stop"
             self.script_streams.append(stream)
             self.script_started.set()
@@ -7872,7 +7873,7 @@ async def test_aclose_ends_the_scripter() -> None:
     ]
 
 
-async def test_a_turn_waiting_on_a_scripter_that_raised_speaks_not_ready(
+async def test_a_script_call_that_raises_counts_as_a_failed_script(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     log: list[tuple[str, object]] = []
@@ -7883,13 +7884,16 @@ async def test_a_turn_waiting_on_a_scripter_that_raised_speaks_not_ready(
         log,
         [],
         speaker.received,
+        turns=[spoken_chunks(["go_on"])],
         plans=[planned_call(LESSON)],
-        scripts=[spoken_chunks([""])],
+        scripts=[spoken_chunks([""]), script_call("ratio")],
         script_gates=[gate],
         script_raises=RuntimeError("the script call broke"),
     )
+    first = asyncio.Event()
     stop = asyncio.Event()
-    loop = split_loop(log, ScriptedSource([stop]), speaker, reasoning, page, scripts={})
+    source = ScriptedSource([first, EndOfTurn(text="go on"), stop])
+    loop = split_loop(log, source, speaker, reasoning, page, scripts={"clip": SCRIPTS["clip"]})
 
     with caplog.at_level(logging.INFO, logger="tutor.session"):
         with line_seen("script.waiting turn_id=turn-1 scene_id=ratio") as waiting:
@@ -7899,18 +7903,61 @@ async def test_a_turn_waiting_on_a_scripter_that_raised_speaks_not_ready(
         scripter = scripter_task()
         gate.set()
         await asyncio.wait_for(asyncio.wait([opening]), HANG_GUARD_S)
+        await turn_after(source, first, "turn-2")
+        assert not scripter.done()
         stop.set()
         await asyncio.wait_for(running, HANG_GUARD_S)
         await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
 
-    assert isinstance(scripter.exception(), RuntimeError)
+    assert speaker.utterances == [NOT_READY_SAID, PREPARED_OPENING]
+    messages = session_messages(caplog)
+    assert messages.count("script.failed scene_id=ratio error=RuntimeError") == 1
+    failed = messages.index("script.failed scene_id=ratio error=RuntimeError")
+    assert failed < messages.index("reply.not_ready turn_id=turn-1 scene_id=ratio")
+    assert not [message for message in messages if message.startswith("script.task_failed")]
+    assert scripted_titles(reasoning) == ["The ratio"] * 2
+    assert "rejected" not in reasoning.script_prompts[1].user_text
+    assert loop._lesson.scripts["ratio"] == SCRIPTS["ratio"] and loop._lesson.unscripted == set()
+
+
+async def test_a_scripter_that_fails_outside_the_script_call_still_speaks_not_ready(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broke = RuntimeError("the window broke")
+
+    def window(state: LessonState) -> Scene | None:
+        raise broke
+
+    monkeypatch.setattr(LessonState, "next_to_script", window)
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log)
+    reasoning = FakeReasoning(log, [], speaker.received, plans=[planned_call(LESSON)])
+    stop = asyncio.Event()
+    loop = split_loop(log, ScriptedSource([stop]), speaker, reasoning, page, scripts={})
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        with line_seen("script.waiting turn_id=turn-1 scene_id=ratio") as waiting:
+            running = asyncio.create_task(loop.run())
+            await asyncio.wait_for(waiting.wait(), HANG_GUARD_S)
+        opening = turn_task("turn-1")
+        await asyncio.wait_for(asyncio.wait([opening]), HANG_GUARD_S)
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+
+    assert loop._scripter is not None and loop._scripter.exception() is broke
+    assert reasoning.script_prompts == []
     assert speaker.utterances == [NOT_READY_SAID]
     messages = session_messages(caplog)
     assert "script.task_failed error=RuntimeError" in messages
+    assert not [message for message in messages if message.startswith("script.failed")]
     assert "reply.not_ready turn_id=turn-1 scene_id=ratio" in messages
 
 
-async def test_a_source_that_ends_during_the_opening_wait_ends_run() -> None:
+async def test_a_source_that_ends_during_the_opening_wait_ends_run(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     log: list[tuple[str, object]] = []
     speaker = FakeSpeaker(log)
     page = FakePage(log)
@@ -7926,16 +7973,53 @@ async def test_a_source_that_ends_during_the_opening_wait_ends_run() -> None:
     stop = asyncio.Event()
     loop = split_loop(log, ScriptedSource([stop]), speaker, reasoning, page, scripts={})
 
-    with line_seen("script.waiting turn_id=turn-1 scene_id=ratio") as waiting:
-        running = asyncio.create_task(loop.run())
-        await asyncio.wait_for(waiting.wait(), HANG_GUARD_S)
-    scripter = scripter_task()
-    stop.set()
-    await asyncio.wait_for(running, HANG_GUARD_S)
-    await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        with line_seen("script.waiting turn_id=turn-1 scene_id=ratio") as waiting:
+            running = asyncio.create_task(loop.run())
+            await asyncio.wait_for(waiting.wait(), HANG_GUARD_S)
+        scripter = scripter_task()
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
 
     assert scripter.cancelled() and not gate.is_set()
     assert "ratio" not in loop._lesson.scripts
+    assert spoken_texts(speaker) == []
+    closing = ("reply.not_ready", "script.failed")
+    assert not [message for message in session_messages(caplog) if message.startswith(closing)]
+
+
+async def test_aclose_during_the_opening_wait_speaks_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[tuple[str, object]] = []
+    speaker = FakeSpeaker(log)
+    page = FakePage(log)
+    reasoning = FakeReasoning(
+        log,
+        [],
+        speaker.received,
+        plans=[planned_call(LESSON)],
+        scripts=[script_call("ratio")],
+        script_gates=[asyncio.Event()],
+    )
+    stop = asyncio.Event()
+    loop = split_loop(log, ScriptedSource([stop]), speaker, reasoning, page, scripts={})
+
+    with caplog.at_level(logging.INFO, logger="tutor.session"):
+        with line_seen("script.waiting turn_id=turn-1 scene_id=ratio") as waiting:
+            running = asyncio.create_task(loop.run())
+            await asyncio.wait_for(waiting.wait(), HANG_GUARD_S)
+        opening = turn_task("turn-1")
+        scripter = scripter_task()
+        await asyncio.wait_for(loop.aclose(), HANG_GUARD_S)
+        stop.set()
+        await asyncio.wait_for(running, HANG_GUARD_S)
+
+    assert scripter.cancelled() and opening.done()
+    assert spoken_texts(speaker) == []
+    closing = ("reply.not_ready", "script.failed")
+    assert not [message for message in session_messages(caplog) if message.startswith(closing)]
 
 
 async def test_a_barge_in_cancels_the_script_wait_and_not_the_scripter() -> None:
