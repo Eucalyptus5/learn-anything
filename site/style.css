@@ -1,0 +1,231 @@
+@font-face {
+  font-family: "Learn Serif";
+  src: url("fonts/learn-serif-regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Learn Serif";
+  src: url("fonts/learn-serif-bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --page: #e6e7ea;
+  --ground: #f4f4f5;
+  --spot: #ffffff;
+  --ink: #17181b;
+  --ink-2: #5f6368;
+  --accent: #0e7c73;
+  --hair: color-mix(in srgb, var(--ink) 20%, transparent);
+  --serif: "Learn Serif", Charter, "Iowan Old Style", Georgia, serif;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page: #0d0e11;
+    --ground: #121316;
+    --spot: #17181c;
+    --ink: #ebeae6;
+    --ink-2: #a6aab2;
+    --accent: #63d3c4;
+    color-scheme: dark;
+  }
+}
+
+html {
+  background: var(--page);
+}
+
+body {
+  margin: 0;
+  color: var(--ink);
+  background: radial-gradient(
+    ellipse 60% 70% at 62% 60%,
+    var(--spot) 0%,
+    var(--ground) 58%,
+    var(--page) 100%
+  );
+}
+
+main {
+  box-sizing: border-box;
+  display: grid;
+  grid-template-columns: 26% 1fr;
+  grid-template-rows: auto auto 1fr auto;
+  grid-template-areas:
+    "brand brand"
+    "say say"
+    "about draw"
+    "about marks";
+  min-height: 100svh;
+  max-width: calc(1600px + 10vw);
+  margin: 0 auto;
+  padding: clamp(24px, 4.5vw, 64px) 5vw;
+}
+
+.brand {
+  grid-area: brand;
+  margin: 0 0 clamp(24px, 5vw, 80px);
+  font: 700 17px / 1.25 var(--serif);
+  letter-spacing: 0.01em;
+}
+
+.sentence {
+  grid-area: say;
+  max-width: 58%;
+  min-height: 2.5em;
+  margin: 0 0 24px;
+  font: 400 clamp(1.75rem, 3.2vw, 3.25rem) / 1.25 var(--serif);
+  letter-spacing: -0.003em;
+  text-wrap: balance;
+}
+
+.sentence span {
+  opacity: 0;
+  transition: opacity 250ms ease;
+}
+
+.sentence span.said {
+  opacity: 1;
+}
+
+.sentence.still span {
+  transition: none;
+}
+
+.drawing {
+  grid-area: draw;
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 140px;
+  contain: size;
+}
+
+.about {
+  grid-area: about;
+  align-self: end;
+  max-width: 18em;
+  margin: 0;
+  padding-right: 24px;
+  color: var(--ink-2);
+  font: 15px / 1.5 var(--sans);
+}
+
+.marks {
+  grid-area: marks;
+  justify-self: end;
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.mark {
+  width: 28px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 2px;
+  cursor: pointer;
+  background:
+    linear-gradient(var(--accent), var(--accent)) left center / calc(var(--p, 0) * 100%) 2px
+      no-repeat,
+    linear-gradient(var(--hair), var(--hair)) center / 100% 2px no-repeat;
+}
+
+.mark:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.construct,
+.result {
+  fill: none;
+  vector-effect: non-scaling-stroke;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.construct {
+  stroke: var(--ink);
+  stroke-opacity: 0.3;
+  stroke-width: 1.25;
+}
+
+.result {
+  stroke: var(--accent);
+  stroke-width: 2.25;
+}
+
+.dash {
+  stroke-dasharray: 3 4;
+}
+
+.point,
+.lit {
+  fill: var(--accent);
+}
+
+.faint {
+  fill: var(--ink);
+  fill-opacity: 0.06;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (width < 700px) {
+  body {
+    background: radial-gradient(
+      ellipse 80% 60% at 50% 55%,
+      var(--spot) 0%,
+      var(--ground) 58%,
+      var(--page) 100%
+    );
+  }
+
+  main {
+    grid-template-columns: 100%;
+    grid-template-rows: auto auto 1fr auto auto;
+    grid-template-areas: "brand" "say" "draw" "about" "marks";
+    padding: 20px;
+  }
+
+  .brand {
+    margin-bottom: 28px;
+  }
+
+  .sentence {
+    max-width: none;
+    min-height: 3.75em;
+    margin-bottom: 20px;
+    font-size: 1.625rem;
+  }
+
+  .about {
+    max-width: none;
+    margin-top: 20px;
+    padding-right: 0;
+  }
+
+  .marks {
+    justify-self: start;
+    margin-top: 12px;
+  }
+}
