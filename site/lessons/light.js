@@ -123,10 +123,11 @@ export default {
     for (const [offset, opacity] of [[0, 0], [0.2, 1], [0.8, 1], [1, 0]]) {
       make("stop", { offset, "stop-opacity": opacity }, ends);
     }
-    // Alpha masks read only stop-opacity, so the fades carry no colour. The waterline fades
-    // only along x, as the sea's fade does on the line, so the trail it carries stays whole.
+    // Alpha masks read only stop-opacity, so the fades carry no colour.
     const sea = make("mask", { id: "light-sea", "mask-type": "alpha" }, defs);
     make("rect", { width: 640, height: 300, fill: "url(#light-fade)" }, sea);
+    // In user space because the line alone has a zero-height box; it fades only along x,
+    // so the trail it carries, between x 308 and 500, is never faded.
     const edge = make(
       "mask",
       { id: "light-edge", "mask-type": "alpha", maskUnits: "userSpaceOnUse" },
