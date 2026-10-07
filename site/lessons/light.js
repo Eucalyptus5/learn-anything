@@ -119,12 +119,29 @@ export default {
     const fade = make("radialGradient", { id: "light-fade", cy: WATER / 300 }, defs);
     make("stop", { offset: 0.6, "stop-opacity": 1 }, fade);
     make("stop", { offset: 1, "stop-opacity": 0 }, fade);
-    // An alpha mask reads only stop-opacity, so the fade carries no colour.
-    const mask = make("mask", { id: "light-shore", "mask-type": "alpha" }, defs);
-    make("rect", { width: 640, height: 300, fill: "url(#light-fade)" }, mask);
-    const shore = make("g", { mask: "url(#light-shore)" });
-    make("rect", { class: "faint", x: 0, y: WATER, width: 640, height: 300 - WATER }, shore);
-    make("line", { class: "construct", x1: 0, y1: WATER, x2: 640, y2: WATER }, shore);
+    const ends = make("linearGradient", { id: "light-ends" }, defs);
+    for (const [offset, opacity] of [[0, 0], [0.2, 1], [0.8, 1], [1, 0]]) {
+      make("stop", { offset, "stop-opacity": opacity }, ends);
+    }
+    // Alpha masks read only stop-opacity, so the fades carry no colour. The waterline fades
+    // only along x, as the sea's fade does on the line, so the trail it carries stays whole.
+    const sea = make("mask", { id: "light-sea", "mask-type": "alpha" }, defs);
+    make("rect", { width: 640, height: 300, fill: "url(#light-fade)" }, sea);
+    const edge = make(
+      "mask",
+      { id: "light-edge", "mask-type": "alpha", maskUnits: "userSpaceOnUse" },
+      defs,
+    );
+    make("rect", { width: 640, height: 300, fill: "url(#light-ends)" }, edge);
+    const tint = make("rect", {
+      class: "faint",
+      mask: "url(#light-sea)",
+      x: 0,
+      y: WATER,
+      width: 640,
+      height: 300 - WATER,
+    });
+    const shore = make("path", { class: "construct", mask: "url(#light-edge)" });
     const normal = make("line", {
       class: "construct dash",
       x1: CROSS.x,
@@ -164,6 +181,7 @@ export default {
     svg.append(group);
 
     return (t) => {
+      tint.setAttribute("opacity", appear(t, 0));
       shore.setAttribute("opacity", appear(t, 0));
       normal.setAttribute("opacity", appear(t, BENDS));
 
@@ -185,7 +203,12 @@ export default {
         path.push(`A${radius},${radius} 0 0 1 ${xy(cartAt(Math.min(t, STRAIGHTEN)))}`);
       }
       if (t > STRAIGHTEN) path.push(`L${xy(center)}`);
-      trail.setAttribute("d", path.join(" "));
+      // A path paints its crossings once; two faint strokes would stack into a darker knot.
+      // The trail joins the waterline once its fade-in ends, while it is still above the line.
+      const joined = t >= CART + APPEAR;
+      const level = `M0,${WATER} L640,${WATER}`;
+      shore.setAttribute("d", joined ? `${level} ${path.join(" ")}` : level);
+      trail.setAttribute("d", joined ? "" : path.join(" "));
       trail.setAttribute("opacity", appear(t, CART));
     };
   },
