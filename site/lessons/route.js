@@ -13,7 +13,7 @@ function when(word) {
   return words.find(([text]) => text === word)[1];
 }
 
-const MAPS = when("A");
+const GRID_START = when("A");
 const EXPLORING = when("exploring");
 
 export const GRAPH = {
@@ -82,7 +82,7 @@ export function shortestPath(graph) {
 const { nodes: NODES, edges: EDGES } = GRAPH;
 const ARRIVAL = arrivals(GRAPH);
 const PATH = shortestPath(GRAPH);
-const GOAL = ARRIVAL[GRAPH.goal];
+const GOAL_DISTANCE = ARRIVAL[GRAPH.goal];
 
 const FLOOD = 3.65;
 const REACH = EXPLORING + FLOOD;
@@ -96,7 +96,7 @@ const LEFT = Math.min(...XS);
 const RIGHT = Math.max(...XS);
 
 function sketched(x) {
-  return MAPS + ((x - LEFT) / (RIGHT - LEFT)) * (EXPLORING - MAPS - DRAW);
+  return GRID_START + ((x - LEFT) / (RIGHT - LEFT)) * (EXPLORING - GRID_START - DRAW);
 }
 
 const STREETS = EDGES.map(([a, b]) => {
@@ -140,8 +140,7 @@ export default {
       return element;
     };
 
-    const grid = make("g", {});
-    const streets = STREETS.map(() => make("line", { class: "construct" }, grid));
+    const grid = make("path", { class: "construct" });
     const flood = make("g", {});
     const fills = EDGES.map(() => [
       make("line", { class: "result" }, flood),
@@ -156,11 +155,16 @@ export default {
     svg.append(group);
 
     return (t) => {
-      STREETS.forEach(({ from, to, at }, i) => stretch(streets[i], from, to, ramp(t, at, DRAW)));
+      const sketch = [];
+      for (const { from, to, at } of STREETS) {
+        const share = ramp(t, at, DRAW);
+        if (share > 0) sketch.push(`M${xy(from)} L${xy(along(from, to, share))}`);
+      }
+      grid.setAttribute("d", sketch.join(" "));
       ring.setAttribute("opacity", ramp(t, sketched(goalX), APPEAR));
       you.setAttribute("opacity", ramp(t, sketched(startX), APPEAR));
 
-      const front = GOAL * ramp(t, EXPLORING, FLOOD);
+      const front = GOAL_DISTANCE * ramp(t, EXPLORING, FLOOD);
       EDGES.forEach(([a, b], i) => {
         const length = span(NODES, a, b);
         stretch(fills[i][0], NODES[a], NODES[b], ramp(front, ARRIVAL[a], length));
@@ -168,7 +172,7 @@ export default {
       });
       flood.setAttribute("opacity", 1 - ramp(t, REACH, YIELD));
 
-      const traced = GOAL * ramp(t, REACH, YIELD);
+      const traced = GOAL_DISTANCE * ramp(t, REACH, YIELD);
       const legs = [];
       for (let i = 1; i < PATH.length; i++) {
         const [a, b] = [PATH[i - 1], PATH[i]];
