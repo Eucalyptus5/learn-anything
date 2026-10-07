@@ -1,3 +1,4 @@
+import { FADE, SWAP, exchange } from "./exchange.js";
 import sine from "./lessons/sine.js";
 import light from "./lessons/light.js";
 import route from "./lessons/route.js";
@@ -5,23 +6,32 @@ import moon from "./lessons/moon.js";
 
 const LESSONS = [sine, light, route, moon];
 const WAIT = 0.6;
-const FADE = 0.8;
+const TAIL = 0.25;
+const RAMP = 0.25;
 
+const main = document.querySelector("main");
 const svg = document.querySelector(".drawing");
 const sentence = document.querySelector(".sentence");
+const you = document.querySelector(".you");
+const tutor = document.querySelector(".tutor");
+const question = you.querySelector(".asked");
 const reduce = matchMedia("(prefers-reduced-motion: reduce)");
 
 let mode = reduce.matches ? "reduce" : "play";
 let current = 0;
-let t = -WAIT;
+let s = -WAIT;
+let heard = [];
 let spans = [];
+let shown = null;
 let prev = null;
 
 const scenes = LESSONS.map((lesson) => {
   const pose = lesson.build(svg);
   const group = svg.lastElementChild;
   group.style.display = "none";
-  return { lesson, pose, group };
+  const timeline = exchange(lesson);
+  const answer = lesson.words.map(([word, at]) => [word, timeline.pre + at]);
+  return { lesson, pose, group, answer, ...timeline };
 });
 
 const marks = LESSONS.map((lesson, index) => {
@@ -38,25 +48,44 @@ const list = document.createElement("ol");
 list.className = "sr-only";
 for (const lesson of LESSONS) {
   const item = document.createElement("li");
-  item.textContent = lesson.words.map(([word]) => word).join(" ");
+  const answer = lesson.words.map(([word]) => word).join(" ");
+  item.textContent = `You: ${lesson.asked} Tutor: ${answer} Tutor: ${lesson.askBack}`;
   list.append(item);
 }
 sentence.after(list);
 
-function finished(index) {
-  return LESSONS[index].length - FADE;
+function clamp(value, low, high) {
+  return Math.min(high, Math.max(low, value));
 }
 
-function play(index, at) {
-  current = index;
-  t = at;
-  spans = LESSONS[index].words.map(([word]) => {
+function finished(index) {
+  return scenes[index].total - FADE;
+}
+
+function fill(element, words) {
+  const made = words.map(([word]) => {
     const span = document.createElement("span");
     span.textContent = word;
     return span;
   });
-  sentence.classList.toggle("still", mode !== "play");
-  sentence.replaceChildren(...spans.flatMap((span, i) => (i === 0 ? [span] : [" ", span])));
+  element.replaceChildren(...made.flatMap((span, i) => (i === 0 ? [span] : [" ", span])));
+  return made;
+}
+
+function reveal(made, words) {
+  made.forEach((span, i) => span.classList.toggle("said", s > words[i][1]));
+}
+
+function talking(words) {
+  return s > words[0][1] && s < words.at(-1)[1] + TAIL;
+}
+
+function play(index, at) {
+  current = index;
+  s = at;
+  shown = null;
+  heard = fill(question, scenes[index].asked);
+  main.classList.toggle("still", mode !== "play");
   scenes.forEach((scene, i) => {
     scene.group.style.display = i === index ? "" : "none";
   });
@@ -65,23 +94,39 @@ function play(index, at) {
 }
 
 function show() {
-  const { lesson, pose, group } = scenes[current];
-  pose(t);
-  spans.forEach((span, i) => span.classList.toggle("said", t > lesson.words[i][1]));
-  const fade = String(Math.min(1, Math.max(0, (lesson.length - t) / FADE)));
-  group.style.opacity = fade;
-  sentence.style.opacity = fade;
-  marks[current].style.setProperty("--p", String(mode === "reduce" ? 1 : t / lesson.length));
+  const { lesson, pose, group, pre, asked, answer, askBack, listenAt, total } = scenes[current];
+  const turn = pre + lesson.askAt;
+  const back = mode !== "reduce" && s >= turn + SWAP;
+  const words = back ? askBack : answer;
+  if (words !== shown) {
+    shown = words;
+    spans = fill(sentence, words);
+    // A span inserted and marked said in the same frame skips its fade; settle it unsaid first.
+    void sentence.offsetWidth;
+  }
+  pose(clamp(s - pre, 0, lesson.length));
+  reveal(heard, asked);
+  reveal(spans, words);
+  const fade = clamp((total - s) / FADE, 0, 1);
+  const giving = back || mode === "reduce" ? 1 : clamp((turn + SWAP - s) / SWAP, 0, 1);
+  group.style.opacity = String(fade);
+  sentence.style.opacity = String(Math.min(fade, giving));
+  you.style.opacity = String(Math.min(fade, clamp(s / RAMP, 0, 1)));
+  tutor.style.opacity = String(Math.min(fade, clamp((s - pre) / RAMP, 0, 1)));
+  you.classList.toggle("talking", talking(asked));
+  you.classList.toggle("listening", mode !== "reduce" && s >= listenAt);
+  tutor.classList.toggle("talking", talking(answer) || talking(askBack));
+  marks[current].style.setProperty("--p", String(mode === "reduce" ? 1 : s / total));
 }
 
 function tick(dt) {
-  if (t < 0) {
-    t += dt;
-    if (t >= 0) play(0, 0);
+  if (s < 0) {
+    s += dt;
+    if (s >= 0) play(0, 0);
     return;
   }
-  t += dt;
-  if (t < LESSONS[current].length) show();
+  s += dt;
+  if (s < scenes[current].total) show();
   else play((current + 1) % LESSONS.length, 0);
 }
 
@@ -103,7 +148,7 @@ reduce.addEventListener("change", () => {
 
 const freeze = /^#(\d+)@(\d*\.?\d+)$/.exec(location.hash);
 const frozen = freeze === null ? -1 : Number(freeze[1]) - 1;
-if (frozen >= 0 && frozen < LESSONS.length && Number(freeze[2]) <= LESSONS[frozen].length) {
+if (frozen >= 0 && frozen < LESSONS.length && Number(freeze[2]) <= scenes[frozen].total) {
   mode = "freeze";
   play(frozen, Number(freeze[2]));
 } else if (mode === "reduce") {
