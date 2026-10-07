@@ -21,8 +21,8 @@ const CIRCLES = when("circles");
 const TAU = 2 * Math.PI;
 
 export function phase(angle) {
-  const turn = ((angle % TAU) + TAU) % TAU;
-  return { lit: (1 - Math.cos(turn)) / 2, waxing: turn > 0 && turn < Math.PI };
+  const fromNew = ((angle % TAU) + TAU) % TAU;
+  return { lit: (1 - Math.cos(fromNew)) / 2, waxing: fromNew > 0 && fromNew < Math.PI };
 }
 
 const EARTH = { x: 200, y: 150 };

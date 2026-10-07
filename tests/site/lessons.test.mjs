@@ -249,17 +249,17 @@ test("phase at the quarters", () => {
 });
 
 test("lit grows while waxing and shrinks while waning", () => {
-  const waxing = steps(0.01, Math.PI, 0.01);
-  for (let i = 1; i < waxing.length; i++) {
-    const [before, after] = [phase(waxing[i - 1]), phase(waxing[i])];
-    assert.ok(after.lit > before.lit, `angle ${waxing[i]}: ${after.lit} after ${before.lit}`);
-    assert.equal(after.waxing, true, `angle ${waxing[i]}`);
+  const rising = steps(0.01, Math.PI, 0.01);
+  for (let i = 1; i < rising.length; i++) {
+    const [before, after] = [phase(rising[i - 1]), phase(rising[i])];
+    assert.ok(after.lit > before.lit, `angle ${rising[i]}: ${after.lit} after ${before.lit}`);
+    assert.equal(after.waxing, true, `angle ${rising[i]}`);
   }
-  const waning = steps(Math.PI + 0.01, 2 * Math.PI, 0.01);
-  for (let i = 1; i < waning.length; i++) {
-    const [before, after] = [phase(waning[i - 1]), phase(waning[i])];
-    assert.ok(after.lit < before.lit, `angle ${waning[i]}: ${after.lit} after ${before.lit}`);
-    assert.equal(after.waxing, false, `angle ${waning[i]}`);
+  const falling = steps(Math.PI + 0.01, 2 * Math.PI, 0.01);
+  for (let i = 1; i < falling.length; i++) {
+    const [before, after] = [phase(falling[i - 1]), phase(falling[i])];
+    assert.ok(after.lit < before.lit, `angle ${falling[i]}: ${after.lit} after ${before.lit}`);
+    assert.equal(after.waxing, false, `angle ${falling[i]}`);
   }
 });
 
