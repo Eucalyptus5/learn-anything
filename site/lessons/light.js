@@ -16,7 +16,7 @@ const LIGHT = when("Light");
 const BENDS = when("bends");
 const SLOWS = when("slows");
 const CART = when("cart");
-const ONE = when("one");
+const STRADDLE = when("one");
 
 export const N = 1.33;
 export const INCIDENCE = (50 * Math.PI) / 180;
@@ -51,14 +51,14 @@ const CART_SPEED = 18;
 const SWIVEL = (CART_SPEED * (1 - 1 / N)) / AXLE;
 const SWIVEL_RADIUS = (CART_SPEED * (1 + 1 / N)) / 2 / SWIVEL;
 // The trailing wheel reaches the line just as the heading reaches Snell's angle.
-const STRAIGHTEN = ONE + (INCIDENCE - REFRACTED) / SWIVEL;
+const STRAIGHTEN = STRADDLE + (INCIDENCE - REFRACTED) / SWIVEL;
 const LANDING = { x: 420, y: WATER - (AXLE / 2) * IN.x };
 const WHEEL = { long: 13, wide: 6 };
 
 const APPEAR = 0.25;
 
 export function cartHeading(t) {
-  return Math.max(REFRACTED, INCIDENCE - SWIVEL * Math.max(0, t - ONE));
+  return Math.max(REFRACTED, INCIDENCE - SWIVEL * Math.max(0, t - STRADDLE));
 }
 
 function rayAt(time) {
@@ -71,8 +71,8 @@ function rayAt(time) {
 }
 
 function cartAt(t) {
-  if (t <= ONE) {
-    const run = CART_SPEED * (t - ONE);
+  if (t <= STRADDLE) {
+    const run = CART_SPEED * (t - STRADDLE);
     return { x: LANDING.x + run * IN.x, y: LANDING.y + run * IN.y };
   }
   const heading = cartHeading(t);
@@ -179,8 +179,8 @@ export default {
       cart.setAttribute("transform", `translate(${xy(center)}) rotate(${degrees.toFixed(3)})`);
       cart.setAttribute("opacity", appear(t, CART));
 
-      const path = [`M${xy(TRAIL)} L${xy(cartAt(Math.min(t, ONE)))}`];
-      if (t > ONE) {
+      const path = [`M${xy(TRAIL)} L${xy(cartAt(Math.min(t, STRADDLE)))}`];
+      if (t > STRADDLE) {
         const radius = SWIVEL_RADIUS.toFixed(2);
         path.push(`A${radius},${radius} 0 0 1 ${xy(cartAt(Math.min(t, STRAIGHTEN)))}`);
       }
