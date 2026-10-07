@@ -804,13 +804,11 @@ class Bench:
         capture: Capture | None = None,
         scripts: dict[str, list[ScriptChunk]] | None = None,
         seed: Seed | None = None,
-        split: bool = False,
     ) -> "Bench":
         reasoning = MeteredReasoning(inner, plan, stub_scenes)
         transport = BenchTransport(models.synth)
         source = ScriptedSource()
         loop = build_loop(cfg, models, reasoning, source, transport, request, planned=planned)
-        loop._cfg = loop._cfg.model_copy(update={"split": split})
         lesson = loop._lesson
         if scripts is not None:
             lesson.scripts = dict(scripts)
@@ -929,11 +927,10 @@ class TagRead(NamedTuple):
 
 
 def classify_tags(
-    reply: str, spoken: list[str], state: LessonState, learner_spoke: bool, sentence_rule: bool
+    reply: str, spoken: list[str], state: LessonState, sentence_rule: bool
 ) -> TagRead:
     ends = ".?!" if sentence_rule else ".?!;:,"
     probe = copy.deepcopy(state)
-    probe.begin_turn(learner_spoke)
     splitter = TagSplitter()
     items = [*splitter.feed(reply), *splitter.finish()]
     tags: list[str] = []
@@ -1061,7 +1058,7 @@ def tag_checks(tags: list[str], scenario: Scenario) -> tuple[bool, bool, bool]:
 def evaluate_scenario(
     reply: str, spoken: list[str], state: LessonState, scenario: Scenario, sentence_rule: bool
 ) -> ScenarioResult:
-    read = classify_tags(reply, spoken, state, scenario.learner is not None, sentence_rule)
+    read = classify_tags(reply, spoken, state, sentence_rule)
     said = " ".join(spoken).strip()
     asked = None
     if scenario.question:
@@ -1130,7 +1127,6 @@ def replay(plan: LessonPlan, case: Scenario) -> Seed:
     state.adopt(plan)
     history: list[tuple[str, str]] = []
     for turn in case.setup:
-        state.begin_turn(turn.learner is not None)
         splitter = TagSplitter()
         items = [*splitter.feed(turn.reply), *splitter.finish()]
         for item in items:
@@ -1698,7 +1694,6 @@ async def run_fixture(
             args.stub_scenes,
             scripts=scripts,
             seed=seed,
-            split=True,
         )
         state = LessonState()
         state.adopt(plan)

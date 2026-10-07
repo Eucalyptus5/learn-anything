@@ -267,13 +267,11 @@ def test_a_new_state_has_no_position_until_the_page_opens_a_scene() -> None:
     assert empty.plan is None and empty.acked == Cursor() and empty.revision == 0
     assert empty.current() is None and empty.statuses() == ([], None)
     assert empty.step_tag(2) == "no_plan" and empty.scene_tag(1) == "no_plan"
-    assert empty.dropped == ["<step 2>: no_plan", "<scene 1>: no_plan"]
     state = three_scenes()
     assert state.acked == Cursor() and state.sent == [] and state.checkpoint is None
     assert state.current().id == "scene-1" and state.next_scene().id == "scene-2"
     assert state.step_tag(2) == "not_open"
     assert state.scene_tag(2) == "not_next"
-    assert state.dropped == ["<step 2>: not_open", "<scene 2>: not_next"]
 
 
 def test_scene_one_opens_by_its_tag_and_the_cursor_moves_only_on_the_ack() -> None:
@@ -302,15 +300,17 @@ def test_a_step_tag_must_rise_past_what_was_acked_or_sent_and_stay_in_range(capl
         assert state.step_tag(2) == "not_rising"
         assert state.step_tag(3) == REPEAT
     assert state.acked == Cursor(scene=1, step=1)
-    assert state.dropped == ["<step 4>: past_end", "<step 2>: not_rising"]
-    assert "step.dropped scene_id=scene-1 n=4 reason=past_end" in caplog.messages
+    assert [message for message in caplog.messages if message.startswith("step.")] == [
+        "step.dropped scene_id=scene-1 n=4 reason=past_end",
+        "step.dropped scene_id=scene-1 n=2 reason=not_rising",
+    ]
 
 
 def test_a_step_tag_naming_the_current_step_sends_and_drops_nothing(caplog) -> None:
     state = scene_one_open()
     with caplog.at_level(logging.INFO, logger="tutor.lesson"):
         assert state.step_tag(1) == REPEAT
-        assert state.sent == [] and state.dropped == []
+        assert state.sent == []
         assert state.scene_tag(2) is None
         assert state.step_tag(1) == REPEAT
         assert state.step_tag(3) is None
@@ -318,96 +318,56 @@ def test_a_step_tag_naming_the_current_step_sends_and_drops_nothing(caplog) -> N
         assert [cue.tag for cue in state.sent] == [SceneCue(n=2, scene_id="scene-2"), StepCue(n=3)]
         assert state.step_tag(2) == "not_rising"
     assert state.position() == Cursor(scene=2, step=3)
-    assert state.dropped == ["<step 2>: not_rising"]
     assert [message for message in caplog.messages if message.startswith("step.")] == [
         "step.dropped scene_id=scene-2 n=2 reason=not_rising"
     ]
 
 
-def test_a_step_tag_at_the_cursor_step_with_no_plan_or_no_open_scene_is_still_dropped() -> None:
+def test_a_step_tag_at_the_cursor_step_with_no_plan_or_no_open_scene_is_still_dropped(
+    caplog,
+) -> None:
     empty = LessonState()
     empty.acked = Cursor(scene=1, step=1)
-    assert empty.step_tag(1) == "no_plan"
     beyond = three_scenes()
     beyond.acked = Cursor(scene=4, step=1)
-    assert beyond.step_tag(1) == "not_open"
-    assert empty.dropped == ["<step 1>: no_plan"] and beyond.dropped == ["<step 1>: not_open"]
+    with caplog.at_level(logging.INFO, logger="tutor.lesson"):
+        assert empty.step_tag(1) == "no_plan"
+        assert beyond.step_tag(1) == "not_open"
+    assert [message for message in caplog.messages if message.startswith("step.")] == [
+        "step.dropped scene_id=None n=1 reason=no_plan",
+        "step.dropped scene_id=None n=1 reason=not_open",
+    ]
 
 
-def test_an_asking_step_opens_as_the_first_advance_of_a_turn_with_learner_text(caplog) -> None:
+def test_an_asking_step_is_taken_like_any_other_step(caplog) -> None:
     state = scene_one_open(3, steps=4)
     assert state.step_tag(2) is None
-    state.begin_turn(True)
     with caplog.at_level(logging.INFO, logger="tutor.lesson"):
         assert state.step_tag(3) is None
         assert state.step_tag(3) == REPEAT
         assert state.step_tag(4) is None
     assert [cue.tag for cue in state.sent] == [StepCue(n=2), StepCue(n=3), StepCue(n=4)]
-    assert state.dropped == [] and not any(m.startswith("step.") for m in caplog.messages)
+    assert not any(m.startswith("step.") for m in caplog.messages)
 
 
-def test_an_asking_step_is_refused_until_the_turn_after_its_question(caplog) -> None:
-    unturned = scene_one_open(2)
-    silent = scene_one_open(2)
-    silent.begin_turn(False)
-    advanced = scene_one_open(3)
-    advanced.begin_turn(True)
-    assert advanced.step_tag(2) is None
-    jumped = scene_one_open(3)
-    jumped.begin_turn(True)
-    skipped = scene_one_open(2, 4, steps=5)
-    skipped.begin_turn(True)
-    assert skipped.step_tag(2) is None
-    with caplog.at_level(logging.INFO, logger="tutor.lesson"):
-        assert unturned.step_tag(2) == "not_answered"
-        assert silent.step_tag(2) == "not_answered"
-        assert silent.step_tag(3) == "not_answered"
-        assert advanced.step_tag(3) == "not_answered"
-        assert jumped.step_tag(3) == "not_answered"
-        assert skipped.step_tag(5) == "not_answered"
-    assert unturned.dropped == ["<step 2>: not_answered"]
-    assert silent.dropped == ["<step 2>: not_answered", "<step 3>: not_answered"]
-    assert advanced.dropped == jumped.dropped == ["<step 3>: not_answered"]
-    assert skipped.dropped == ["<step 5>: not_answered"]
-    assert unturned.sent == silent.sent == jumped.sent == []
-    assert unturned.position() == silent.position() == jumped.position() == Cursor(scene=1, step=1)
-    assert advanced.position() == skipped.position() == Cursor(scene=1, step=2)
-    assert "step.dropped scene_id=scene-1 n=2 reason=not_answered" in caplog.messages
-    assert "step.dropped scene_id=scene-1 n=5 reason=not_answered" in caplog.messages
-
-
-def test_a_step_that_does_not_ask_is_taken_in_any_turn() -> None:
-    state = scene_one_open(3, steps=5)
-    assert state.step_tag(2) is None
-    state.begin_turn(True)
-    assert state.step_tag(3) is None
-    assert state.step_tag(4) is None
-    state.begin_turn(False)
-    assert state.step_tag(5) is None
-    assert state.position() == Cursor(scene=1, step=5) and state.dropped == []
-
-
-def test_told_the_rest_the_answered_step_opens_and_the_next_ask_still_waits(caplog) -> None:
+def test_told_the_rest_every_step_past_both_asks_is_accepted(caplog) -> None:
     state = scene_one_open(2, 4, steps=5)
-    state.begin_turn(True)
     with caplog.at_level(logging.INFO, logger="tutor.lesson"):
         assert state.step_tag(2) is None
         assert state.step_tag(3) is None
-        assert state.step_tag(4) == "not_answered"
-        assert state.step_tag(5) == "not_answered"
-        assert state.position() == Cursor(scene=1, step=3)
+        assert state.step_tag(4) is None
+        assert state.step_tag(5) is None
+        assert state.position() == Cursor(scene=1, step=5)
         assert state.scene_tag(2) is None
-    assert state.dropped == ["<step 4>: not_answered", "<step 5>: not_answered"]
     assert [cue.tag for cue in state.sent] == [
         StepCue(n=2),
         StepCue(n=3),
+        StepCue(n=4),
+        StepCue(n=5),
         SceneCue(n=2, scene_id="scene-2"),
     ]
     assert state.position() == Cursor(scene=2, step=1)
-    assert [m for m in caplog.messages if m.startswith(("step.", "scene."))] == [
-        "step.dropped scene_id=scene-1 n=4 reason=not_answered",
-        "step.dropped scene_id=scene-1 n=5 reason=not_answered",
-    ]
+    assert [m for m in caplog.messages if m.startswith(("step.", "scene."))] == []
 
 
 def test_a_scene_tag_names_the_next_scene_only(caplog) -> None:
@@ -443,11 +403,6 @@ def test_a_dropped_head_takes_every_later_cue_with_it(caplog) -> None:
         state.acknowledge(ack(3, outcome="dropped", reason="stale_revision"))
         state.acknowledge(ack(4, outcome="dropped", reason="stale_revision"))
     assert not any(m.startswith("lesson.ack_unknown") for m in caplog.messages)
-    assert state.dropped == [
-        "<step 2>: range",
-        "<step 3>: stale_revision",
-        "<scene 2>: stale_revision",
-    ]
     assert state.acked == Cursor(scene=1, step=1) and state.revision == 1 and not state.resync
     assert state.step_tag(2) is None and state.sent[-1].revision == 1
 
@@ -458,7 +413,6 @@ def test_a_failed_cue_waits_for_the_checkpoint_the_page_sends_after_it() -> None
     assert state.step_tag(2) is None
     state.acknowledge(ack(2, outcome="failed", reason="runtime"))
     assert state.sent == [] and state.acked == Cursor(scene=1, step=1) and state.resync
-    assert state.dropped == ["<step 2>: runtime"]
     restored = LessonCheckpoint(epoch=1, scene_id="scene-1", version=0, step=1, revision=2)
     state.retain(restored)
     assert state.checkpoint == restored and state.resync
@@ -499,7 +453,6 @@ def test_the_barrier_clears_the_overlay_and_the_page_names_the_position() -> Non
         LessonSynced(epoch=1, barrier=1, scene_id="scene-1", step=2, revision=2, last_cue=2)
     )
     assert state.sent == [] and state.acked == Cursor(scene=1, step=2) and state.revision == 2
-    assert state.dropped == []
     assert state.step_tag(3) is None and state.sent[-1].revision == 2
 
 
@@ -628,12 +581,12 @@ def test_a_rerun_keeps_the_larger_of_the_prefix_it_was_shown_and_the_live_one(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     fresh = LessonState()
-    assert fresh.accept(LessonPlan.model_validate(plan(3)), 0, 0) is None
+    assert fresh.accept(LessonPlan.model_validate(plan(3)), 0) is None
     assert fresh.plan is not None
     state = three_scenes()
     state.committed.add("scene-1")
     reshaped = LessonPlan.model_validate({**plan(3), "scenes": [scene(1), scene(7), scene(8)]})
-    assert state.accept(reshaped, 1, 0) is None and state.plan == reshaped
+    assert state.accept(reshaped, 1) is None and state.plan == reshaped
     assert state.scene_tag(1) is None and state.scene_tag(2) is None
     assert state.protected_count() == 2
     touched = LessonPlan.model_validate({**plan(3), "scenes": [scene(1), scene(9), scene(8)]})
@@ -641,13 +594,15 @@ def test_a_rerun_keeps_the_larger_of_the_prefix_it_was_shown_and_the_live_one(
     shorter = LessonPlan.model_validate({**plan(1), "scenes": [scene(1)]})
     crowded = LessonPlan.model_validate({**plan(12), "scenes": [scene(n) for n in range(20, 32)]})
     with caplog.at_level(logging.INFO, logger="tutor.lesson"):
-        assert state.accept(touched, 2, 0) is None
+        assert state.accept(touched, 2) is None
         assert [s.id for s in state.plan.scenes] == ["scene-1", "scene-7", "scene-9", "scene-8"]
-        assert state.accept(third, 2, 3) is None
+        state.scripting.add("scene-9")
+        assert state.accept(third, 2) is None
         assert [s.id for s in state.plan.scenes] == ["scene-1", "scene-7", "scene-9", "scene-5"]
-        assert state.accept(shorter, 2, 0) is None
+        state.scripting.clear()
+        assert state.accept(shorter, 2) is None
         assert [s.id for s in state.plan.scenes] == ["scene-1", "scene-7"]
-        assert state.accept(crowded, 2, 0) == "splice_invalid"
+        assert state.accept(crowded, 2) == "splice_invalid"
         assert [s.id for s in state.plan.scenes] == ["scene-1", "scene-7"]
     assert [m for m in caplog.messages if m.startswith("lesson.prefix_touched")] == [
         "lesson.prefix_touched reason=committed_changed",
@@ -659,7 +614,7 @@ def test_a_rerun_keeps_the_larger_of_the_prefix_it_was_shown_and_the_live_one(
 
 
 def test_the_block_without_a_plan_asks_for_words_and_no_tags() -> None:
-    text = lesson_block(LessonState(), learner_spoke=True, dropped=[])
+    text = lesson_block(LessonState(), learner_spoke=True)
     assert text == NO_PLAN
     assert "no lesson plan yet" in text and "write no tags" in text and text.isascii()
 
@@ -667,7 +622,7 @@ def test_the_block_without_a_plan_asks_for_words_and_no_tags() -> None:
 def test_the_block_lists_every_title_marks_the_current_scene_and_numbers_the_steps() -> None:
     state = opened()
     state.opened = True
-    text = lesson_block(state, learner_spoke=True, dropped=[])
+    text = lesson_block(state, learner_spoke=True)
     assert text.startswith("Profile: Knows policy gradients.")
     assert "1. Scene 1 (now)\n2. Scene 2\n3. Scene 3" in text
     assert "Current scene, 1 of 3: Scene 1." in text
@@ -686,17 +641,17 @@ def test_the_block_lists_every_title_marks_the_current_scene_and_numbers_the_ste
 
 def test_the_block_directs_the_opening_and_a_learner_who_spoke_first() -> None:
     state = three_scenes()
-    opening = lesson_block(state, learner_spoke=False, dropped=[])
+    opening = lesson_block(state, learner_spoke=False)
     assert "There is no learner text" in opening and "Open scene one" in opening
     assert "write <scene 1> at the start of the sentence where it opens" in opening
     assert "<scene 1> and its <step 1> open the same picture" in opening
     assert "The page has not opened a scene yet." in opening
     assert "1. Scene 1 (now)" in opening
-    spoke = lesson_block(state, learner_spoke=True, dropped=[])
+    spoke = lesson_block(state, learner_spoke=True)
     assert "spoke before the lesson was ready" in spoke and "open scene one" in spoke
     assert "Answer what they said in a sentence" in spoke
     state.opened = True
-    missed = lesson_block(state, learner_spoke=True, dropped=[])
+    missed = lesson_block(state, learner_spoke=True)
     assert "Scene one is not open yet" in missed and "write <scene 1>" in missed
 
 
@@ -705,7 +660,7 @@ def test_the_block_asks_before_an_asking_step_and_closes_a_scene_and_the_lesson(
     state.opened = True
     assert state.step_tag(2) is None
     state.acknowledge(ack(2, step=2, revision=2))
-    text = lesson_block(state, learner_spoke=True, dropped=[])
+    text = lesson_block(state, learner_spoke=True)
     assert "The next step, 3, asks first: Where does the band sit?" in text
     assert "put it with no tag and stop" in text and "write <step 3>" in text
     assert "Its tag is held back until the learner has answered." in text
@@ -713,10 +668,9 @@ def test_the_block_asks_before_an_asking_step_and_closes_a_scene_and_the_lesson(
     assert "open the next scene in the same breath: write <scene 2>" in text
     assert "writing the tag of every step you narrate; <scene 2> and its <step 1> open" in text
     assert "asked to be told" in text and "without questions" in text
-    state.begin_turn(True)
     assert state.step_tag(3) is None
     state.acknowledge(ack(3, step=3, revision=3))
-    done = lesson_block(state, learner_spoke=True, dropped=[])
+    done = lesson_block(state, learner_spoke=True)
     assert "This scene is done" in done and "write <scene 2>" in done
     assert "by the same rules; <scene 2> and its <step 1> open the same picture." in done
     assert state.scene_tag(2) is None
@@ -725,10 +679,9 @@ def test_the_block_asks_before_an_asking_step_and_closes_a_scene_and_the_lesson(
     state.acknowledge(ack(5, scene_id="scene-3", step=1, revision=5))
     assert state.step_tag(2) is None
     state.acknowledge(ack(6, scene_id="scene-3", step=2, revision=6))
-    state.begin_turn(True)
     assert state.step_tag(3) is None
     state.acknowledge(ack(7, scene_id="scene-3", step=3, revision=7))
-    last = lesson_block(state, learner_spoke=True, dropped=[])
+    last = lesson_block(state, learner_spoke=True)
     assert "last scene" in last and "close the lesson" in last and "<scene" not in last
     assert "3. Scene 3 (now)" in last and "Next scene" not in last
 
@@ -740,28 +693,26 @@ def test_the_opening_ask_boundary_and_plain_directives_carry_the_same_tag_rules(
     assert "until the learner has answered" in TAG_RULES
     fresh = three_scenes()
     blocks = {
-        "There is no learner text": lesson_block(fresh, learner_spoke=False, dropped=[]),
-        "spoke before the lesson was ready": lesson_block(fresh, learner_spoke=True, dropped=[]),
+        "There is no learner text": lesson_block(fresh, learner_spoke=False),
+        "spoke before the lesson was ready": lesson_block(fresh, learner_spoke=True),
     }
     fresh.opened = True
-    blocks["Scene one is not open yet"] = lesson_block(fresh, learner_spoke=True, dropped=[])
+    blocks["Scene one is not open yet"] = lesson_block(fresh, learner_spoke=True)
     state = opened()
     state.opened = True
-    blocks["The next step, 2, does not ask"] = lesson_block(state, learner_spoke=True, dropped=[])
+    blocks["The next step, 2, does not ask"] = lesson_block(state, learner_spoke=True)
     assert state.step_tag(2) is None
-    blocks["If the scene ends first"] = lesson_block(state, learner_spoke=True, dropped=[])
-    state.begin_turn(True)
+    blocks["If the scene ends first"] = lesson_block(state, learner_spoke=True)
     assert state.step_tag(3) is None
-    blocks["This scene is done"] = lesson_block(state, learner_spoke=True, dropped=[])
+    blocks["This scene is done"] = lesson_block(state, learner_spoke=True)
     assert state.scene_tag(2) is None and state.scene_tag(3) is None and state.step_tag(2) is None
-    blocks["or until the scene ends."] = lesson_block(state, learner_spoke=True, dropped=[])
+    blocks["or until the scene ends."] = lesson_block(state, learner_spoke=True)
     for lead, text in blocks.items():
         assert lead in text, lead
         assert text.endswith(TAG_RULES) and text.count(TAG_RULES) == 1, lead
         assert "start at 2" not in text and "never written" not in text, lead
-    state.begin_turn(True)
     assert state.step_tag(3) is None
-    last = lesson_block(state, learner_spoke=True, dropped=[])
+    last = lesson_block(state, learner_spoke=True)
     assert "close the lesson" in last and TAG_RULES not in last and TAG_RULES not in NO_PLAN
 
 
@@ -770,7 +721,7 @@ def test_the_ask_directive_in_the_last_scene_opens_no_scene() -> None:
     state.opened = True
     assert state.scene_tag(2) is None and state.scene_tag(3) is None
     assert state.step_tag(2) is None
-    text = lesson_block(state, learner_spoke=True, dropped=[])
+    text = lesson_block(state, learner_spoke=True)
     assert "3. Scene 3 (now)" in text
     assert "The next step, 3, asks first: Where does the band sit?" in text
     assert "put it with no tag and stop" in text
@@ -782,7 +733,7 @@ def test_the_block_reads_the_position_with_tags_already_sent() -> None:
     state = opened()
     state.opened = True
     assert state.step_tag(2) is None
-    text = lesson_block(state, learner_spoke=True, dropped=[])
+    text = lesson_block(state, learner_spoke=True)
     assert "The page shows scene 1 at step 1 of 3." in text
     assert "The next step, 3, asks first" in text
 
@@ -790,28 +741,18 @@ def test_the_block_reads_the_position_with_tags_already_sent() -> None:
 def test_the_block_shows_the_drawn_say_lines_or_says_the_board_is_blank() -> None:
     state = opened()
     state.opened = True
-    unbuilt = lesson_block(state, learner_spoke=True, dropped=[])
+    unbuilt = lesson_block(state, learner_spoke=True)
     assert "The board is blank for this scene" in unbuilt and "still write the step tags" in unbuilt
     state.built["scene-1"] = BuiltScene(
         scene_id="scene-1", version=1, say=["The axes", "The curve", "The band"], html="<p>x</p>"
     )
-    text = lesson_block(state, learner_spoke=True, dropped=[])
+    text = lesson_block(state, learner_spoke=True)
     assert "what each step shows, as drawn:\n1. The axes\n2. The curve\n3. The band" in text
     assert "blank" not in text
     del state.built["scene-1"]
     state.failed.add("scene-1")
-    failed = lesson_block(state, learner_spoke=True, dropped=[])
+    failed = lesson_block(state, learner_spoke=True)
     assert "not coming" in failed and "blank" in failed
-
-
-def test_the_block_names_the_tags_dropped_from_the_last_reply() -> None:
-    state = opened()
-    state.opened = True
-    text = lesson_block(
-        state, learner_spoke=True, dropped=["<step 4>: past_end", "<set>: unsupported"]
-    )
-    assert "Tags dropped from your last reply: <step 4>: past_end; <set>: unsupported." in text
-    assert "Tags dropped" not in lesson_block(state, learner_spoke=True, dropped=[])
 
 
 def test_done_is_the_last_scenes_last_step() -> None:

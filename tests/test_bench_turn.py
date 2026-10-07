@@ -645,7 +645,6 @@ def state_at(scene: int, step: int) -> LessonState:
             )
         )
     for n in range(2, step + 1):
-        state.begin_turn(True)
         assert state.step_tag(n) is None
         revision += 1
         state.acknowledge(
@@ -687,7 +686,7 @@ def scenario(
 def test_classify_tags_reads_validity_drops_placement_and_leaks() -> None:
     reply = "<scene 1>The ratio compares two policies. <step 2>At one action<step 3> it is one. <set lr 0.9>"
     spoken = ["The ratio compares two policies.", "At one action it is one."]
-    read = bench_turn.classify_tags(reply, spoken, WATCHED_STATE, False, sentence_rule=False)
+    read = bench_turn.classify_tags(reply, spoken, WATCHED_STATE, sentence_rule=False)
     assert read == bench_turn.TagRead(
         tags=["scene 1", "step 2", "step 3", "set"],
         valid=False,
@@ -702,17 +701,17 @@ def test_classify_tags_reads_validity_drops_placement_and_leaks() -> None:
 
 def test_a_step_tag_naming_the_current_step_is_neither_listed_nor_dropped() -> None:
     reply = "<scene 1> <step 1>Three bars. <step 2>Then one moves."
-    read = bench_turn.classify_tags(reply, [], WATCHED_STATE, False, sentence_rule=True)
+    read = bench_turn.classify_tags(reply, [], WATCHED_STATE, sentence_rule=True)
     assert (read.tags, read.valid, read.dropped) == (["scene 1", "step 2"], True, {})
     assert read.placement_errors == 0
     held = bench_turn.classify_tags(
-        "<step 2>Then one moves <step 2>and settles.", [], state_at(1, 1), True, sentence_rule=True
+        "<step 2>Then one moves <step 2>and settles.", [], state_at(1, 1), sentence_rule=True
     )
     assert (held.tags, held.valid, held.dropped) == (["step 2"], True, {})
     assert held.placement_errors == 1
     assert (held.cues, held.cue_placement_errors) == (["step 2"], 0)
     below = bench_turn.classify_tags(
-        "<step 3>It settles. <step 2>Again.", [], state_at(1, 1), True, sentence_rule=True
+        "<step 3>It settles. <step 2>Again.", [], state_at(1, 1), sentence_rule=True
     )
     assert (below.tags, below.valid, below.dropped) == (
         ["step 3", "step 2"],
@@ -725,24 +724,14 @@ def test_a_step_tag_naming_the_current_step_is_neither_listed_nor_dropped() -> N
 def test_a_tag_after_a_comma_is_misplaced_only_under_the_sentence_rule() -> None:
     reply = "<scene 1>The ratio, <step 2>compared at one action."
     spoken = ["The ratio,", "compared at one action."]
-    assert (
-        bench_turn.classify_tags(reply, spoken, STATE, False, sentence_rule=False).placement_errors
-        == 0
-    )
-    assert (
-        bench_turn.classify_tags(reply, spoken, STATE, False, sentence_rule=True).placement_errors
-        == 1
-    )
+    assert bench_turn.classify_tags(reply, spoken, STATE, sentence_rule=False).placement_errors == 0
+    assert bench_turn.classify_tags(reply, spoken, STATE, sentence_rule=True).placement_errors == 1
 
 
 def test_placement_is_read_where_the_reply_wrote_each_tag() -> None:
     reply = '<scene 1><step 2>It falls, <draw t = label "x > 1">then rises<step 2> again.'
-    assert (
-        bench_turn.classify_tags(reply, [], STATE, False, sentence_rule=False).placement_errors == 1
-    )
-    assert (
-        bench_turn.classify_tags(reply, [], STATE, False, sentence_rule=True).placement_errors == 2
-    )
+    assert bench_turn.classify_tags(reply, [], STATE, sentence_rule=False).placement_errors == 1
+    assert bench_turn.classify_tags(reply, [], STATE, sentence_rule=True).placement_errors == 2
 
 
 @pytest.mark.parametrize(
@@ -774,14 +763,14 @@ def test_placement_is_read_where_the_reply_wrote_each_tag() -> None:
 def test_placement_as_seen_is_read_where_each_cue_lands_in_the_speech(
     reply: str, cues: list[str], strict: int, seen: int
 ) -> None:
-    read = bench_turn.classify_tags(reply, [], state_at(2, 1), True, sentence_rule=True)
+    read = bench_turn.classify_tags(reply, [], state_at(2, 1), sentence_rule=True)
     assert read.cues == cues
     assert (read.placement_errors, read.cue_placement_errors) == (strict, seen)
 
 
 def test_any_tag_text_in_the_spoken_stream_is_a_leak() -> None:
     read = bench_turn.classify_tags(
-        "<scene 1>Hi.", ["<scene 1>Hi.", "<set lr", "<STEP 2>"], STATE, False, sentence_rule=False
+        "<scene 1>Hi.", ["<scene 1>Hi.", "<set lr", "<STEP 2>"], STATE, sentence_rule=False
     )
     assert read.leaked == 3
 
@@ -791,7 +780,6 @@ def test_closing_tag_text_in_the_spoken_stream_is_a_leak() -> None:
         "<step 3>Why is it dishonest?</step 3></scene 3>",
         ["Why is it dishonest?</step 3></scene 3>", "</Draw>"],
         STATE,
-        False,
         sentence_rule=False,
     )
     assert (read.tags, read.leaked) == (["step 3"], 3)
@@ -799,36 +787,10 @@ def test_closing_tag_text_in_the_spoken_stream_is_a_leak() -> None:
 
 def test_a_malformed_tag_is_counted_under_its_name_alone() -> None:
     read = bench_turn.classify_tags(
-        "<Step 2>Hi. <step2>There.", ["Hi.", "There."], STATE, False, sentence_rule=False
+        "<Step 2>Hi. <step2>There.", ["Hi.", "There."], STATE, sentence_rule=False
     )
     assert read.tags == ["step", "step"] and read.dropped == {"step:malformed": 2}
     assert read.cues == []
-
-
-def test_the_asking_step_is_refused_without_learner_text_and_taken_with_it() -> None:
-    reply = "<step 2>They agree at one."
-    silent = bench_turn.classify_tags(reply, [], state_at(1, 1), False, sentence_rule=True)
-    assert (silent.tags, silent.valid, silent.dropped) == (
-        ["step 2"],
-        False,
-        {"step:not_answered": 1},
-    )
-    spoke = bench_turn.classify_tags(reply, [], state_at(1, 1), True, sentence_rule=True)
-    assert (spoke.tags, spoke.valid, spoke.dropped) == (["step 2"], True, {})
-
-
-def test_a_scenario_takes_learner_text_from_its_case() -> None:
-    reply = "<step 2>They agree at one."
-    spoken = ["They agree at one."]
-    answered = scenario("answer", Cursor(scene=1, step=1), [["step 2"]])
-    unprompted = scenario("answer", Cursor(scene=1, step=1), [["step 2"]], learner=None)
-    state = state_at(1, 1)
-    taken = bench_turn.evaluate_scenario(reply, spoken, state, answered, sentence_rule=True)
-    refused = bench_turn.evaluate_scenario(reply, spoken, state, unprompted, sentence_rule=True)
-    assert (taken.tags_valid, taken.dropped, taken.passed) == (True, {}, True)
-    assert (refused.tags, refused.tags_valid, refused.passed) == (["step 2"], False, False)
-    assert refused.dropped == {"step:not_answered": 1}
-    assert state.sent == []
 
 
 QUESTION = {"question": True, "terms": ["ratio", "agree"], "reveal_forbidden": ["step 2"]}
@@ -958,12 +920,12 @@ def test_a_scenario_passes_only_when_every_applicable_check_holds(
         pytest.param(
             scenario("opening", Cursor(), [["scene 1"]]),
             (0, 0),
-            "<scene 1>Start with the ratio. <step 2>They agree at one.",
+            "<scene 1>Start with the ratio. <step 4>They agree at one.",
             ["Start with the ratio.", "They agree at one."],
-            ("tags", ["scene 1", "step 2"]),
+            ("tags", ["scene 1", "step 4"]),
             ["scene 1"],
             True,
-            id="asking-step-with-no-learner-text",
+            id="step-past-the-scenes-end",
         ),
         pytest.param(
             scenario("progress", Cursor(scene=2, step=1), [["step 2"]]),
@@ -1016,11 +978,11 @@ def test_a_scenario_passes_only_when_every_applicable_check_holds(
             id="leak",
         ),
         pytest.param(
-            scenario("answer", Cursor(scene=1, step=1), [["step 2"]], learner=None),
-            (1, 1),
-            "<step 2>They agree at one.",
-            ["They agree at one."],
-            ("dropped", {"step:not_answered": 1}),
+            scenario("progress", Cursor(scene=2, step=3), [["step 2"]]),
+            (2, 3),
+            "<step 2>The band sits at 0.8 and 1.2.",
+            ["The band sits at 0.8 and 1.2."],
+            ("dropped", {"step:not_rising": 1}),
             [],
             False,
             id="required-tag-refused",
@@ -1066,8 +1028,8 @@ def test_a_scenario_passes_only_when_every_applicable_check_holds(
             id="reveal-forbidden-cue",
         ),
         pytest.param(
-            scenario("question", Cursor(scene=1, step=1), [[]], **QUESTION, learner=None),
-            (1, 1),
+            scenario("question", Cursor(scene=1, step=3), [[]], **QUESTION),
+            (1, 3),
             "<step 2>They agree where the ratio is one. Where do they agree, and what is the ratio?",
             ["They agree where the ratio is one.", "Where do they agree, and what is the ratio?"],
             ("reveal_ok", False),
@@ -1192,9 +1154,9 @@ def test_replay_reaches_each_target_and_refuses_a_bad_setup() -> None:
         "progress",
         Cursor(scene=1, step=3),
         [[]],
-        setup=[{"learner": None, "reply": "<scene 1>Start. <step 3>Past the question."}],
+        setup=[{"learner": None, "reply": "<scene 1>Start. <step 4>Past the end."}],
     )
-    with pytest.raises(bench_turn.HarnessError, match=r"progress-1: .*<step 3> refused: not_answ"):
+    with pytest.raises(bench_turn.HarnessError, match=r"progress-1: .*<step 4> refused: past_end"):
         bench_turn.replay(LESSON, skipped)
     malformed = scenario(
         "progress", Cursor(scene=1, step=1), [[]], setup=[{"learner": None, "reply": "<scene x>A."}]
@@ -1556,7 +1518,6 @@ async def test_a_seeded_case_skips_the_opening_and_starts_at_its_target(
             True,
             scripts=SCRIPTS,
             seed=seed,
-            split=True,
         )
         loop, lesson, page = bench._loop, bench.lesson, bench.transport
         try:
@@ -1565,7 +1526,7 @@ async def test_a_seeded_case_skips_the_opening_and_starts_at_its_target(
             assert loop._transcript.latest() == "turn-2"
             assert (lesson.acked, lesson.asked) == (Cursor(scene=1, step=2), {("ratio", 2)})
             assert lesson.opened and lesson.first_answer_done
-            assert lesson.scripts == SCRIPTS and loop._cfg.split
+            assert lesson.scripts == SCRIPTS and loop._cfg.planned
             await asyncio.wait_for(page.wait_frames(lambda: page._epoch == 1), HANG_GUARD_S)
             assert (page._scene_id, page._step, page._revision) == ("ratio", 2, 0)
             heard = await asyncio.wait_for(bench.turn("go on"), HANG_GUARD_S)
@@ -1589,7 +1550,7 @@ async def test_a_seeded_case_skips_the_opening_and_starts_at_its_target(
 async def test_a_seed_at_no_scene_seats_the_page_on_no_scene() -> None:
     seed = bench_turn.Seed(acked=Cursor(), asked=set(), history=[], turns=1)
     bench = bench_turn.Bench.boot(
-        CFG, _models(), ScriptedReasoning([]), REQUEST, True, LESSON, True, seed=seed, split=True
+        CFG, _models(), ScriptedReasoning([]), REQUEST, True, LESSON, True, seed=seed
     )
     page = bench.transport
     try:

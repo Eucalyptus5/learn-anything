@@ -48,7 +48,7 @@ from tutor.scene import NO_TOOL_CALL as NO_TOOL_CALL_SCENE
 from tutor.scene import draft_paths, planned_scene_prompt, run_scene_build
 from tutor.script import write_script
 from tutor.speech import Chunk, OnPlay, Speaker
-from tutor.tags import Marker, RawTag, TagSplitter, parse_marker, tag_name
+from tutor.tags import Marker, RawTag, TagSplitter, tag_name
 from tutor.tools.models import SearchBudget, SearchResult
 from tutor.tools.provenance import TurnRegistry
 from tutor.transcript import Transcript
@@ -210,7 +210,6 @@ class TurnLoopConfig(BaseModel):
     script_effort: str = "high"
     script_max_tokens: int = Field(default=22000, gt=0)
     script_timeout_s: float = Field(default=300.0, gt=0)
-    split: bool = False
 
 
 class Speculation:
@@ -281,7 +280,6 @@ class TurnLoop:
         self._scripts_changed = asyncio.Event()
         self._script_waits = asyncio.Event()
         self._rerun_pending: str | None = None
-        self._exposed: dict[str, int] = {}
         self._closing = False
         self._hearing = False
         self._rights = 0
@@ -381,9 +379,8 @@ class TurnLoop:
             self._planner = asyncio.create_task(self._plan(), name="lesson-planner")
             self._planner.add_done_callback(self._planner_done)
             self._builder = asyncio.create_task(self._build_loop(), name="lesson-builder")
-            if self._cfg.split:
-                self._scripter = asyncio.create_task(self._script_loop(), name="lesson-scripter")
-                self._scripter.add_done_callback(self._scripter_done)
+            self._scripter = asyncio.create_task(self._script_loop(), name="lesson-scripter")
+            self._scripter.add_done_callback(self._scripter_done)
         async for event in self._source.events():
             if isinstance(event, SpeechStarted):
                 self._hearing = True
@@ -462,12 +459,12 @@ class TurnLoop:
         return result
 
     async def _replan(self, stage: str) -> None:
-        snapshot, size = self._lesson.plan, self._protected()
+        snapshot, size = self._lesson.plan, self._lesson.protected_count()
         result = await self._planner_call(stage, snapshot, size)
         if isinstance(result, str):
             logger.info("planner.rejected stage=%s reason=%s", stage, _planner_reason(result))
             return
-        conflict = self._lesson.accept(result, size, max(self._exposed.values(), default=0))
+        conflict = self._lesson.accept(result, size)
         if conflict is not None:
             logger.info("planner.rejected stage=%s reason=%s", stage, conflict)
             return
@@ -500,9 +497,6 @@ class TurnLoop:
             logger.error("script.task_failed error=%s", type(task.exception()).__name__)
         self._release_script_waits()
 
-    def _protected(self) -> int:
-        return max(self._lesson.protected_count(), *self._exposed.values(), 0)
-
     def _adopt(self, plan: LessonPlan) -> None:
         self._lesson.adopt(plan)
         logger.info("lesson.planned scenes=%d", len(plan.scenes))
@@ -531,7 +525,7 @@ class TurnLoop:
         turn.add_done_callback(self._turn_done)
 
     def _splitting(self) -> bool:
-        return self._cfg.split and self._lesson.plan is not None and not self._lesson.done()
+        return self._lesson.plan is not None and not self._lesson.done()
 
     def _prime(self, text: str) -> None:
         if self._splitting():
@@ -688,7 +682,6 @@ class TurnLoop:
                 speculation.grounded.cancel()
             if not speculation.claimed:
                 self._results.pop(turn_id, None)
-                self._exposed.pop(turn_id, None)
 
     async def _claim(self, turn_id: str, user_text: str) -> asyncio.Future[Grounded] | None:
         speculation = self._speculations.pop(turn_id, None)
@@ -709,15 +702,10 @@ class TurnLoop:
         return None
 
     def _prompt(self, results: list[SearchResult], user_text: str, turn_id: str) -> TurnPrompt:
-        plan = self._lesson.plan
-        if plan is not None:
-            self._exposed[turn_id] = min(
-                max(self._lesson.position().scene, 1) + 1, len(plan.scenes)
-            )
         starting = (
             f"Starting from: {self._cfg.starting_from}\n\n" if self._cfg.starting_from else ""
         )
-        block = lesson_block(self._lesson, user_text != OPENING_TEXT, list(self._lesson.dropped))
+        block = lesson_block(self._lesson, user_text != OPENING_TEXT)
         system = f"{self._cfg.system}\n\nSubject: {self._cfg.subject}\n\n{starting}{block}"
         return TurnPrompt(
             system=system,
@@ -823,8 +811,6 @@ class TurnLoop:
                 # A cancelled turn must not cancel the future the speculation is about to
                 # resolve, or set_result() raises inside the speculation.
                 _, feed = await asyncio.shield(grounded)
-            self._lesson.dropped.clear()
-            self._lesson.begin_turn(user_text != OPENING_TEXT)
             await self._speaker.speak(
                 self._utterance(turn_id, feed, barrier), self._caption(turn_id, barrier)
             )
@@ -870,7 +856,6 @@ class TurnLoop:
         self._due.pop(turn_id, None)
         self._played.pop(turn_id, None)
         self._results.pop(turn_id, None)
-        self._exposed.pop(turn_id, None)
         await self._stop(self._pumps, turn_id)
         await self._stop(self._stagers, turn_id)
         await self._stop(self._drains, turn_id)
@@ -971,18 +956,12 @@ class TurnLoop:
             if isinstance(item, Flush):
                 continue
             if isinstance(item, RawTag):
-                marker = parse_marker(item)
-                if isinstance(marker, str):
-                    logger.info(
-                        "tag.dropped turn_id=%s kind=%s reason=%s chars=%d",
-                        turn_id,
-                        tag_name(item),
-                        marker,
-                        len(item.text),
-                    )
-                    self._lesson.dropped.append(f"<{tag_name(item)}>: {marker}")
-                else:
-                    markers.append(marker)
+                logger.info(
+                    "tag.dropped turn_id=%s kind=%s reason=voice chars=%d",
+                    turn_id,
+                    tag_name(item),
+                    len(item.text),
+                )
                 continue
             if isinstance(item, Question) and withheld:
                 logger.info(

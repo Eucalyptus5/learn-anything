@@ -19,7 +19,9 @@ from tests.test_session import (
     FakeReasoning,
     ScriptedSource,
     draft_call,
+    line_seen,
     planned_call,
+    script_call,
     spoken_chunks,
 )
 from tutor import app
@@ -361,19 +363,24 @@ async def test_build_loop_hands_the_scene_model_to_the_builder_only(tmp_path: Pa
     log: list[tuple[str, object]] = []
     reasoning = FakeReasoning(
         log,
-        spoken_chunks(SPOKEN_DELTAS),
+        [],
         asyncio.Event(),
+        turns=[spoken_chunks(["go_on"])],
         plans=[planned_call(LESSON)],
         visual=[draft_call(3)],
         visual_finish="tool_calls",
+        scripts=[script_call("ratio")],
     )
     request = SessionRequest(subject="PPO", starting_from=STARTING_FROM)
+    first = asyncio.Event()
     stop = asyncio.Event()
-    loop = build_loop(
-        cfg, fake_models(), reasoning, ScriptedSource([stop]), FakeTransport(), request
-    )
-    running = asyncio.create_task(loop.run())
+    source = ScriptedSource([first, EndOfTurn(text="go on"), stop])
+    loop = build_loop(cfg, fake_models(), reasoning, source, FakeTransport(), request)
 
+    with line_seen("turn.spoken turn_id=turn-1") as opened:
+        running = asyncio.create_task(loop.run())
+        await asyncio.wait_for(opened.wait(), HANG_GUARD_S)
+    first.set()
     await asyncio.wait_for(reasoning.visual_started.wait(), HANG_GUARD_S)
     await asyncio.wait_for(reasoning.started.wait(), HANG_GUARD_S)
     stop.set()
@@ -382,3 +389,4 @@ async def test_build_loop_hands_the_scene_model_to_the_builder_only(tmp_path: Pa
 
     assert set(reasoning.build_models) == {"draw-1"}
     assert reasoning.models == [None]
+    assert set(reasoning.script_models) == {"glm-5.3-flash"}

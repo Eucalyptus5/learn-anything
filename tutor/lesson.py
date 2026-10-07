@@ -134,10 +134,6 @@ class SentCue(NamedTuple):
     to: Cursor
 
 
-def _spelled(tag: StepCue | SceneCue) -> str:
-    return f"<{tag.kind} {tag.n}>"
-
-
 class LessonState:
     def __init__(self) -> None:
         self.plan: LessonPlan | None = None
@@ -145,7 +141,6 @@ class LessonState:
         self.revision = 0
         self.sent: list[SentCue] = []
         self.checkpoint: LessonCheckpoint | None = None
-        self.dropped: list[str] = []
         self.committed: set[str] = set()
         self.built: dict[str, BuiltScene] = {}
         self.failed: set[str] = set()
@@ -159,17 +154,15 @@ class LessonState:
         self.asked: set[tuple[str, int]] = set()
         self._cue_id = 0
         self._stale: set[int] = set()
-        self._turn_start = Cursor()
-        self._learner_spoke = False
 
     def adopt(self, plan: LessonPlan) -> None:
         self.plan = plan
 
-    def accept(self, plan: LessonPlan, shown: int, exposed: int) -> str | None:
+    def accept(self, plan: LessonPlan, shown: int) -> str | None:
         if self.plan is None:
             self.adopt(plan)
             return None
-        live = max(self.protected_count(), exposed)
+        live = self.protected_count()
         note = rerun_conflict(self.plan, plan, shown)
         if note is None and rerun_conflict(self.plan, plan, live) is not None:
             note = "stale_prefix"
@@ -210,16 +203,9 @@ class LessonState:
         scenes = self.plan.scenes
         return self.position() == Cursor(scene=len(scenes), step=len(scenes[-1].steps))
 
-    def begin_turn(self, learner_spoke: bool) -> None:
-        self._turn_start = self.position()
-        self._learner_spoke = learner_spoke
-
     def step_tag(self, n: int) -> str | None:
         at = self.position()
         scene = self.scene_at(at.scene)
-        # Learner text can answer only the step right after where its turn began; any later
-        # ask in the same reply was put after the learner last spoke.
-        answered = at.step + 1 if self._learner_spoke and at == self._turn_start else at.step
         if self.plan is None:
             reason = "no_plan"
         elif scene is None:
@@ -230,8 +216,6 @@ class LessonState:
             reason = "not_rising"
         elif n > len(scene.steps):
             reason = "past_end"
-        elif any(step.ask for step in scene.steps[answered:n]):
-            reason = "not_answered"
         else:
             self._accept(StepCue(n=n), scene.id, Cursor(scene=at.scene, step=n))
             return None
@@ -241,7 +225,6 @@ class LessonState:
             n,
             reason,
         )
-        self.dropped.append(f"<step {n}>: {reason}")
         return reason
 
     def scene_tag(self, n: int) -> str | None:
@@ -258,7 +241,6 @@ class LessonState:
             self._accept(cue, None if here is None else here.id, Cursor(scene=n, step=1))
             return None
         logger.info("scene.dropped n=%d reason=%s", n, reason)
-        self.dropped.append(f"<scene {n}>: {reason}")
         return reason
 
     def _accept(self, tag: StepCue | SceneCue, scene_id: str | None, to: Cursor) -> None:
@@ -288,14 +270,10 @@ class LessonState:
             self.sent.pop(0)
             self.acked, self.revision = at, ack.revision
             return
-        head, *later = self.sent
         if ack.outcome == "failed":
             self.resync = True
+        self._stale.update(cue.cue_id for cue in self.sent[1:])
         self.sent = []
-        self._stale.update(cue.cue_id for cue in later)
-        if ack.reason != "barrier":
-            self.dropped.append(f"{_spelled(head.tag)}: {ack.reason}")
-            self.dropped.extend(f"{_spelled(cue.tag)}: stale_revision" for cue in later)
 
     def synced(self, message: LessonSynced) -> None:
         at = self._at(message.scene_id, message.step)
@@ -452,7 +430,7 @@ def _directive(state: LessonState, scene: Scene, learner_spoke: bool) -> str:
     )
 
 
-def lesson_block(state: LessonState, learner_spoke: bool, dropped: list[str]) -> str:
+def lesson_block(state: LessonState, learner_spoke: bool) -> str:
     plan = state.plan
     scene = state.current()
     if plan is None or scene is None:
@@ -495,7 +473,5 @@ def lesson_block(state: LessonState, learner_spoke: bool, dropped: list[str]) ->
             f"The page shows scene {state.acked.scene} at step {state.acked.step} "
             f"of {len(shown.steps)}."
         )
-    if dropped:
-        lines.append(f"Tags dropped from your last reply: {'; '.join(dropped)}.")
     lines.append(_directive(state, scene, learner_spoke))
     return "\n".join(lines)
