@@ -106,8 +106,6 @@ export default {
   words,
   length: 12,
   asked: "Why does a straw look bent in a glass of water?",
-  askBack: "So which way does it bend on the way out?",
-  askAt: 5.15,
   build(svg) {
     const doc = svg.ownerDocument;
     const group = doc.createElementNS(NS, "g");

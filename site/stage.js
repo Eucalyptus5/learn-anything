@@ -1,4 +1,4 @@
-import { FADE, SWAP, exchange } from "./exchange.js";
+import { FADE, exchange } from "./exchange.js";
 import sine from "./lessons/sine.js";
 import light from "./lessons/light.js";
 import route from "./lessons/route.js";
@@ -22,7 +22,6 @@ let current = 0;
 let s = -WAIT;
 let heard = [];
 let spans = [];
-let shown = null;
 let prev = null;
 
 const scenes = LESSONS.map((lesson) => {
@@ -49,7 +48,7 @@ list.className = "sr-only";
 for (const lesson of LESSONS) {
   const item = document.createElement("li");
   const answer = lesson.words.map(([word]) => word).join(" ");
-  item.textContent = `You: ${lesson.asked} Tutor: ${answer} Tutor: ${lesson.askBack}`;
+  item.textContent = `You: ${lesson.asked} Tutor: ${answer}`;
   list.append(item);
 }
 sentence.after(list);
@@ -83,39 +82,30 @@ function talking(words) {
 function play(index, at) {
   current = index;
   s = at;
-  shown = null;
   heard = fill(question, scenes[index].asked);
   main.classList.toggle("still", mode !== "play");
   scenes.forEach((scene, i) => {
     scene.group.style.display = i === index ? "" : "none";
   });
   for (const mark of marks) mark.style.setProperty("--p", "0");
+  spans = fill(sentence, scenes[index].answer);
+  // A span inserted and marked said in the same frame skips its fade; settle it unsaid first.
+  void sentence.offsetWidth;
   show();
 }
 
 function show() {
-  const { lesson, pose, group, pre, asked, answer, askBack, listenAt, total } = scenes[current];
-  const turn = pre + lesson.askAt;
-  const back = mode !== "reduce" && s >= turn + SWAP;
-  const words = back ? askBack : answer;
-  if (words !== shown) {
-    shown = words;
-    spans = fill(sentence, words);
-    // A span inserted and marked said in the same frame skips its fade; settle it unsaid first.
-    void sentence.offsetWidth;
-  }
+  const { lesson, pose, group, pre, asked, answer, total } = scenes[current];
   pose(clamp(s - pre, 0, lesson.length));
   reveal(heard, asked);
-  reveal(spans, words);
+  reveal(spans, answer);
   const fade = clamp((total - s) / FADE, 0, 1);
-  const giving = back || mode === "reduce" ? 1 : clamp((turn + SWAP - s) / SWAP, 0, 1);
   group.style.opacity = String(fade);
-  sentence.style.opacity = String(Math.min(fade, giving));
+  sentence.style.opacity = String(fade);
   you.style.opacity = String(Math.min(fade, clamp(s / RAMP, 0, 1)));
   tutor.style.opacity = String(Math.min(fade, clamp((s - pre) / RAMP, 0, 1)));
   you.classList.toggle("talking", talking(asked));
-  you.classList.toggle("listening", mode !== "reduce" && s >= listenAt);
-  tutor.classList.toggle("talking", talking(answer) || talking(askBack));
+  tutor.classList.toggle("talking", talking(answer));
   marks[current].style.setProperty("--p", String(mode === "reduce" ? 1 : s / total));
 }
 

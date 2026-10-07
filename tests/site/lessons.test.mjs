@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { FADE, exchange } from "../../site/exchange.js";
+import { exchange } from "../../site/exchange.js";
 import light, {
   INCIDENCE,
   N,
@@ -20,14 +20,12 @@ const ROWS = [
     name: "Sine wave",
     sentence: "A sine wave is a point going round a circle, watched from the side.",
     asked: "What actually is a sine wave?",
-    askBack: "So what if the point went round faster?",
   },
   {
     path: "../../site/lessons/light.js",
     name: "Light at water",
     sentence: "Light bends at water because it slows there, like a cart with one wheel in sand.",
     asked: "Why does a straw look bent in a glass of water?",
-    askBack: "So which way does it bend on the way out?",
   },
   {
     path: "../../site/lessons/route.js",
@@ -35,14 +33,12 @@ const ROWS = [
     sentence:
       "A maps app finds the quickest route by exploring outward from you, closest streets first.",
     asked: "How does my maps app find the fastest way home?",
-    askBack: "So which streets would it check last?",
   },
   {
     path: "../../site/lessons/moon.js",
     name: "Phases of the Moon",
     sentence: "The Moon's phases are just how much of its sunlit half we can see as it circles us.",
     asked: "Why does the Moon change shape?",
-    askBack: "So when it's between us and the Sun, what do we see?",
   },
 ];
 
@@ -68,8 +64,6 @@ const FIXTURE = {
   words: [["A", 0]],
   length: 11,
   asked: "Why is the sky blue?",
-  askBack: "So, why?",
-  askAt: 6,
 };
 
 const lessons = await Promise.all(
@@ -129,34 +123,19 @@ test("exchange times a fixture lesson", () => {
     ["sky", 0.36],
     ["blue?", 0.48],
   ];
-  const askBack = [
-    ["So,", 7.5],
-    ["why?", 7.82],
-  ];
   timed(x.asked, asked, "asked");
-  timed(x.askBack, askBack, "askBack");
-  near(x.listenAt, 8.27, "listenAt");
   near(x.total, 12.1, "total");
+  assert.deepEqual(Object.keys(x).sort(), ["asked", "pre", "total"]);
 });
 
-test("every lesson asks and is asked back", () => {
-  for (const { path, asked, askBack, lesson } of lessons) {
+test("every lesson asks", () => {
+  for (const { path, asked, lesson } of lessons) {
     assert.equal(lesson.asked, asked, path);
-    assert.equal(lesson.askBack, askBack, path);
-  }
-});
-
-test("the question back waits for the answer", () => {
-  for (const { path, lesson } of lessons) {
-    const last = lesson.words.at(-1)[1];
-    assert.ok(lesson.askAt >= last + 2, `${path}: asks back at ${lesson.askAt}`);
-  }
-});
-
-test("the question back leaves time to listen", () => {
-  for (const { path, lesson } of lessons) {
-    const x = exchange(lesson);
-    assert.ok(x.listenAt + 1 <= x.total - FADE, `${path}: listens at ${x.listenAt} of ${x.total}`);
+    assert.deepEqual(
+      Object.keys(lesson).sort(),
+      ["asked", "build", "length", "name", "words"],
+      path,
+    );
   }
 });
 
