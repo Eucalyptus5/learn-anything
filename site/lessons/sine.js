@@ -5,7 +5,7 @@ const words = [];
 let next = 0;
 for (const word of SENTENCE.split(" ")) {
   words.push([word, Math.round(next * 100) / 100]);
-  next += word.endsWith(",") ? 0.46 : 0.28;
+  next += word.endsWith(",") ? 0.32 : 0.2;
 }
 
 function when(word) {
@@ -22,7 +22,8 @@ const R = 90;
 export const X0 = 260;
 const X1 = 630;
 const SPEED = 90;
-const OMEGA = (2 * Math.PI) / (WATCHED - ROUND);
+const TURN = 1.45;
+const OMEGA = (2 * Math.PI) / TURN;
 const APPEAR = 0.25;
 
 export function dot(t) {
